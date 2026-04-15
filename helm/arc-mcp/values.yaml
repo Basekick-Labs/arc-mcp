@@ -1,0 +1,104 @@
+# Default values for arc-mcp.
+# This chart deploys arc-mcp wrapped by supergateway, exposing the MCP server
+# over SSE so remote LLM agents can connect over the network.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/basekick-labs/arc-mcp
+  # tag defaults to the chart's appVersion (set by CI)
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Connection to Arc.
+arc:
+  # Required: URL of the Arc instance reachable from the pod.
+  url: "http://arc.arc.svc.cluster.local:8000"
+  # Inline token — only used if tokenSecretRef.name is empty. Prefer tokenSecretRef.
+  token: ""
+  # Reference to a pre-existing Secret holding the Arc API token.
+  # Recommended: create the Secret yourself via `kubectl create secret generic`
+  # or your GitOps/SealedSecrets tooling, and reference it here.
+  tokenSecretRef:
+    name: ""
+    key: "token"
+  # Enforce HTTPS + tell arc-mcp not to accept plaintext HTTP + token unless
+  # the Arc URL is loopback. Set true only if you knowingly point at a
+  # non-loopback http:// endpoint and accept the credential-leak risk.
+  insecure: false
+  # Row cap and timeout passed to arc-mcp.
+  maxRows: 500
+  timeout: "30s"
+  maxResponseSize: 50000
+
+# Gateway that wraps arc-mcp's stdio as HTTP/SSE so remote LLM clients can
+# connect. Default uses ghcr.io/basekick-labs/arc-mcp-gateway, which bundles
+# arc-mcp with supergateway (https://github.com/supercorp-ai/supergateway).
+# Disable to run arc-mcp as stdio-only (useful for sidecar topologies).
+gateway:
+  enabled: true
+  image:
+    repository: ghcr.io/basekick-labs/arc-mcp-gateway
+    # tag defaults to the chart's appVersion (set by CI)
+    tag: ""
+    pullPolicy: IfNotPresent
+  port: 8080
+  # Extra args passed to supergateway.
+  extraArgs: []
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+livenessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 20
+
+readinessProbe:
+  tcpSocket:
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

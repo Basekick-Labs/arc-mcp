@@ -1,0 +1,27 @@
+arc-mcp has been installed in namespace {{ .Release.Namespace }} as {{ include "arc-mcp.fullname" . }}.
+
+{{- if .Values.gateway.enabled }}
+
+The supergateway wrapper is exposing arc-mcp over SSE on port {{ .Values.service.port }}.
+
+From inside the cluster:
+
+  curl http://{{ include "arc-mcp.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/sse
+
+Or port-forward locally:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arc-mcp.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Point your MCP-over-SSE client at http://localhost:{{ .Values.service.port }}/sse.
+{{- else }}
+
+Gateway is disabled — arc-mcp is running as a stdio-only process. Connect via
+`kubectl exec` or a sidecar in the same pod.
+{{- end }}
+
+{{- if and (not .Values.arc.tokenSecretRef.name) (not .Values.arc.token) }}
+
+WARNING: no Arc token is configured. Queries that require authentication will
+fail. Either set arc.token (dev/test only) or arc.tokenSecretRef.name pointing
+at a pre-created Secret.
+{{- end }}

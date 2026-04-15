@@ -1,0 +1,128 @@
+{{/*
+arc-mcp Deployment.
+
+When gateway.enabled is true (default), we run the arc-mcp-gateway image,
+which bundles supergateway + arc-mcp. Supergateway spawns arc-mcp as a
+stdio subprocess and exposes it over HTTP/SSE on gateway.port.
+
+When gateway.enabled is false, we run the distroless arc-mcp image as a
+stdio-only process — only useful when another workload attaches via
+`kubectl exec` or a shared-namespace sidecar.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "arc-mcp.fullname" . }}
+  labels:
+    {{- include "arc-mcp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "arc-mcp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "arc-mcp.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "arc-mcp.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        {{- if .Values.gateway.enabled }}
+        - name: gateway
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          args:
+            - "--stdio"
+            - "/usr/local/bin/arc-mcp"
+            - "--port"
+            - {{ .Values.gateway.port | quote }}
+            {{- with .Values.gateway.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: ARC_URL
+              value: {{ .Values.arc.url | quote }}
+            - name: ARC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-mcp.tokenSecretName" . }}
+                  key: {{ include "arc-mcp.tokenSecretKey" . }}
+                  optional: true
+            - name: ARC_MCP_MAX_ROWS
+              value: {{ .Values.arc.maxRows | quote }}
+            {{- if .Values.arc.insecure }}
+            - name: ARC_MCP_INSECURE
+              value: "1"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.port }}
+              protocol: TCP
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+        {{- else }}
+        - name: arc-mcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--max-rows"
+            - {{ .Values.arc.maxRows | quote }}
+            - "--timeout"
+            - {{ .Values.arc.timeout | quote }}
+            - "--max-response-size"
+            - {{ .Values.arc.maxResponseSize | quote }}
+          env:
+            - name: ARC_URL
+              value: {{ .Values.arc.url | quote }}
+            - name: ARC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "arc-mcp.tokenSecretName" . }}
+                  key: {{ include "arc-mcp.tokenSecretKey" . }}
+                  optional: true
+            {{- if .Values.arc.insecure }}
+            - name: ARC_MCP_INSECURE
+              value: "1"
+            {{- end }}
+          stdin: true
+          tty: false
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

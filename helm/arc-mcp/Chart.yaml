@@ -1,0 +1,22 @@
+apiVersion: v2
+name: arc-mcp
+description: MCP server for Arc, a high-performance columnar analytical database.
+type: application
+version: 0.0.0      # overwritten by CI at `helm package` time
+appVersion: 0.0.0   # overwritten by CI at `helm package` time
+home: https://github.com/basekick-labs/arc-mcp
+sources:
+  - https://github.com/basekick-labs/arc-mcp
+maintainers:
+  - name: Basekick Labs
+    email: support@basekick.net
+    url: https://basekick.net
+icon: https://basekick.net/favicon.ico
+keywords:
+  - arc
+  - mcp
+  - model-context-protocol
+  - ai
+  - llm
+  - columnar
+  - analytics

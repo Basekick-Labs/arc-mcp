@@ -1,0 +1,13 @@
+# arc-mcp-gateway image: combines arc-mcp with supergateway so remote LLM
+# clients can connect to arc-mcp over HTTP/SSE inside a cluster.
+#
+# goreleaser passes the already-built arc-mcp binary via COPY. We layer it
+# onto supercorp/supergateway (node-based) so supergateway can spawn arc-mcp
+# as its stdio subprocess.
+
+FROM supercorp/supergateway:latest
+
+COPY arc-mcp /usr/local/bin/arc-mcp
+
+# Supergateway is ENTRYPOINT=["supergateway"]; the Helm chart passes
+# `--stdio /usr/local/bin/arc-mcp` via container args.

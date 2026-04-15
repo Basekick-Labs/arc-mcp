@@ -1,0 +1,31 @@
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - gosec
+    - gofmt
+    - goimports
+    - bodyclose
+    - noctx
+    - misspell
+    - unconvert
+    - ineffassign
+    - unused
+
+linters-settings:
+  gosec:
+    excludes:
+      - G115  # integer overflow conversion — we guard explicitly where relevant
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck

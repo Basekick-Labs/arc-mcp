@@ -1,0 +1,236 @@
+# GoReleaser configuration for arc-mcp.
+# https://goreleaser.com
+#
+# Triggered by a git tag push matching v*. Produces:
+#   - Platform binaries (linux/darwin/windows × amd64/arm64, skip windows/arm64)
+#   - .tar.gz / .zip archives
+#   - checksums.txt (sha256)
+#   - CycloneDX SBOM via syft
+#   - .deb and .rpm packages (amd64, arm64)
+#   - Multi-arch Docker images to ghcr.io/basekick-labs/arc-mcp
+#   - Cosign signatures (keyless via GH OIDC) for blobs and images
+#   - GitHub Release
+
+version: 2
+
+project_name: arc-mcp
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: arc-mcp
+    main: ./cmd/arc-mcp
+    binary: arc-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.ShortCommit}}
+      - -X main.BuildTime={{.Date}}
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.sbom.json"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+
+# System packages (.deb, .rpm).
+# arc-mcp is a client binary spawned by LLM tools — no systemd service.
+nfpms:
+  - id: packages
+    package_name: arc-mcp
+    vendor: Basekick Labs
+    homepage: https://github.com/basekick-labs/arc-mcp
+    maintainer: Basekick Labs <support@basekick.net>
+    description: MCP server for Arc, a high-performance columnar analytical database.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/arc-mcp/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/arc-mcp/README.md
+
+# Docker images — multi-arch to GHCR.
+dockers:
+  - id: amd64
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-amd64"
+    use: buildx
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=MCP server for Arc"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+  - id: arm64
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: Dockerfile
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.description=MCP server for Arc"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+  # arc-mcp-gateway: arc-mcp bundled with supergateway for HTTP/SSE exposure.
+  # This is what the Helm chart consumes by default.
+  - id: gateway-amd64
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
+    use: buildx
+    dockerfile: Dockerfile.gateway
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=arc-mcp-gateway"
+      - "--label=org.opencontainers.image.description=arc-mcp bundled with supergateway for HTTP/SSE"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+  - id: gateway-arm64
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
+    use: buildx
+    dockerfile: Dockerfile.gateway
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=arc-mcp-gateway"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.licenses=MIT"
+
+docker_manifests:
+  - name_template: "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/basekick-labs/arc-mcp:{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/basekick-labs/arc-mcp:latest"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Major }}.{{ .Minor }}"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:latest"
+    image_templates:
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
+      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
+
+# Cosign keyless signing — uses GH OIDC, no keys to manage.
+# Verify with: cosign verify-blob --certificate ... --signature ...
+signs:
+  - cmd: cosign
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--yes'
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+    artifacts: checksum
+    output: true
+
+docker_signs:
+  - cmd: cosign
+    args:
+      - sign
+      - '--yes'
+      - '${artifact}'
+    artifacts: manifests
+    output: true
+
+release:
+  github:
+    owner: basekick-labs
+    name: arc-mcp
+  draft: false
+  prerelease: auto
+  name_template: "arc-mcp v{{ .Version }}"
+  header: |
+    arc-mcp {{ .Version }} — MCP server for [Arc](https://github.com/basekick-labs/arc).
+  footer: |
+    **Verify signatures:**
+    ```
+    cosign verify-blob \
+      --certificate checksums.txt.pem \
+      --signature checksums.txt.sig \
+      --certificate-identity-regexp 'https://github\.com/basekick-labs/arc-mcp/' \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      checksums.txt
+    ```
