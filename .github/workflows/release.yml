@@ -136,17 +136,20 @@ jobs:
       - name: Pull published image
         run: docker pull ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }}
 
-      - name: Verify image starts and talks to an invalid Arc
+      - name: Verify image starts and logs a server boot line
         run: |
-          # arc-mcp is a stdio MCP server. Without a real Arc and an MCP client
-          # it will block on stdin. We start it in the background, confirm it
-          # logs a health check attempt, then kill it. Exit code 0 means the
-          # image ran; this smoke test will be strengthened in a follow-up once
-          # --version is implemented (PR 3 in the hardening plan).
-          docker run --rm -d --name smoke \
+          # arc-mcp is a stdio MCP server. Without an attached MCP client over
+          # stdin it sees EOF and exits cleanly — that's the signal we want.
+          # Drop --rm so docker logs can still read the log after exit, and
+          # feed /dev/null to stdin so the exit is deterministic. The health
+          # check is expected to fail (invalid URL); we only assert the server
+          # booted far enough to log. Tightens once --version lands (PR 3).
+          docker run -d --name smoke -i \
             -e ARC_URL=http://127.0.0.1:65535 \
-            ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }}
+            ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }} \
+            < /dev/null
+          # Give it a moment to log; then fetch logs whether running or exited.
           sleep 3
-          docker logs smoke | tee /tmp/smoke.log
-          docker rm -f smoke
+          docker logs smoke 2>&1 | tee /tmp/smoke.log
+          docker rm -f smoke || true
           grep -q "arc-mcp server starting" /tmp/smoke.log
