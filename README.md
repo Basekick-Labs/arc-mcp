@@ -46,6 +46,27 @@ arc-mcp \
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Max response characters | `50000` |
 
+## Docker Compose (quick-start)
+
+The fastest way to evaluate arc-mcp is with Docker Compose — it brings up Arc and arc-mcp together, exposing MCP over HTTP/SSE for remote LLM clients:
+
+```bash
+cp .env.example .env
+# edit .env — at minimum set ARC_TOKEN
+docker compose --profile with-arc up
+```
+
+- Arc API:             `http://localhost:8000`
+- MCP over SSE:        `http://localhost:8080/sse`
+
+If you already run Arc elsewhere, omit the `--profile with-arc` flag, set `ARC_URL` and `ARC_TOKEN` in `.env`, and run:
+
+```bash
+docker compose up arc-mcp
+```
+
+See [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example) for the full surface.
+
 ## Connecting to LLM Clients
 
 arc-mcp uses the **stdio** transport (JSON-RPC over stdin/stdout), which is supported by all major MCP-compatible clients.

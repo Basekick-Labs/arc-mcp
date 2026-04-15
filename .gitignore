@@ -16,3 +16,6 @@ coverage.*
 .vscode/
 *.swp
 dist/
+
+# Local secrets (compose quick-start uses .env; .env.example is checked in)
+.env

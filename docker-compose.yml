@@ -1,0 +1,81 @@
+# Quick-start Compose file for arc-mcp.
+#
+# Two usage modes:
+#
+#   1. Everything — arc + arc-mcp-gateway (default):
+#        docker compose --profile with-arc up
+#      Arc API on  : http://localhost:8000
+#      MCP over SSE: http://localhost:8080/sse
+#
+#   2. MCP only — you already run Arc elsewhere:
+#        docker compose up arc-mcp
+#      Set ARC_URL + ARC_TOKEN in .env (see .env.example).
+#
+# The `gateway` service wraps arc-mcp (stdio) with supergateway so remote
+# LLM clients can connect over HTTP/SSE. For local Claude Desktop (stdio),
+# use the `arc-mcp-stdio` service definition at the bottom and wire it into
+# Claude Desktop's MCP config (see README).
+
+services:
+  # Arc database — optional; enabled via the `with-arc` profile.
+  arc:
+    image: ghcr.io/basekick-labs/arc:${ARC_VERSION:-latest}
+    container_name: arc
+    profiles: ["with-arc"]
+    ports:
+      - "${ARC_PORT:-8000}:8000"
+    volumes:
+      - arc-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # arc-mcp wrapped by supergateway — exposes MCP over HTTP/SSE.
+  arc-mcp:
+    image: ghcr.io/basekick-labs/arc-mcp-gateway:${ARC_MCP_VERSION:-26.04.1}
+    container_name: arc-mcp
+    command:
+      - "--stdio"
+      - "/usr/local/bin/arc-mcp"
+      - "--port"
+      - "8080"
+    environment:
+      # When running alongside `arc` in this compose file, use the service name.
+      # Otherwise point ARC_URL at your own Arc instance (see .env.example).
+      ARC_URL: ${ARC_URL:-http://arc:8000}
+      ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required — set it in .env}
+      ARC_MCP_MAX_ROWS: ${ARC_MCP_MAX_ROWS:-500}
+      # arc-mcp refuses by default to send a Bearer token over plaintext HTTP
+      # to a non-loopback host. Inside this Compose file the `arc` service
+      # lives on an isolated Docker bridge that never touches the host LAN,
+      # so opting into insecure is acceptable. Override to 0 (or unset) if
+      # you point ARC_URL at a remote HTTP host and want the guard back.
+      ARC_MCP_INSECURE: ${ARC_MCP_INSECURE:-1}
+    ports:
+      - "${ARC_MCP_PORT:-8080}:8080"
+    depends_on:
+      arc:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  # Stdio-only variant — commented out by default. Use this if you're wiring
+  # arc-mcp directly into Claude Desktop or another stdio-based MCP client
+  # running on the host: they spawn the process themselves, so compose's role
+  # is really just to build/pull the image. Uncomment and run:
+  #   docker compose run --rm -T arc-mcp-stdio
+  #
+  # arc-mcp-stdio:
+  #   image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-26.04.1}
+  #   environment:
+  #     ARC_URL: ${ARC_URL:-http://host.docker.internal:8000}
+  #     ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required}
+  #   stdin_open: true
+  #   tty: false
+
+volumes:
+  arc-data:
