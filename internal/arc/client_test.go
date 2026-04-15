@@ -46,11 +46,11 @@ func TestClient_ListMeasurements_PathEscaping(t *testing.T) {
 func TestClient_Query_ResponseSizeCap(t *testing.T) {
 	// Stream a response larger than maxArcResponseBytes; the LimitReader should
 	// cause JSON decoding to fail cleanly instead of buffering unbounded bytes.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Write a malformed JSON stream of ~maxArcResponseBytes+1KiB so the cap
 		// is exceeded before the decoder finishes.
-		w.Write([]byte(`{"success":true,"columns":["x"],"data":[`))
+		_, _ = w.Write([]byte(`{"success":true,"columns":["x"],"data":[`))
 		row := []byte(`["` + strings.Repeat("a", 1024) + `"],`)
 		written := 0
 		for written < maxArcResponseBytes+1024 {

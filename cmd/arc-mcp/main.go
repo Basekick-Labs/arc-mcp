@@ -1,3 +1,5 @@
+// Command arc-mcp is an MCP server that exposes Arc, a columnar analytical
+// database, to LLM clients over stdio.
 package main
 
 import (

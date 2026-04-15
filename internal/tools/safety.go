@@ -68,7 +68,7 @@ func normalizeForCheck(sql string) (string, error) {
 		// /* block comment */ (non-nested; nested block comments are extremely rare)
 		if r == '/' && i+1 < len(runes) && runes[i+1] == '*' {
 			i += 2
-			for i+1 < len(runes) && !(runes[i] == '*' && runes[i+1] == '/') {
+			for i+1 < len(runes) && (runes[i] != '*' || runes[i+1] != '/') {
 				i++
 			}
 			if i+1 < len(runes) {
@@ -163,7 +163,10 @@ func EnforceRowLimit(sql string, maxRows int) string {
 
 	if m := limitPattern.FindStringSubmatchIndex(trimmed); m != nil {
 		var n int
-		fmt.Sscanf(trimmed[m[2]:m[3]], "%d", &n)
+		if _, err := fmt.Sscanf(trimmed[m[2]:m[3]], "%d", &n); err != nil {
+			// Unparseable digits (shouldn't happen given the regex) — leave as-is.
+			return trimmed
+		}
 		if n > maxRows {
 			return trimmed[:m[2]] + fmt.Sprintf("%d", maxRows) + trimmed[m[3]:]
 		}

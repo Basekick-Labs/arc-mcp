@@ -28,7 +28,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
 		Description: "Execute a read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. Write operations (INSERT, UPDATE, DELETE, DROP) are blocked.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args QueryArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (*mcp.CallToolResult, any, error) {
 		if args.Database == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Error: database name is required"}},
@@ -85,7 +85,7 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_sample_data",
 		Description: "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetSampleDataArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (*mcp.CallToolResult, any, error) {
 		if args.Database == "" || args.Measurement == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Error: both database and measurement are required"}},
@@ -168,12 +168,12 @@ func formatQueryResult(result *arc.QueryResponse) string {
 			if i > 0 {
 				sb.WriteString(" | ")
 			}
-			sb.WriteString(fmt.Sprintf("%v", val))
+			fmt.Fprintf(&sb, "%v", val)
 		}
 		sb.WriteString(" |\n")
 	}
 
-	sb.WriteString(fmt.Sprintf("\n*%d rows returned in %.1fms*", result.RowCount, result.ExecutionTimeMs))
+	fmt.Fprintf(&sb, "\n*%d rows returned in %.1fms*", result.RowCount, result.ExecutionTimeMs)
 
 	return sb.String()
 }

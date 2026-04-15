@@ -1,3 +1,4 @@
+// Package arc is an HTTP client for Arc's REST API.
 package arc
 
 import (
@@ -90,10 +91,10 @@ func (c *Client) Health(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connecting to Arc at %s: %w", c.baseURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Arc health check failed: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("arc health check failed: HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -110,7 +111,7 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 	if err != nil {
 		return nil, fmt.Errorf("listing databases: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
 
 	if resp.StatusCode != http.StatusOK {
@@ -141,7 +142,7 @@ func (c *Client) ListMeasurements(ctx context.Context, database string) (*Measur
 	if err != nil {
 		return nil, fmt.Errorf("listing measurements: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
 
 	if resp.StatusCode != http.StatusOK {
@@ -202,7 +203,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 	if err != nil {
 		return nil, fmt.Errorf("executing query: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody := io.LimitReader(resp.Body, maxArcResponseBytes+1)
 
 	if resp.StatusCode != http.StatusOK {

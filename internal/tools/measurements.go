@@ -26,7 +26,7 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_measurements",
 		Description: "List all measurements (tables) in a database. Returns measurement names.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args ListMeasurementsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ListMeasurementsArgs) (*mcp.CallToolResult, any, error) {
 		if args.Database == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -64,9 +64,9 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 		}
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Database '%s' has %d measurement(s):\n\n", args.Database, result.Count))
+		fmt.Fprintf(&sb, "Database '%s' has %d measurement(s):\n\n", args.Database, result.Count)
 		for _, m := range result.Measurements {
-			sb.WriteString(fmt.Sprintf("- %s\n", m.Name))
+			fmt.Fprintf(&sb, "- %s\n", m.Name)
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
@@ -81,7 +81,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "describe_measurement",
 		Description: "Describe a measurement's schema — column names, types, row count, and time range. Use this before writing queries to understand the data structure.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args DescribeMeasurementArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (*mcp.CallToolResult, any, error) {
 		if args.Database == "" || args.Measurement == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -126,7 +126,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		statsResult, err := client.Query(ctx, args.Database, statsSQL)
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("## Measurement: %s.%s\n\n", args.Database, args.Measurement))
+		fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
 
 		// Schema
 		sb.WriteString("### Columns\n\n")
@@ -135,7 +135,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			// We get columns from the schema query; types come from the first row if DESCRIBE is used,
 			// but LIMIT 0 only gives column names. Use DESCRIBE for types.
 			for _, col := range schemaResult.Columns {
-				sb.WriteString(fmt.Sprintf("| %s | — |\n", col))
+				fmt.Fprintf(&sb, "| %s | — |\n", col)
 			}
 		}
 
@@ -144,7 +144,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		descResult, descErr := client.Query(ctx, args.Database, describeSQL)
 		if descErr == nil && len(descResult.Data) > 0 {
 			sb.Reset()
-			sb.WriteString(fmt.Sprintf("## Measurement: %s.%s\n\n", args.Database, args.Measurement))
+			fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
 			sb.WriteString("### Columns\n\n")
 			sb.WriteString("| Column | Type | Nullable |\n|--------|------|----------|\n")
 			for _, row := range descResult.Data {
@@ -157,17 +157,17 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 				if len(row) > 2 {
 					nullable = fmt.Sprintf("%v", row[2])
 				}
-				sb.WriteString(fmt.Sprintf("| %s | %s | %s |\n", colName, colType, nullable))
+				fmt.Fprintf(&sb, "| %s | %s | %s |\n", colName, colType, nullable)
 			}
 		}
 
 		// Stats
 		if err == nil && len(statsResult.Data) > 0 && len(statsResult.Data[0]) >= 3 {
 			row := statsResult.Data[0]
-			sb.WriteString(fmt.Sprintf("\n### Statistics\n\n"))
-			sb.WriteString(fmt.Sprintf("- **Row count:** %v\n", row[0]))
-			sb.WriteString(fmt.Sprintf("- **Earliest:** %v\n", row[1]))
-			sb.WriteString(fmt.Sprintf("- **Latest:** %v\n", row[2]))
+			sb.WriteString("\n### Statistics\n\n")
+			fmt.Fprintf(&sb, "- **Row count:** %v\n", row[0])
+			fmt.Fprintf(&sb, "- **Earliest:** %v\n", row[1])
+			fmt.Fprintf(&sb, "- **Latest:** %v\n", row[2])
 		}
 
 		text := sb.String()

@@ -1,3 +1,4 @@
+// Package tools implements the MCP tool handlers exposed by arc-mcp.
 package tools
 
 import (
@@ -17,7 +18,7 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_databases",
 		Description: "List all databases in the Arc instance. Returns database names and measurement counts.",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args ListDatabasesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesArgs) (*mcp.CallToolResult, any, error) {
 		result, err := client.ListDatabases(ctx)
 		if err != nil {
 			return &mcp.CallToolResult{
@@ -37,9 +38,9 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 		}
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Found %d database(s):\n\n", result.Count))
+		fmt.Fprintf(&sb, "Found %d database(s):\n\n", result.Count)
 		for _, db := range result.Databases {
-			sb.WriteString(fmt.Sprintf("- **%s** (%d measurements)\n", db.Name, db.MeasurementCount))
+			fmt.Fprintf(&sb, "- **%s** (%d measurements)\n", db.Name, db.MeasurementCount)
 		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{

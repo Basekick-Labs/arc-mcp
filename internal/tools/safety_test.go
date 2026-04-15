@@ -16,16 +16,16 @@ func TestValidateIdentifier(t *testing.T) {
 	}
 	invalid := []string{
 		"",
-		"1cpu",       // leading digit
-		"cpu;DROP",   // semicolon
-		"cpu DROP",   // space
-		"cpu/*x*/",   // comment chars
-		"../etc",     // traversal-ish
-		"cpu-1",      // hyphen
-		"\"cpu\"",    // quoted
-		"cpu'",       // quote
-		"école",      // non-ASCII
-		"a b",        // internal space
+		"1cpu",                   // leading digit
+		"cpu;DROP",               // semicolon
+		"cpu DROP",               // space
+		"cpu/*x*/",               // comment chars
+		"../etc",                 // traversal-ish
+		"cpu-1",                  // hyphen
+		"\"cpu\"",                // quoted
+		"cpu'",                   // quote
+		"école",                  // non-ASCII
+		"a b",                    // internal space
 		strings.Repeat("a", 200), // too long
 	}
 
@@ -191,10 +191,10 @@ func TestEnforceRowLimit(t *testing.T) {
 
 func TestTruncateResponse(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		maxChars int
-		wantLen  int
+		name      string
+		input     string
+		maxChars  int
+		wantLen   int
 		truncated bool
 	}{
 		{"short string unchanged", "hello", 100, 5, false},
@@ -206,10 +206,8 @@ func TestTruncateResponse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := TruncateResponse(tt.input, tt.maxChars)
 			if tt.truncated {
-				if len(got) <= tt.maxChars {
-					// The truncated notice is appended, so total length > maxChars
-					// but the data portion should be exactly maxChars
-				}
+				// Truncated notice is appended, so total length > maxChars,
+				// but the data prefix (up to maxChars bytes) must match input.
 				if got[:tt.maxChars] != tt.input[:tt.maxChars] {
 					t.Errorf("truncated prefix mismatch")
 				}
