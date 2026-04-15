@@ -1,0 +1,17 @@
+# Compiled binary
+/arc-mcp
+arc-mcp.exe
+
+# Test & coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Go build cache / module downloads (safety)
+/vendor/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
