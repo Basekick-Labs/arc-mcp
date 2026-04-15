@@ -136,11 +136,17 @@ jobs:
       - name: Pull published image
         run: docker pull ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }}
 
-      - name: Probe --version flag
+      - name: Verify image starts and talks to an invalid Arc
         run: |
-          OUT=$(docker run --rm ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }} --version 2>&1 || true)
-          echo "Output: ${OUT}"
-          # Confirm the binary prints a version string that matches the tag.
-          # (arc-mcp doesn't yet implement --version; this step is a harmless probe
-          # and will be tightened once PR 3 adds a real --version flag.)
-          echo "Smoke test passed — image runs."
+          # arc-mcp is a stdio MCP server. Without a real Arc and an MCP client
+          # it will block on stdin. We start it in the background, confirm it
+          # logs a health check attempt, then kill it. Exit code 0 means the
+          # image ran; this smoke test will be strengthened in a follow-up once
+          # --version is implemented (PR 3 in the hardening plan).
+          docker run --rm -d --name smoke \
+            -e ARC_URL=http://127.0.0.1:65535 \
+            ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }}
+          sleep 3
+          docker logs smoke | tee /tmp/smoke.log
+          docker rm -f smoke
+          grep -q "arc-mcp server starting" /tmp/smoke.log
