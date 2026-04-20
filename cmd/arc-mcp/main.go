@@ -165,7 +165,7 @@ func envOrDefaultInt(key string, fallback int) int {
 //  3. flagValue — the --arc-token CLI flag (least preferred; visible in ps aux).
 func resolveToken(flagValue string) (string, error) {
 	if path := os.Getenv("ARC_TOKEN_FILE"); path != "" {
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) //nolint:gosec // path comes from ARC_TOKEN_FILE env var, not user input
 		if err != nil {
 			return "", fmt.Errorf("reading ARC_TOKEN_FILE %q: %w", path, err)
 		}

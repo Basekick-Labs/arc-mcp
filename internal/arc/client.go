@@ -14,37 +14,37 @@ import (
 	"time"
 )
 
-// ArcError is a classified error returned by the Arc client. Kind is a short
+// Error is a classified error returned by the Arc client. Kind is a short
 // machine-readable label; use it in tool handlers to produce user-facing
 // messages without leaking internal detail (stack traces, paths, SQL context)
 // to the LLM.
-type ArcError struct {
+type Error struct {
 	Kind   string // "auth", "not_found", "server", "network", "too_large", "parse", "query"
 	Detail string // full detail — log to stderr, never send to LLM
 }
 
-func (e *ArcError) Error() string { return e.Kind + ": " + e.Detail }
+func (e *Error) Error() string { return e.Kind + ": " + e.Detail }
 
-// arcErrorFrom classifies a non-2xx HTTP response into an ArcError and logs
+// arcErrorFrom classifies a non-2xx HTTP response into an Error and logs
 // the full body snippet to stderr. Callers receive only the Kind.
-func arcErrorFrom(op string, statusCode int, snippet []byte) *ArcError {
+func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	detail := fmt.Sprintf("%s: HTTP %d: %s", op, statusCode, strings.TrimSpace(string(snippet)))
 	log.Printf("arc error: %s", detail)
 	kind := "server"
-	switch {
-	case statusCode == 401 || statusCode == 403:
+	switch statusCode {
+	case 401, 403:
 		kind = "auth"
-	case statusCode == 404:
+	case 404:
 		kind = "not_found"
 	}
-	return &ArcError{Kind: kind, Detail: detail}
+	return &Error{Kind: kind, Detail: detail}
 }
 
 // UserMessage returns a short, safe error message suitable for the LLM.
 // It never leaks internal detail (stack traces, paths, Arc query context).
 func UserMessage(err error) string {
-	var ae *ArcError
-	if asArcError(err, &ae) { //nolint:errorlint
+	var ae *Error
+	if ae, _ = err.(*Error); ae != nil { //nolint:errorlint
 		switch ae.Kind {
 		case "auth":
 			return "Arc authentication failed — check the API token."
@@ -61,18 +61,6 @@ func UserMessage(err error) string {
 		}
 	}
 	return fmt.Sprintf("Arc error: %v", err)
-}
-
-// asArcError is a helper that avoids importing errors in this package.
-func asArcError(err error, target **ArcError) bool {
-	if err == nil {
-		return false
-	}
-	if ae, ok := err.(*ArcError); ok {
-		*target = ae
-		return true
-	}
-	return false
 }
 
 // maxArcResponseBytes caps how much we read from Arc in a single response to
@@ -277,13 +265,13 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
 		detail := fmt.Sprintf("query: decoding response: %v", err)
 		log.Printf("arc error: %s", detail)
-		return nil, &ArcError{Kind: "parse", Detail: detail}
+		return nil, &Error{Kind: "parse", Detail: detail}
 	}
 
 	if !result.Success {
 		detail := fmt.Sprintf("query: Arc error: %s", result.Error)
 		log.Printf("arc error: %s", detail)
-		return nil, &ArcError{Kind: "query", Detail: detail}
+		return nil, &Error{Kind: "query", Detail: detail}
 	}
 	return &result, nil
 }
