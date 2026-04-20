@@ -36,7 +36,7 @@ services:
 
   # arc-mcp wrapped by supergateway — exposes MCP over HTTP/SSE.
   arc-mcp:
-    image: ghcr.io/basekick-labs/arc-mcp-gateway:${ARC_MCP_VERSION:-26.04.1}
+    image: ghcr.io/basekick-labs/arc-mcp-gateway:${ARC_MCP_VERSION:-26.04.2}
     container_name: arc-mcp
     command:
       - "--stdio"
@@ -70,7 +70,7 @@ services:
   #   docker compose run --rm -T arc-mcp-stdio
   #
   # arc-mcp-stdio:
-  #   image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-26.04.1}
+  #   image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-26.04.2}
   #   environment:
   #     ARC_URL: ${ARC_URL:-http://host.docker.internal:8000}
   #     ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required}
