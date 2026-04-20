@@ -26,7 +26,8 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_measurements",
 		Description: "List all measurements (tables) in a database. Returns measurement names.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ListMeasurementsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ListMeasurementsArgs) (out *mcp.CallToolResult, _ any, _ error) {
+		defer RecoverToolPanic(&out)
 		if args.Database == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -49,7 +50,7 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: fmt.Sprintf("Error listing measurements: %v", err)},
+					&mcp.TextContent{Text: arc.UserMessage(err)},
 				},
 				IsError: true,
 			}, nil, nil
@@ -81,7 +82,8 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "describe_measurement",
 		Description: "Describe a measurement's schema — column names, types, row count, and time range. Use this before writing queries to understand the data structure.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (out *mcp.CallToolResult, _ any, _ error) {
+		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -115,7 +117,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: fmt.Sprintf("Error getting schema: %v", err)},
+					&mcp.TextContent{Text: arc.UserMessage(err)},
 				},
 				IsError: true,
 			}, nil, nil
@@ -148,14 +150,17 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			sb.WriteString("### Columns\n\n")
 			sb.WriteString("| Column | Type | Nullable |\n|--------|------|----------|\n")
 			for _, row := range descResult.Data {
-				colName := fmt.Sprintf("%v", row[0])
+				if len(row) == 0 {
+					continue
+				}
+				colName := escapeMarkdownCell(row[0])
 				colType := ""
 				nullable := ""
 				if len(row) > 1 {
-					colType = fmt.Sprintf("%v", row[1])
+					colType = escapeMarkdownCell(row[1])
 				}
 				if len(row) > 2 {
-					nullable = fmt.Sprintf("%v", row[2])
+					nullable = escapeMarkdownCell(row[2])
 				}
 				fmt.Fprintf(&sb, "| %s | %s | %s |\n", colName, colType, nullable)
 			}

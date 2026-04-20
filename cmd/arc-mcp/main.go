@@ -19,6 +19,11 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Version is overridden at build time via:
+//
+//	-ldflags "-X main.Version=YY.MM.PATCH"
+var Version = "dev"
+
 const (
 	defaultMaxRows         = 500
 	defaultTimeout         = 30 * time.Second
@@ -27,15 +32,29 @@ const (
 
 func main() {
 	arcURL := flag.String("arc-url", envOrDefault("ARC_URL", "http://localhost:8000"), "Arc instance URL")
-	arcToken := flag.String("arc-token", envOrDefault("ARC_TOKEN", ""), "Arc API token")
+	arcToken := flag.String("arc-token", envOrDefault("ARC_TOKEN", ""), "Arc API token (prefer ARC_TOKEN env var or ARC_TOKEN_FILE to avoid ps aux exposure)")
 	maxRows := flag.Int("max-rows", envOrDefaultInt("ARC_MCP_MAX_ROWS", defaultMaxRows), "Maximum rows per query")
 	timeout := flag.Duration("timeout", defaultTimeout, "Query timeout")
 	maxResponseSize := flag.Int("max-response-size", defaultMaxResponseSize, "Maximum response size in characters")
 	insecure := flag.Bool("insecure", envOrDefault("ARC_MCP_INSECURE", "") != "", "Allow token auth over plaintext HTTP to non-loopback hosts (credentials will be sent in cleartext)")
+	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *version {
+		fmt.Println(Version)
+		os.Exit(0)
+	}
 
 	// All logging goes to stderr to avoid corrupting the MCP stdio protocol
 	log.SetOutput(os.Stderr)
+
+	// Resolve token: ARC_TOKEN_FILE > ARC_TOKEN > --arc-token flag.
+	token, err := resolveToken(*arcToken)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+		os.Exit(2)
+	}
+	*arcToken = token
 
 	// Guard against sending Bearer tokens over cleartext to remote hosts.
 	if err := validateArcURL(*arcURL, *arcToken, *insecure); err != nil {
@@ -62,7 +81,7 @@ func main() {
 	// Create MCP server
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "arc-mcp",
-		Version: "0.1.0",
+		Version: Version,
 	}, &mcp.ServerOptions{
 		Instructions: "Arc is a high-performance columnar analytical database. Use list_databases to discover databases, list_measurements to see tables, describe_measurement to understand schema, and query to run SQL (DuckDB dialect). Always describe a measurement before querying it.",
 	})
@@ -136,4 +155,27 @@ func envOrDefaultInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// resolveToken returns the Arc API token using the following precedence:
+//
+//  1. ARC_TOKEN_FILE env var — reads the file and trims trailing whitespace.
+//     Preferred for production: the token never appears in ps aux or shell history.
+//  2. ARC_TOKEN env var — convenient for containers and CI.
+//  3. flagValue — the --arc-token CLI flag (least preferred; visible in ps aux).
+func resolveToken(flagValue string) (string, error) {
+	if path := os.Getenv("ARC_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("reading ARC_TOKEN_FILE %q: %w", path, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	if v := os.Getenv("ARC_TOKEN"); v != "" {
+		return v, nil
+	}
+	if flagValue != "" {
+		log.Printf("WARNING: token supplied via --arc-token flag is visible in ps aux; prefer ARC_TOKEN env var or ARC_TOKEN_FILE")
+	}
+	return flagValue, nil
 }

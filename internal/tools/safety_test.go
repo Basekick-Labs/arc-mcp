@@ -219,3 +219,31 @@ func TestTruncateResponse(t *testing.T) {
 		})
 	}
 }
+
+func TestEscapeMarkdownCell(t *testing.T) {
+	tests := []struct {
+		name  string
+		input any
+		want  string
+	}{
+		{"nil becomes NULL", nil, "NULL"},
+		{"plain string unchanged", "hello", "hello"},
+		{"pipe escaped", "a|b", `a\|b`},
+		{"newline replaced with space", "a\nb", "a b"},
+		{"carriage return replaced", "a\rb", "a b"},
+		{"crlf replaced", "a\r\nb", "a b"},
+		{"multiple pipes", "a|b|c", `a\|b\|c`},
+		{"integer value", 42, "42"},
+		{"float value", 3.14, "3.14"},
+		{"long cell truncated", strings.Repeat("x", 600), strings.Repeat("x", 512) + "…"},
+		{"pipe and newline combined", "a|b\nc", `a\|b c`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := escapeMarkdownCell(tt.input)
+			if got != tt.want {
+				t.Errorf("escapeMarkdownCell(%v) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}

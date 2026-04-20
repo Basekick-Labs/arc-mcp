@@ -7,11 +7,73 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// ArcError is a classified error returned by the Arc client. Kind is a short
+// machine-readable label; use it in tool handlers to produce user-facing
+// messages without leaking internal detail (stack traces, paths, SQL context)
+// to the LLM.
+type ArcError struct {
+	Kind   string // "auth", "not_found", "server", "network", "too_large", "parse", "query"
+	Detail string // full detail — log to stderr, never send to LLM
+}
+
+func (e *ArcError) Error() string { return e.Kind + ": " + e.Detail }
+
+// arcErrorFrom classifies a non-2xx HTTP response into an ArcError and logs
+// the full body snippet to stderr. Callers receive only the Kind.
+func arcErrorFrom(op string, statusCode int, snippet []byte) *ArcError {
+	detail := fmt.Sprintf("%s: HTTP %d: %s", op, statusCode, strings.TrimSpace(string(snippet)))
+	log.Printf("arc error: %s", detail)
+	kind := "server"
+	switch {
+	case statusCode == 401 || statusCode == 403:
+		kind = "auth"
+	case statusCode == 404:
+		kind = "not_found"
+	}
+	return &ArcError{Kind: kind, Detail: detail}
+}
+
+// UserMessage returns a short, safe error message suitable for the LLM.
+// It never leaks internal detail (stack traces, paths, Arc query context).
+func UserMessage(err error) string {
+	var ae *ArcError
+	if asArcError(err, &ae) { //nolint:errorlint
+		switch ae.Kind {
+		case "auth":
+			return "Arc authentication failed — check the API token."
+		case "not_found":
+			return "The requested database or measurement was not found in Arc."
+		case "too_large":
+			return "Arc returned a response that was too large to process."
+		case "parse":
+			return "Arc returned an unexpected response format."
+		case "query":
+			return "Arc rejected the query — check the SQL syntax."
+		default:
+			return "Arc returned an error — see server logs for details."
+		}
+	}
+	return fmt.Sprintf("Arc error: %v", err)
+}
+
+// asArcError is a helper that avoids importing errors in this package.
+func asArcError(err error, target **ArcError) bool {
+	if err == nil {
+		return false
+	}
+	if ae, ok := err.(*ArcError); ok {
+		*target = ae
+		return true
+	}
+	return false
+}
 
 // maxArcResponseBytes caps how much we read from Arc in a single response to
 // protect the MCP process from OOM if Arc (or a MITM) returns a huge body.
@@ -116,7 +178,7 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-		return nil, fmt.Errorf("listing databases: HTTP %d: %s", resp.StatusCode, string(snippet))
+		return nil, arcErrorFrom("list databases", resp.StatusCode, snippet)
 	}
 
 	var result DatabaseListResponse
@@ -147,7 +209,7 @@ func (c *Client) ListMeasurements(ctx context.Context, database string) (*Measur
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-		return nil, fmt.Errorf("listing measurements: HTTP %d: %s", resp.StatusCode, string(snippet))
+		return nil, arcErrorFrom("list measurements", resp.StatusCode, snippet)
 	}
 
 	var result MeasurementListResponse
@@ -208,16 +270,20 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(respBody, maxErrorBodyBytes))
-		return nil, fmt.Errorf("query failed: HTTP %d: %s", resp.StatusCode, string(snippet))
+		return nil, arcErrorFrom("query", resp.StatusCode, snippet)
 	}
 
 	var result QueryResponse
 	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		detail := fmt.Sprintf("query: decoding response: %v", err)
+		log.Printf("arc error: %s", detail)
+		return nil, &ArcError{Kind: "parse", Detail: detail}
 	}
 
 	if !result.Success {
-		return nil, fmt.Errorf("query error: %s", result.Error)
+		detail := fmt.Sprintf("query: Arc error: %s", result.Error)
+		log.Printf("arc error: %s", detail)
+		return nil, &ArcError{Kind: "query", Detail: detail}
 	}
 	return &result, nil
 }

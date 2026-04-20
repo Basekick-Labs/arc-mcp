@@ -18,18 +18,20 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_databases",
 		Description: "List all databases in the Arc instance. Returns database names and measurement counts.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesArgs) (*mcp.CallToolResult, any, error) {
-		result, err := client.ListDatabases(ctx)
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesArgs) (out *mcp.CallToolResult, _ any, _ error) {
+		defer RecoverToolPanic(&out)
+
+		dbResult, err := client.ListDatabases(ctx)
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: fmt.Sprintf("Error listing databases: %v", err)},
+					&mcp.TextContent{Text: arc.UserMessage(err)},
 				},
 				IsError: true,
 			}, nil, nil
 		}
 
-		if len(result.Databases) == 0 {
+		if len(dbResult.Databases) == 0 {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: "No databases found."},
@@ -38,8 +40,8 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 		}
 
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "Found %d database(s):\n\n", result.Count)
-		for _, db := range result.Databases {
+		fmt.Fprintf(&sb, "Found %d database(s):\n\n", dbResult.Count)
+		for _, db := range dbResult.Databases {
 			fmt.Fprintf(&sb, "- **%s** (%d measurements)\n", db.Name, db.MeasurementCount)
 		}
 		return &mcp.CallToolResult{

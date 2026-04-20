@@ -3,9 +3,43 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
+	"runtime/debug"
 	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// RecoverToolPanic catches any panic in a tool handler and converts it into a
+// safe MCP error result. Without this, a single nil-dereference or bounds
+// violation crashes the entire MCP server process.
+//
+// Usage (at top of every tool handler closure):
+//
+//	var panicResult *mcp.CallToolResult
+//	defer RecoverToolPanic(&panicResult)
+//	if panicResult != nil { return panicResult, nil, nil }
+//
+// Because defer runs after the return statement is evaluated, callers must
+// check panicResult at the top of the function body after the defer line.
+// The idiomatic pattern is a named return:
+//
+//	func handler(...) (result *mcp.CallToolResult, _ any, _ error) {
+//	    defer RecoverToolPanic(&result)
+//	    ...
+//	}
+func RecoverToolPanic(result **mcp.CallToolResult) {
+	if r := recover(); r != nil {
+		log.Printf("tool handler panic: %v\n%s", r, debug.Stack())
+		*result = &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: "Internal error: the tool handler encountered an unexpected problem. See server logs."},
+			},
+			IsError: true,
+		}
+	}
+}
 
 // identifierPattern matches safe SQL identifiers (database and measurement names).
 // Arc identifiers are ASCII alphanumeric plus underscore, starting with a letter
@@ -194,4 +228,31 @@ func TruncateResponse(s string, maxChars int) string {
 	}
 
 	return s[:cut] + fmt.Sprintf("\n\n... [truncated — response exceeded %d characters]", maxChars)
+}
+
+// escapeMarkdownCell sanitizes a value for safe inclusion in a markdown table
+// cell. Pipe characters would break the table structure; newlines would inject
+// extra rows visible to the LLM. nil is rendered as NULL. Values longer than
+// 512 runes are truncated with an ellipsis.
+func escapeMarkdownCell(v any) string {
+	var s string
+	if v == nil {
+		s = "NULL"
+	} else {
+		s = fmt.Sprintf("%v", v)
+	}
+
+	// Truncate very long cells.
+	const maxCellRunes = 512
+	runes := []rune(s)
+	if len(runes) > maxCellRunes {
+		s = string(runes[:maxCellRunes]) + "…"
+	}
+
+	// Escape characters that break markdown tables.
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "|", `\|`)
+	return s
 }

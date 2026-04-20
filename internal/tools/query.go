@@ -28,7 +28,8 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
 		Description: "Execute a read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. Write operations (INSERT, UPDATE, DELETE, DROP) are blocked.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (out *mcp.CallToolResult, _ any, _ error) {
+		defer RecoverToolPanic(&out)
 		if args.Database == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Error: database name is required"}},
@@ -64,7 +65,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 		result, err := client.Query(ctx, args.Database, sql)
 		if err != nil {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Query error: %v", err)}},
+				Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
 				IsError: true,
 			}, nil, nil
 		}
@@ -85,7 +86,8 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_sample_data",
 		Description: "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (out *mcp.CallToolResult, _ any, _ error) {
+		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Error: both database and measurement are required"}},
@@ -120,7 +122,7 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 		result, err := client.Query(ctx, args.Database, sql)
 		if err != nil {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error: %v", err)}},
+				Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
 				IsError: true,
 			}, nil, nil
 		}
@@ -150,7 +152,7 @@ func formatQueryResult(result *arc.QueryResponse) string {
 		if i > 0 {
 			sb.WriteString(" | ")
 		}
-		sb.WriteString(col)
+		sb.WriteString(escapeMarkdownCell(col))
 	}
 	sb.WriteString(" |\n")
 
@@ -168,7 +170,7 @@ func formatQueryResult(result *arc.QueryResponse) string {
 			if i > 0 {
 				sb.WriteString(" | ")
 			}
-			fmt.Fprintf(&sb, "%v", val)
+			sb.WriteString(escapeMarkdownCell(val))
 		}
 		sb.WriteString(" |\n")
 	}
