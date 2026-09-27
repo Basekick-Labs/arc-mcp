@@ -34,6 +34,7 @@ arc-mcp \
 |----------|-------------|---------|
 | `ARC_URL` | Arc instance URL | `http://localhost:8000` |
 | `ARC_TOKEN` | Arc API token | (none) |
+| `ARC_TOKEN_FILE` | File containing the Arc API token | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
 
 ### CLI Flags
@@ -45,6 +46,17 @@ arc-mcp \
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Max response characters | `50000` |
+
+### Token hygiene
+
+Use a dedicated, short-lived Arc token with only the `read` permission for
+arc-mcp. Do not share an administrator or write-capable token with an MCP
+client. Prefer `ARC_TOKEN_FILE` (or a secret-mounted `ARC_TOKEN`) so the token
+does not appear in shell history or process arguments.
+
+At startup, arc-mcp asks Arc's `/api/v1/auth/verify` endpoint for the token's
+permissions and warns when it detects `write`, `delete`, or `admin`. This is a
+defence-in-depth advisory; Arc remains responsible for enforcing permissions.
 
 ## Docker Compose (quick-start)
 

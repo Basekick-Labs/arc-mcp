@@ -77,6 +77,21 @@ func main() {
 	} else {
 		log.Printf("Connected to Arc at %s", *arcURL)
 	}
+	if *arcToken != "" {
+		permissions, err := client.VerifyToken(ctx)
+		if err != nil {
+			log.Printf("Warning: Arc token verification failed: %v", err)
+		} else {
+			log.Printf("Arc token permissions: %s", strings.Join(permissions, ", "))
+			for _, permission := range permissions {
+				switch permission {
+				case "write", "delete", "admin":
+					log.Printf("WARNING: Arc token has %q permission; use a read-only token for arc-mcp", permission)
+					break
+				}
+			}
+		}
+	}
 
 	// Create MCP server
 	server := mcp.NewServer(&mcp.Implementation{

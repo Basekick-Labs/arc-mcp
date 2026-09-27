@@ -112,6 +112,12 @@ type QueryResponse struct {
 	Error           string          `json:"error,omitempty"`
 }
 
+// TokenVerifyResponse matches Arc's GET /api/v1/auth/verify response.
+type TokenVerifyResponse struct {
+	Valid       bool     `json:"valid"`
+	Permissions []string `json:"permissions"`
+}
+
 // Client is an HTTP client for the Arc REST API.
 type Client struct {
 	baseURL    string
@@ -147,6 +153,36 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("arc health check failed: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// VerifyToken returns the permissions reported by Arc for the configured token.
+func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/auth/verify", nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	c.setAuth(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("verifying token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
+
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
+		return nil, arcErrorFrom("verify token", resp.StatusCode, snippet)
+	}
+
+	var result TokenVerifyResponse
+	if err := json.NewDecoder(body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decoding token verification response: %w", err)
+	}
+	if !result.Valid {
+		return nil, &Error{Kind: "auth", Detail: "verify token: Arc reported an invalid token"}
+	}
+	return result.Permissions, nil
 }
 
 // ListDatabases returns all databases from Arc.
