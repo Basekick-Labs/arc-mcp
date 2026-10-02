@@ -47,6 +47,13 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 		}
 
 		result, err := client.ListMeasurements(ctx, args.Database)
+		if arc.Scoped(err) {
+			// The token reads some databases but not this one. Naming a
+			// different database is the only thing that resolves it, and
+			// only the user knows which — so say that rather than
+			// returning a tool error the model can only retry.
+			return ScopedResult(args.Database, "list_measurements"), nil, nil
+		}
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{

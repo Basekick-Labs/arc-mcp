@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,9 +20,47 @@ import (
 // messages without leaking internal detail (stack traces, paths, SQL context)
 // to the LLM.
 type Error struct {
-	Kind   string // "auth", "not_found", "server", "network", "too_large", "parse", "query"
+	Kind   string // see the Kind* constants
+	Status int    // HTTP status when the error came from a response, 0 otherwise
 	Detail string // full detail — log to stderr, never send to LLM
 }
+
+// The Kind values Error can carry. The three permission kinds are kept
+// apart because they need different answers: a bad token, a token
+// missing a permission outright, and a token restricted to particular
+// databases are not the same problem, and only the last one is resolved
+// by naming a database.
+const (
+	// KindAuth is HTTP 401 — the token is missing, invalid or expired.
+	KindAuth = "auth"
+	// KindForbidden is HTTP 403 from Arc's coarse permission check — the
+	// token does not carry the permission the route requires at all.
+	KindForbidden = "forbidden"
+	// KindScoped is HTTP 403 from Arc's per-database permission check —
+	// the token can read, but not the database it asked about. Arc
+	// answers the list-everything route this way rather than returning a
+	// filtered list, so a scoped caller has to name a database it is
+	// granted. This is an expected state, not a fault, and retrying it
+	// without changing the database will fail the same way.
+	KindScoped = "scoped"
+	// KindUnavailable is HTTP 403 when Arc could not load the token's
+	// grants and failed closed. Nothing about the token or the database
+	// caused it, so it must not be reported as a permission problem.
+	KindUnavailable = "permissions_unavailable"
+	// KindNotFound is HTTP 404 — no such database or measurement.
+	KindNotFound = "not_found"
+
+	// KindServer is any other non-2xx response from Arc.
+	KindServer = "server"
+	// KindNetwork is a failure to reach Arc at all.
+	KindNetwork = "network"
+	// KindTooLarge is a response bigger than arc-mcp will read.
+	KindTooLarge = "too_large"
+	// KindParse is a response arc-mcp could not decode.
+	KindParse = "parse"
+	// KindQuery is a query Arc rejected.
+	KindQuery = "query"
+)
 
 func (e *Error) Error() string { return e.Kind + ": " + e.Detail }
 
@@ -30,14 +69,81 @@ func (e *Error) Error() string { return e.Kind + ": " + e.Detail }
 func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	detail := fmt.Sprintf("%s: HTTP %d: %s", op, statusCode, strings.TrimSpace(string(snippet)))
 	log.Printf("arc error: %s", detail)
-	kind := "server"
-	switch statusCode {
-	case 401, 403:
-		kind = "auth"
-	case 404:
-		kind = "not_found"
+	kind := KindServer
+	switch {
+	case statusCode == 401:
+		kind = KindAuth
+	case statusCode == 403 && isPermissionDataUnavailable(snippet):
+		kind = KindUnavailable
+	case statusCode == 403 && isScopedDenial(snippet):
+		kind = KindScoped
+	case statusCode == 403:
+		kind = KindForbidden
+	case statusCode == 404:
+		kind = KindNotFound
 	}
-	return &Error{Kind: kind, Detail: detail}
+	return &Error{Kind: kind, Status: statusCode, Detail: detail}
+}
+
+// Arc sends 403 for three different things and distinguishes them only
+// by message, so the message is what these read. The shapes Arc's read
+// middleware and handler gates produce:
+//
+//	no permission for read on database 'x'               -> KindScoped
+//	access denied: no read permission for database 'x'   -> KindScoped
+//	access denied: no read permission for db.measurement -> KindScoped
+//	access denied: no read permission to list databases  -> KindScoped
+//	permission data unavailable                          -> KindUnavailable
+//	token does not have 'read' permission                -> KindForbidden
+//	Permission denied: read required                     -> KindForbidden
+//
+// Matching is by stable fragment, so a change to the permission word or
+// to surrounding punctuation does not reclassify one as another. An
+// unrecognised 403 is KindForbidden on purpose: naming the token's
+// permissions is safe to say about any refusal, whereas telling a model
+// to ask for a database when the token simply cannot read sends the
+// conversation the wrong way.
+
+// errorMessage pulls Arc's message out of a JSON error body, falling
+// back to the raw bytes for a non-JSON one.
+func errorMessage(body []byte) string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Error != "" {
+		return parsed.Error
+	}
+	return string(body)
+}
+
+// isScopedDenial recognises every body that means "your grants do not
+// cover what you asked for".
+func isScopedDenial(body []byte) bool {
+	msg := strings.ToLower(strings.TrimSpace(errorMessage(body)))
+	switch {
+	case strings.HasPrefix(msg, "no permission for ") && strings.Contains(msg, " on database "):
+		return true
+	case strings.HasPrefix(msg, "access denied: no ") &&
+		(strings.Contains(msg, "permission for ") || strings.Contains(msg, "permission to list databases")):
+		return true
+	default:
+		return false
+	}
+}
+
+// isPermissionDataUnavailable recognises Arc's fail-closed answer when
+// it could not load the token's grants. Checked before isScopedDenial so
+// a server fault is never reported as a scoping state.
+func isPermissionDataUnavailable(body []byte) bool {
+	return strings.Contains(strings.ToLower(errorMessage(body)), "permission data unavailable")
+}
+
+// Scoped reports whether err is Arc's per-database permission denial —
+// "you may read, but not that database". Tool handlers use it to answer
+// with guidance the model can act on instead of a tool error.
+func Scoped(err error) bool {
+	var ae *Error
+	return errors.As(err, &ae) && ae.Kind == KindScoped
 }
 
 // UserMessage returns a short, safe error message suitable for the LLM.
@@ -46,9 +152,15 @@ func UserMessage(err error) string {
 	var ae *Error
 	if ae, _ = err.(*Error); ae != nil { //nolint:errorlint
 		switch ae.Kind {
-		case "auth":
-			return "Arc authentication failed — check the API token."
-		case "not_found":
+		case KindAuth:
+			return "Arc rejected the token — it is missing, invalid or expired. Ask the user to check the token configured for this Arc server."
+		case KindForbidden:
+			return "Arc refused the request: this token does not carry the permission the endpoint requires. A token with read permission is needed."
+		case KindScoped:
+			return "This Arc token can only read specific databases, and not the one asked for. Ask the user which database to use, then call the tool again with that database."
+		case KindUnavailable:
+			return "Arc could not read its own permission data and refused the request rather than guessing. This is a server-side fault, not a problem with the token or the database — tell the user to check the Arc server log."
+		case KindNotFound:
 			return "The requested database or measurement was not found in Arc."
 		case "too_large":
 			return "Arc returned a response that was too large to process."
