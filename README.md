@@ -160,15 +160,25 @@ The server reads JSON-RPC from stdin and writes to stdout. All logs go to stderr
 
 ### list_databases
 
-List all databases in the Arc instance.
+List all databases in the Arc instance. Needs a token with read permission.
 
 **Example prompt:** "What databases are available?"
 
+A token Arc restricts to particular databases cannot list them all: Arc refuses
+the request rather than returning a partial list, the same way `SHOW DATABASES`
+does. The tool reports that as a result rather than an error, saying the token
+is scoped and that a database has to be named — so the model asks you which one
+instead of retrying. Call `list_measurements` with that database.
+
 ### list_measurements
 
-List all measurements (tables) in a database.
+List all measurements (tables) in a database. Needs a token with read
+permission for that database.
 
 **Example prompt:** "What tables are in the telemetry database?"
+
+A token that can read some databases but not the one asked for gets the same
+scoped result, naming the database it was refused for.
 
 ### describe_measurement
 
@@ -194,6 +204,7 @@ Get recent sample rows from a measurement, ordered by time descending.
 ## Safety
 
 - **Read-only:** All write operations (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, etc.) are blocked before reaching Arc
+- **Permission answers are kept apart:** Arc's 401 (token missing, invalid or expired), its 403 for a token without read permission, its 403 for a token scoped to other databases, and its 404 for a database that does not exist produce four different messages. arc-mcp never retries a refusal and never widens a token's reach to work around one
 - **Row limits:** Queries are capped at 500 rows by default (configurable)
 - **Response truncation:** Large responses are truncated to prevent overwhelming LLM context windows
 - **Timeout:** 30-second default query timeout

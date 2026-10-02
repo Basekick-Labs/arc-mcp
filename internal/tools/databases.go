@@ -22,6 +22,15 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 		defer RecoverToolPanic(&out)
 
 		dbResult, err := client.ListDatabases(ctx)
+		if arc.Scoped(err) {
+			// Arc refuses this route for a token restricted to specific
+			// databases rather than returning a filtered list, the same
+			// way SHOW DATABASES does. That is the expected answer, not a
+			// failure: report it as a result the model can act on, so it
+			// asks the user which database to use instead of retrying a
+			// call that will be refused identically.
+			return ScopedResult("", "list_measurements"), nil, nil
+		}
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
