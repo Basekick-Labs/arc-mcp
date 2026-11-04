@@ -99,7 +99,7 @@ func main() {
 		Name:    "arc-mcp",
 		Version: Version,
 	}, &mcp.ServerOptions{
-		Instructions: "Arc is a high-performance columnar analytical database. Use list_databases to discover databases, list_measurements to see tables, describe_measurement to understand schema, and query to run SQL (DuckDB dialect). Always describe a measurement before querying it.",
+		Instructions: "Arc is a high-performance columnar analytical database. Use list_databases to discover databases, list_measurements to see tables, describe_measurement to understand schema, and query to run SQL (DuckDB dialect). Use the arc_* observability tools for health, readiness, metrics, and (with an admin token) Arc application logs. Always describe a measurement before querying it.",
 	})
 
 	// Register tools
@@ -108,6 +108,7 @@ func main() {
 	tools.RegisterDescribeMeasurement(server, client, *maxResponseSize)
 	tools.RegisterQuery(server, client, *maxRows, *maxResponseSize)
 	tools.RegisterGetSampleData(server, client, *maxResponseSize)
+	tools.RegisterObservability(server, client, *maxResponseSize)
 
 	// Run on stdio
 	log.Printf("arc-mcp server starting (max-rows=%d, timeout=%s)", *maxRows, *timeout)

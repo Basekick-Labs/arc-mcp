@@ -19,7 +19,7 @@ import (
 // messages without leaking internal detail (stack traces, paths, SQL context)
 // to the LLM.
 type Error struct {
-	Kind   string // "auth", "not_found", "server", "network", "too_large", "parse", "query"
+	Kind   string // "auth", "admin_required", "unsupported", "forbidden", "not_found", "server", "network", "too_large", "parse", "query"
 	Detail string // full detail — log to stderr, never send to LLM
 }
 
@@ -48,6 +48,12 @@ func UserMessage(err error) string {
 		switch ae.Kind {
 		case "auth":
 			return "Arc authentication failed — check the API token."
+		case "admin_required":
+			return "Arc application logs require an admin token. Use a token with admin access to inspect server logs."
+		case "unsupported":
+			return "This Arc version does not expose the requested observability endpoint."
+		case "forbidden":
+			return "Arc denied access to this observability endpoint. Check the token permissions."
 		case "not_found":
 			return "The requested database or measurement was not found in Arc."
 		case "too_large":
