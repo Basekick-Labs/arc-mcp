@@ -54,9 +54,23 @@ arc-mcp. Do not share an administrator or write-capable token with an MCP
 client. Prefer `ARC_TOKEN_FILE` (or a secret-mounted `ARC_TOKEN`) so the token
 does not appear in shell history or process arguments.
 
+Create one with an admin token (`expires_in` is optional):
+
+```bash
+curl -s -X POST "$ARC_URL/api/v1/auth/tokens" \
+  -H "Authorization: Bearer $ARC_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"arc-mcp","permissions":["read"],"expires_in":"30d"}'
+```
+
+The response holds the new token once; store it in the file `ARC_TOKEN_FILE`
+points to. Leaving `permissions` out gives Arc's default, `read,write`.
+
 At startup, arc-mcp asks Arc's `/api/v1/auth/verify` endpoint for the token's
-permissions and warns when it detects `write`, `delete`, or `admin`. This is a
-defence-in-depth advisory; Arc remains responsible for enforcing permissions.
+permissions and logs them, with one warning naming any of `write`, `delete` or
+`admin`. The check is skipped when Arc is unreachable. It sees only the token's
+own permissions, not RBAC roles, and it does not stop arc-mcp from starting:
+Arc remains responsible for enforcing permissions.
 
 ## Docker Compose (quick-start)
 
