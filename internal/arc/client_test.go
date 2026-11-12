@@ -89,3 +89,27 @@ func TestClient_SetsAuthAndDatabaseHeaders(t *testing.T) {
 		t.Errorf("x-arc-database header = %q, want %q", gotDB, "telemetry")
 	}
 }
+
+func TestClient_VerifyToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/auth/verify" {
+			t.Errorf("request = %s %s, want GET /api/v1/auth/verify", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, `{"valid":true,"permissions":["read"]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "secret", time.Second)
+	permissions, err := c.VerifyToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer secret")
+	}
+	if len(permissions) != 1 || permissions[0] != "read" {
+		t.Errorf("permissions = %v, want [read]", permissions)
+	}
+}

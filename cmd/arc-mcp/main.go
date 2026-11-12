@@ -71,11 +71,27 @@ func main() {
 	// Verify connectivity
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	healthy := true
 	if err := client.Health(ctx); err != nil {
+		healthy = false
 		log.Printf("Warning: Arc health check failed: %v", err)
 		log.Printf("The MCP server will start anyway — queries will fail until Arc is reachable at %s", *arcURL)
 	} else {
 		log.Printf("Connected to Arc at %s", *arcURL)
+	}
+	// Skipped when Arc is unreachable: a second failure would only repeat
+	// the health warning above.
+	if *arcToken != "" && healthy {
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		permissions, err := client.VerifyToken(verifyCtx)
+		verifyCancel()
+		if err != nil {
+			log.Printf("Warning: Arc token verification failed: %v", err)
+		} else {
+			for _, line := range tokenScopeLog(permissions) {
+				log.Print(line)
+			}
+		}
 	}
 
 	// Create MCP server
@@ -99,6 +115,29 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// tokenScopeLog returns the startup log lines describing the permissions Arc
+// reports for the configured token: one line listing them, and one warning
+// naming every write-class permission (write, delete, admin), since arc-mcp's
+// tools only read. Advisory only: Arc enforces permissions, and a token's
+// RBAC roles (which /api/v1/auth/verify does not report) can grant more.
+func tokenScopeLog(permissions []string) []string {
+	if len(permissions) == 0 {
+		return []string{"Arc token has no direct permissions; its access comes from RBAC roles, which this check cannot see"}
+	}
+	lines := []string{"Arc token permissions: " + strings.Join(permissions, ", ")}
+	var overScoped []string
+	for _, p := range permissions {
+		switch p {
+		case "write", "delete", "admin":
+			overScoped = append(overScoped, p)
+		}
+	}
+	if len(overScoped) > 0 {
+		lines = append(lines, fmt.Sprintf("WARNING: Arc token carries %s; arc-mcp only reads, so give it a token with only the read permission", strings.Join(overScoped, ", ")))
+	}
+	return lines
 }
 
 // validateArcURL rejects configurations that would send a Bearer token over
