@@ -217,9 +217,23 @@ Get recent sample rows from a measurement, ordered by time descending.
 
 **Example prompt:** "Show me some recent data from the temperature measurement"
 
+### Read-only observability tools
+
+- `arc_health` and `arc_readiness` — liveness and traffic readiness (a not-ready HTTP 503 is returned as a normal status snapshot).
+- `arc_metrics`, `arc_memory_metrics`, `arc_query_pool_metrics`, and `arc_endpoint_metrics` — aggregate server, runtime, connection-pool, and endpoint metrics.
+- `arc_timeseries_metrics` — system, application, or API metrics with a 1–1440 minute look-back.
+- `arc_application_logs` — buffered Arc server logs, with severity, look-back, and limit filters. This is distinct from log data stored in Arc measurements and requires an **admin token**.
+
+Observability responses are JSON, capped by the configured maximum response size. Filters are validated and bounded before requests are sent. Metrics and logs describe only the Arc node configured by `ARC_URL`; in a cluster, point `ARC_URL` at the node you want to inspect.
+
+Common diagnostic workflows:
+- Is Arc healthy? Use `arc_readiness` (and `arc_health` for liveness and license/storage details).
+- Why are queries slow? Combine `arc_query_pool_metrics` with `arc_application_logs` filtered to `warn` or `error`.
+- Is the API or host under pressure? Compare `arc_endpoint_metrics` with `arc_timeseries_metrics` for `api` or `system`.
+
 ## Safety
 
-- **Read-only:** All write operations (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, etc.) are blocked before reaching Arc
+- **Read-only:** All query and observability tools use GET or validated read-only SQL. All write operations (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, etc.) are blocked before reaching Arc
 - **Row limits:** Queries are capped at 500 rows by default (configurable)
 - **Response truncation:** Large responses are truncated to prevent overwhelming LLM context windows
 - **Timeout:** 30-second default query timeout
