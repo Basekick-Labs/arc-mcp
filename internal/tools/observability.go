@@ -112,30 +112,47 @@ func compactTimeSeriesResponse(body json.RawMessage, maxChars int) string {
 		}
 		return compact.String()
 	}
-	encode := func() []byte {
-		rawPoints, _ := json.Marshal(points)
+	encode := func(kept []json.RawMessage) []byte {
+		rawPoints, _ := json.Marshal(kept)
 		envelope["data"] = rawPoints
 		encoded, _ := json.Marshal(envelope)
 		return encoded
 	}
-	encoded := encode()
-	if maxChars <= 0 || len(encoded) <= maxChars {
+	encoded := encode(points)
+	if maxChars <= 0 || len(encoded) <= maxChars || len(points) == 0 {
 		return string(encoded)
 	}
-	dropped := 0
-	for len(encoded) > maxChars && len(points) > 0 {
-		points = points[1:]
-		dropped++
-		count, _ := json.Marshal(dropped)
-		envelope["truncated_points"] = count
-		encoded = encode()
+
+	// Size the envelope once with an empty data array and the widest possible
+	// truncated_points value, then keep the longest newest suffix that fits.
+	// The cost is linear in the response size. Re-encoding the whole envelope
+	// once per dropped point is quadratic: seconds for 4,000 points, and Arc's
+	// metrics.timeseries_* settings allow buffers of tens of thousands.
+	// json.Marshal encodes each element exactly as it does inside the array,
+	// so the sum below is the exact size of the kept points. Keeping a point
+	// shortens truncated_points by at most one digit and costs at least two
+	// bytes, so the size grows with every point kept and the first point that
+	// does not fit ends the search.
+	widest := strconv.Itoa(len(points))
+	envelope["truncated_points"] = json.RawMessage(widest)
+	base := len(encode([]json.RawMessage{}))
+	used, kept := 0, 0
+	for i := len(points) - 1; i >= 0; i-- {
+		size, _ := json.Marshal(points[i])
+		cost := len(size)
+		if kept > 0 {
+			cost++ // separating comma
+		}
+		digitsSaved := len(widest) - len(strconv.Itoa(len(points)-kept-1))
+		if base-digitsSaved+used+cost > maxChars {
+			break
+		}
+		used += cost
+		kept++
 	}
-	if _, exists := envelope["truncated_points"]; !exists {
-		count, _ := json.Marshal(dropped)
-		envelope["truncated_points"] = count
-		encoded = encode()
-	}
-	return string(encoded)
+	dropped, _ := json.Marshal(len(points) - kept)
+	envelope["truncated_points"] = dropped
+	return string(encode(points[len(points)-kept:]))
 }
 
 type invalidArgumentError struct{ message string }

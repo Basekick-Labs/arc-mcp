@@ -80,8 +80,50 @@ func TestCompactTimeSeriesResponseKeepsNewestPointsAndValidJSON(t *testing.T) {
 	if decoded.Data[0].Timestamp != decoded.Truncated {
 		t.Fatalf("first kept point = %d, want %d (a contiguous newest suffix)", decoded.Data[0].Timestamp, decoded.Truncated)
 	}
-	if len(got) > 220 {
-		t.Fatalf("response is %d bytes, want at most the 220-byte cap", len(got))
+}
+
+// TestCompactTimeSeriesResponseFillsTheCap pins both edges of the budget
+// across many caps: the output never exceeds the cap, and keeping one more
+// point would have.
+func TestCompactTimeSeriesResponseFillsTheCap(t *testing.T) {
+	points := make([]map[string]any, 360)
+	for i := range points {
+		points[i] = map[string]any{"timestamp": "2026-11-15T17:00:00.123456789Z", "seq": i, "latency_p99_ms": 1.25}
+	}
+	body, err := json.Marshal(map[string]any{"type": "api", "points_count": len(points), "data": points})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for maxChars := 200; maxChars < 30000; maxChars += 97 {
+		got := compactTimeSeriesResponse(body, maxChars)
+		var decoded struct {
+			Data      []json.RawMessage `json:"data"`
+			Truncated int               `json:"truncated_points"`
+		}
+		if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+			t.Fatalf("cap %d: invalid JSON: %v", maxChars, err)
+		}
+		if len(got) > maxChars {
+			t.Fatalf("cap %d: response is %d bytes", maxChars, len(got))
+		}
+		if decoded.Truncated+len(decoded.Data) != len(points) {
+			t.Fatalf("cap %d: truncated_points %d + kept %d != %d", maxChars, decoded.Truncated, len(decoded.Data), len(points))
+		}
+		if decoded.Truncated == 0 {
+			continue
+		}
+		oneMore, err := json.Marshal(map[string]any{
+			"type":             "api",
+			"points_count":     len(points),
+			"data":             points[decoded.Truncated-1:],
+			"truncated_points": decoded.Truncated - 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(oneMore) <= maxChars {
+			t.Fatalf("cap %d: kept %d points but %d fit (%d bytes)", maxChars, len(decoded.Data), len(decoded.Data)+1, len(oneMore))
+		}
 	}
 }
 
