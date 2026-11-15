@@ -74,6 +74,32 @@ func TestCompactTimeSeriesResponseKeepsNewestPointsAndValidJSON(t *testing.T) {
 	if decoded.Data[0].Timestamp <= 0 {
 		t.Fatalf("oldest points were not discarded: %#v", decoded.Data)
 	}
+	if decoded.Truncated+len(decoded.Data) != len(points) {
+		t.Fatalf("truncated_points = %d with %d points kept, want them to sum to %d", decoded.Truncated, len(decoded.Data), len(points))
+	}
+	if decoded.Data[0].Timestamp != decoded.Truncated {
+		t.Fatalf("first kept point = %d, want %d (a contiguous newest suffix)", decoded.Data[0].Timestamp, decoded.Truncated)
+	}
+	if len(got) > 220 {
+		t.Fatalf("response is %d bytes, want at most the 220-byte cap", len(got))
+	}
+}
+
+func TestCompactTimeSeriesResponseUnderCapIsUntouched(t *testing.T) {
+	body := []byte(`{"type": "api", "data": [{"timestamp": 1}, {"timestamp": 2}]}`)
+	got := compactTimeSeriesResponse(body, 50000)
+	if strings.Contains(got, "truncated_points") {
+		t.Fatalf("truncated_points reported for a response under the cap: %s", got)
+	}
+	if strings.Contains(got, " ") {
+		t.Fatalf("response not compacted: %s", got)
+	}
+	var decoded struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil || len(decoded.Data) != 2 {
+		t.Fatalf("decoded = %#v, err = %v, want both points", decoded, err)
+	}
 }
 
 func TestInvalidArgumentErrorIsNotReportedAsArcError(t *testing.T) {
@@ -81,7 +107,19 @@ func TestInvalidArgumentErrorIsNotReportedAsArcError(t *testing.T) {
 	if _, ok := err.(*invalidArgumentError); !ok {
 		t.Fatalf("error type = %T, want invalidArgumentError", err)
 	}
-	if got := fmt.Sprintf("Invalid argument: %v", err); got == "" {
-		t.Fatal("empty validation message")
+	result := observabilityError(err)
+	if !result.IsError || len(result.Content) != 1 {
+		t.Fatalf("result = %#v, want one error content", result)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content type = %T, want *mcp.TextContent", result.Content[0])
+	}
+	if strings.Contains(text.Text, "Arc error") {
+		t.Fatalf("validation error labelled as an Arc error: %q", text.Text)
+	}
+	want := "Invalid argument: metric type must be one of: system, application, api"
+	if text.Text != want {
+		t.Fatalf("message = %q, want %q", text.Text, want)
 	}
 }
