@@ -2,9 +2,12 @@ package arc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -111,5 +114,112 @@ func TestClient_VerifyToken(t *testing.T) {
 	}
 	if len(permissions) != 1 || permissions[0] != "read" {
 		t.Errorf("permissions = %v, want [read]", permissions)
+	}
+}
+func TestClient_GetJSON_EncodesQueryAndAuth(t *testing.T) {
+	var gotPath, gotQuery, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, `{"type":"system","data":[]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL+"/proxy", "secret", time.Second)
+	query := make(url.Values)
+	query.Set("duration_minutes", "30")
+	body, err := c.GetJSON(context.Background(), "/api/v1/metrics/timeseries/system", query)
+	if err != nil {
+		t.Fatalf("GetJSON returned error: %v", err)
+	}
+	if string(body) != `{"type":"system","data":[]}` {
+		t.Errorf("body = %s", body)
+	}
+	if gotPath != "/proxy/api/v1/metrics/timeseries/system" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotQuery != "duration_minutes=30" {
+		t.Errorf("query = %q", gotQuery)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestClient_GetJSON_Readiness503IsAValidSnapshot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"status":"not_ready","reason":"startup recovery"}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", time.Second)
+	body, err := c.GetJSON(context.Background(), "/ready", nil)
+	if err != nil {
+		t.Fatalf("not-ready response should be returned as data: %v", err)
+	}
+	if !json.Valid(body) || !strings.Contains(string(body), "startup recovery") {
+		t.Errorf("unexpected readiness body: %s", body)
+	}
+}
+
+func TestClient_GetJSON_ClassifiesUnsupportedAndAdminOnlyEndpoints(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		endpoint string
+		status   int
+		wantKind string
+	}{
+		{"unsupported Arc version", "/api/v1/metrics/memory", http.StatusNotFound, "unsupported"},
+		{"application logs require admin", "/api/v1/logs", http.StatusForbidden, "admin_required"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				fmt.Fprint(w, `{"error":"not available"}`)
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, "token", time.Second)
+			_, err := c.GetJSON(context.Background(), tt.endpoint, nil)
+			apiErr, ok := err.(*Error)
+			if !ok {
+				t.Fatalf("error type = %T, want *Error", err)
+			}
+			if apiErr.Kind != tt.wantKind {
+				t.Errorf("error kind = %q, want %q", apiErr.Kind, tt.wantKind)
+			}
+		})
+	}
+}
+
+func TestClient_GetJSON_RejectsInvalidJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"broken":`) }))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok", time.Second)
+	_, err := c.GetJSON(context.Background(), "/api/v1/metrics", nil)
+	apiErr, ok := err.(*Error)
+	if !ok || apiErr.Kind != "parse" {
+		t.Fatalf("error = %#v, want parse *Error", err)
+	}
+}
+
+func TestClient_GetJSON_ResponseSizeCap(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		chunk := strings.NewReader(strings.Repeat("x", 1<<20))
+		for written := 0; written < maxArcResponseBytes+1; written += 1 << 20 {
+			if _, err := io.CopyN(w, chunk, 1<<20); err != nil {
+				return
+			}
+			chunk = strings.NewReader(strings.Repeat("x", 1<<20))
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok", 10*time.Second)
+	_, err := c.GetJSON(context.Background(), "/api/v1/metrics", nil)
+	apiErr, ok := err.(*Error)
+	if !ok || apiErr.Kind != "too_large" {
+		t.Fatalf("error = %#v, want too_large *Error", err)
 	}
 }
