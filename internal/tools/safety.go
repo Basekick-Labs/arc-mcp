@@ -6,6 +6,8 @@ import (
 	"log"
 	"regexp"
 	"runtime/debug"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -59,156 +61,248 @@ func ValidateIdentifier(s string) error {
 	return nil
 }
 
-// dangerousPatterns matches SQL statements that modify data.
-// Arc server-side is the authoritative read-only guard; this layer is advisory
-// and defense-in-depth for accidental LLM-generated writes.
-var dangerousPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\bINSERT\s+INTO\b`),
-	regexp.MustCompile(`(?i)\bUPDATE\s+\w+\s+SET\b`),
-	regexp.MustCompile(`(?i)\bDELETE\s+FROM\b`),
-	regexp.MustCompile(`(?i)\bDROP\s+(?:TABLE|DATABASE|INDEX|VIEW|SCHEMA)\b`),
-	regexp.MustCompile(`(?i)\bALTER\s+(?:TABLE|DATABASE)\b`),
-	regexp.MustCompile(`(?i)\bCREATE\s+(?:TABLE|DATABASE|INDEX|VIEW|SCHEMA)\b`),
-	regexp.MustCompile(`(?i)\bTRUNCATE\s+TABLE\b`),
-	regexp.MustCompile(`(?i)\bATTACH\b`),
-	regexp.MustCompile(`(?i)\bDETACH\b`),
-	regexp.MustCompile(`(?i)\bCOPY\b`),
-	regexp.MustCompile(`(?i)\bEXPORT\b`),
-	regexp.MustCompile(`(?i)\bIMPORT\b`),
-	regexp.MustCompile(`(?i)\bLOAD\b`),
-	regexp.MustCompile(`(?i)\bINSTALL\b`),
+// Words Arc's query validator refuses wherever they appear as code, even
+// as a column name or alias, and the two-word shapes it refuses (one of
+// the second words directly after the first). INSERT [OR x] INTO,
+// UPDATE x SET and CREATE/DROP ... SECRET are handled in refusedPhrases.
+// This is a subset of Arc's checks, kept so the model learns why and what
+// to change; Arc stays the authority and refuses more (file functions,
+// backticks, Unicode escapes), and its message is passed through when it
+// does. When Arc's list changes, change this one.
+var (
+	refusedWords = map[string]bool{
+		"attach": true, "detach": true, "copy": true, "pragma": true, "set": true, "reset": true,
+		"load": true, "install": true, "call": true, "prepare": true, "execute": true,
+	}
+	refusedPairs = map[string][]string{
+		"drop":     {"table", "database", "index", "view"},
+		"create":   {"table", "database", "index"},
+		"alter":    {"table"},
+		"truncate": {"table"},
+		"delete":   {"from"},
+		"merge":    {"into"},
+		"export":   {"database"},
+		"import":   {"database"},
+	}
+)
+
+// refusedPhrases returns each word or phrase in toks that Arc refuses, in
+// order, without repeats (for example "DELETE FROM", "LOAD").
+func refusedPhrases(toks []token) []string {
+	var found []string
+	add := func(p string) {
+		if !slices.Contains(found, p) {
+			found = append(found, p)
+		}
+	}
+	word := func(k int) string {
+		if k < len(toks) && toks[k].kind == wordToken {
+			return toks[k].text
+		}
+		return ""
+	}
+	for k, t := range toks {
+		if t.kind != wordToken || gluedToLiteral(toks, k) {
+			continue
+		}
+		w := t.text
+		switch {
+		case refusedWords[w]:
+			add(strings.ToUpper(w))
+		case asciiParts(w) != nil:
+			// Arc matches with ASCII word boundaries, so in `set$x` or
+			// `éset` it still finds SET.
+			for _, part := range asciiParts(w) {
+				if refusedWords[part] {
+					add(strings.ToUpper(part))
+				}
+			}
+		case slices.Contains(refusedPairs[w], word(k+1)):
+			add(strings.ToUpper(w + " " + word(k+1)))
+		case w == "insert" && (word(k+1) == "into" || word(k+1) == "or" && word(k+3) == "into"):
+			add("INSERT INTO")
+		case w == "update" && word(k+2) == "set":
+			add("UPDATE ... SET")
+		case w == "create" || w == "drop":
+			if slices.ContainsFunc(toks[k+1:], func(t token) bool { return t.is("secret") }) {
+				add(strings.ToUpper(w) + " ... SECRET")
+			}
+		}
+	}
+	return found
 }
 
-// normalizeForCheck strips comments and string/identifier literals so the
-// dangerous-pattern regexes don't fire on keywords inside them, and rejects
-// multi-statement queries (embedded semicolons). A trailing semicolon is OK.
-func normalizeForCheck(sql string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(sql))
-
-	runes := []rune(sql)
-	i := 0
-	for i < len(runes) {
-		r := runes[i]
-
-		// -- line comment
-		if r == '-' && i+1 < len(runes) && runes[i+1] == '-' {
-			for i < len(runes) && runes[i] != '\n' {
-				i++
-			}
-			continue
-		}
-
-		// /* block comment */ (non-nested; nested block comments are extremely rare)
-		if r == '/' && i+1 < len(runes) && runes[i+1] == '*' {
-			i += 2
-			for i+1 < len(runes) && (runes[i] != '*' || runes[i+1] != '/') {
-				i++
-			}
-			if i+1 < len(runes) {
-				i += 2
-			} else {
-				i = len(runes)
-			}
-			continue
-		}
-
-		// 'single-quoted' string (SQL doubles the quote to escape)
-		if r == '\'' {
-			i++
-			for i < len(runes) {
-				if runes[i] == '\'' {
-					if i+1 < len(runes) && runes[i+1] == '\'' {
-						i += 2
-						continue
-					}
-					i++
-					break
-				}
-				i++
-			}
-			continue
-		}
-
-		// "double-quoted" identifier
-		if r == '"' {
-			i++
-			for i < len(runes) {
-				if runes[i] == '"' {
-					if i+1 < len(runes) && runes[i+1] == '"' {
-						i += 2
-						continue
-					}
-					i++
-					break
-				}
-				i++
-			}
-			continue
-		}
-
-		b.WriteRune(r)
-		i++
+// asciiParts splits a word that contains $ or non-ASCII letters into its
+// ASCII [a-z0-9_] runs; nil for a plain ASCII word.
+func asciiParts(w string) []string {
+	notASCIIWord := func(r rune) bool {
+		return r != '_' && (r < 'a' || r > 'z') && (r < '0' || r > '9')
 	}
-
-	cleaned := b.String()
-
-	// Reject embedded semicolons (allow one trailing).
-	stripped := strings.TrimRight(cleaned, " \t\r\n")
-	stripped = strings.TrimSuffix(stripped, ";")
-	if strings.ContainsRune(stripped, ';') {
-		return "", errors.New("multi-statement queries are not allowed")
+	if !strings.ContainsFunc(w, notASCIIWord) {
+		return nil
 	}
-
-	return cleaned, nil
+	return strings.FieldsFunc(w, notASCIIWord)
 }
 
-// ValidateReadOnly checks that the SQL query is read-only.
-// Returns a generic error when rejected; callers should log the underlying
-// detail (matched pattern, SQL preview) to stderr for operator debugging.
-func ValidateReadOnly(sql string) error {
-	trimmed := strings.TrimSpace(sql)
-	if trimmed == "" {
-		return errors.New("empty SQL query")
-	}
+// gluedToLiteral reports whether the word at k touches a literal with no
+// space between. Arc checks words after replacing literals with
+// placeholder words, so there the two read as one word and the check
+// does not fire; it must not fire here either.
+func gluedToLiteral(toks []token, k int) bool {
+	return k > 0 && toks[k-1].kind == literalToken && toks[k-1].end == toks[k].pos ||
+		k+1 < len(toks) && toks[k+1].kind == literalToken && toks[k].end == toks[k+1].pos
+}
 
-	cleaned, err := normalizeForCheck(trimmed)
+// ReadQuery is a query that passed ValidateReadOnly, ready to send to Arc.
+type ReadQuery struct {
+	l lexed
+}
+
+// readStatementList is how refusals name the statements that run.
+const readStatementList = "SELECT, FROM, VALUES, WITH, PIVOT, UNPIVOT, SHOW, DESCRIBE, SUMMARIZE, EXPLAIN"
+
+// ValidateReadOnly checks that sql is one read-only statement and, when it
+// is not, says what to change. The checks are a subset of Arc's own (Arc's
+// server-side validation and a read-only token are the security boundary):
+// arc-mcp's job is to answer early, with a reason the model can act on.
+func ValidateReadOnly(sql string) (*ReadQuery, error) {
+	if strings.TrimSpace(sql) == "" {
+		return nil, errors.New("empty SQL query")
+	}
+	l, err := lex(sql)
 	if err != nil {
-		return fmt.Errorf("query rejected: %w", err)
+		return nil, fmt.Errorf("query rejected: %w", err)
 	}
 
-	for _, pattern := range dangerousPatterns {
-		if pattern.MatchString(cleaned) {
-			return errors.New("query rejected: only read-only SQL is allowed")
+	if !readsOnly(l.toks) {
+		first, ok := firstToken(l.toks)
+		switch {
+		case !ok || first.is(";"):
+			return nil, errors.New("query rejected: there is no statement to run")
+		case first.is("with") || first.is("explain"):
+			return nil, fmt.Errorf("query rejected: the statement after %s is not a read; arc-mcp only runs read-only queries", strings.ToUpper(first.text))
+		case first.kind != wordToken:
+			return nil, fmt.Errorf("query rejected: a query must start with a statement keyword; arc-mcp only runs read-only queries (%s)", readStatementList)
+		default:
+			return nil, fmt.Errorf("query rejected: arc-mcp only runs read-only queries (%s); this one starts with %s", readStatementList, strings.ToUpper(first.text))
 		}
 	}
 
-	return nil
+	if phrases := refusedPhrases(l.toks); len(phrases) > 0 {
+		quoted := make([]string, len(phrases))
+		for i, p := range phrases {
+			quoted[i] = `"` + strings.ToLower(strings.Fields(p)[0]) + `"`
+		}
+		return nil, fmt.Errorf("query rejected: Arc refuses %s in a query, even when the word is a column name or alias. "+
+			"If it is a column or alias here, double-quote it: %s",
+			strings.Join(phrases, ", "), strings.Join(quoted, ", "))
+	}
+
+	return &ReadQuery{l: l}, nil
 }
 
-// limitPattern captures an existing LIMIT clause and its integer argument.
-var limitPattern = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\b`)
+// Row-limit bounds. Arc is asked for maxRows+1 rows; 100,000 rows is far
+// beyond what a model can read.
+const (
+	MinRowLimit = 1
+	MaxRowLimit = 100_000
+)
 
-// EnforceRowLimit caps the query's row output at maxRows. If the query has no
-// LIMIT, one is appended. If it has a LIMIT > maxRows, the existing clause is
-// rewritten. Existing LIMITs ≤ maxRows are preserved unchanged.
-func EnforceRowLimit(sql string, maxRows int) string {
-	trimmed := strings.TrimSpace(sql)
+// ClampRowLimit keeps a configured row limit inside [MinRowLimit, MaxRowLimit].
+func ClampRowLimit(n int) int {
+	return max(MinRowLimit, min(n, MaxRowLimit))
+}
 
-	if m := limitPattern.FindStringSubmatchIndex(trimmed); m != nil {
-		var n int
-		if _, err := fmt.Sscanf(trimmed[m[2]:m[3]], "%d", &n); err != nil {
-			// Unparseable digits (shouldn't happen given the regex) — leave as-is.
-			return trimmed
+// Selectable reports whether the statement returns rows the limit applies
+// to (SELECT, FROM, VALUES, WITH, PIVOT, UNPIVOT). SHOW, DESCRIBE,
+// SUMMARIZE and EXPLAIN are sent unchanged.
+func (q *ReadQuery) Selectable() bool {
+	first, ok := firstToken(q.l.toks)
+	return ok && first.kind == wordToken && selectStatements[first.text]
+}
+
+// WithRowLimit returns the SQL to send to Arc so that at most maxRows+1
+// rows come back; one row more than will be shown is how the caller learns
+// the result was cut. maxRows must already be clamped.
+//
+// The statement's own top-level LIMIT is what is changed, so the WHERE
+// clause stays exactly where Arc's time-range pruning looks for it:
+//   - no top-level LIMIT: append "\nLIMIT maxRows+1" (the newline ends any
+//     trailing -- comment; trailing semicolons are dropped first). A LIMIT
+//     inside a CTE or subquery is not the statement's and is left alone,
+//     and neither is a column named limit (`AS limit`, `t.limit`).
+//   - LIMIT n with n <= maxRows: unchanged.
+//   - LIMIT n with n > maxRows: n becomes maxRows+1, OFFSET untouched.
+//   - anything else (LIMIT expression, LIMIT n%, FETCH), and a statement
+//     that is one parenthesised query, where DuckDB rejects a LIMIT after
+//     the closing parenthesis: wrap the whole query as a subquery. Correct,
+//     but Arc cannot prune by time through a subquery (it cannot for a
+//     parenthesised statement either), so it is kept for these forms only.
+//
+// Statements that are not Selectable are returned unchanged; the caller
+// still cuts their rows.
+func (q *ReadQuery) WithRowLimit(maxRows int) string {
+	sql, toks := q.l.sql, q.l.toks
+	if !q.Selectable() {
+		return sql
+	}
+	if toks[0].is("(") {
+		if end := groupEnd(toks, 0); end == len(toks) || toks[end].is(";") {
+			return q.wrapped(maxRows)
 		}
-		if n > maxRows {
-			return trimmed[:m[2]] + fmt.Sprintf("%d", maxRows) + trimmed[m[3]:]
-		}
-		return trimmed
 	}
 
-	trimmed = strings.TrimRight(trimmed, "; \t\n")
-	return fmt.Sprintf("%s LIMIT %d", trimmed, maxRows)
+	depth, limitAt := 0, -1
+	for k, t := range toks {
+		switch {
+		case t.is("("):
+			depth++
+		case t.is(")"):
+			depth--
+		case depth == 0 && (t.is("limit") || t.is("fetch")):
+			if k == 0 || !toks[k-1].is("as") && !toks[k-1].is(".") {
+				limitAt = k
+			}
+		}
+	}
+
+	if limitAt < 0 {
+		return fmt.Sprintf("%s\nLIMIT %d", q.withoutSemicolons(), maxRows+1)
+	}
+	if toks[limitAt].is("limit") && limitAt+1 < len(toks) {
+		num := toks[limitAt+1]
+		next := limitAt + 2
+		plainEnd := next == len(toks) || toks[next].is("offset") || toks[next].is(";")
+		if num.kind == numberToken && isDigits(num.text) && plainEnd {
+			// A number too large for uint64 is larger than maxRows too.
+			if n, err := strconv.ParseUint(num.text, 10, 64); err == nil && n <= uint64(maxRows) {
+				return sql
+			}
+			return sql[:num.pos] + strconv.Itoa(maxRows+1) + sql[num.end:]
+		}
+	}
+	return q.wrapped(maxRows)
+}
+
+// wrapped is the query as a subquery under the row limit.
+func (q *ReadQuery) wrapped(maxRows int) string {
+	return fmt.Sprintf("SELECT * FROM (\n%s\n) AS arc_mcp_q LIMIT %d", q.withoutSemicolons(), maxRows+1)
+}
+
+// withoutSemicolons is the query with its trailing semicolons blanked and
+// trailing whitespace trimmed (lex allows semicolons only at the end).
+func (q *ReadQuery) withoutSemicolons() string {
+	body := []byte(q.l.sql)
+	for _, t := range q.l.toks {
+		if t.is(";") {
+			body[t.pos] = ' '
+		}
+	}
+	return strings.TrimRight(string(body), " \t\r\n\f")
+}
+
+func isDigits(s string) bool {
+	return s != "" && strings.Trim(s, "0123456789") == ""
 }
 
 // TruncateResponse caps the response string at approximately maxChars bytes,

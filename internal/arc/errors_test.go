@@ -162,3 +162,26 @@ func TestListingRoutes_OtherStatusesAreNotScoped(t *testing.T) {
 		})
 	}
 }
+
+// A 400 is Arc refusing the request as invalid, with a fixed validation
+// message the model can act on. Other statuses keep the generic text.
+func TestUserMessage_ValidationRefusalCarriesArcsWords(t *testing.T) {
+	long := strings.Repeat("x", 400)
+	tests := []struct {
+		status int
+		body   string
+		want   string
+	}{
+		{400, `{"success":false,"error":"Dangerous SQL operation not allowed"}`, "Arc refused the request: Dangerous SQL operation not allowed"},
+		{400, `{"success":false,"error":"first line\nLINE 1: SELECT secret_path"}`, "Arc refused the request: first line"},
+		{400, `{"success":false,"error":"` + long + `"}`, "Arc refused the request: " + long[:300] + "…"},
+		{500, `{"success":false,"error":"IO Error: /data/arc/x.parquet"}`, "Arc returned an error — see server logs for details."},
+		{400, `<html><body>400 Bad Request from proxy</body></html>`, "Arc returned an error — see server logs for details."},
+	}
+	for _, tt := range tests {
+		got := UserMessage(arcErrorFrom("query", tt.status, []byte(tt.body)))
+		if got != tt.want {
+			t.Errorf("status %d: UserMessage = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+}

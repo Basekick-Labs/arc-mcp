@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
@@ -20,14 +21,17 @@ type QueryArgs struct {
 type GetSampleDataArgs struct {
 	Database    string `json:"database"    jsonschema:"Database name"`
 	Measurement string `json:"measurement" jsonschema:"Measurement (table) name"`
-	Limit       int    `json:"limit"       jsonschema:"Number of rows to return (default 10 and max 100)"`
+	Limit       int    `json:"limit,omitempty" jsonschema:"Number of rows to return (default 10 and max 100)"`
 }
 
-// RegisterQuery registers the query tool.
+// RegisterQuery registers the query tool. maxRows must be within
+// MinRowLimit..MaxRowLimit (see ClampRowLimit).
 func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "query",
-		Description: "Execute a read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. Write operations (INSERT, UPDATE, DELETE, DROP) are blocked.",
+		Name: "query",
+		Description: "Execute one read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. " +
+			"At most " + strconv.Itoa(maxRows) + " rows come back; when there are more, the answer says so at the top. " +
+			"Arc refuses some words anywhere in a query, even as column names or aliases (load, copy, set, pragma, call, ...): double-quote such a name, as in AS \"load\".",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" {
@@ -50,8 +54,10 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 			}, nil, nil
 		}
 
-		// Safety: reject write operations. Advisory only — Arc server-side is authoritative.
-		if err := ValidateReadOnly(args.SQL); err != nil {
+		// Answer early, with a reason, for anything Arc would refuse. Arc's
+		// own checks remain the boundary.
+		q, err := ValidateReadOnly(args.SQL)
+		if err != nil {
 			log.Printf("query: rejected by read-only validator: %v; sql=%q", err, truncateForLog(args.SQL))
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Blocked: %v", err)}},
@@ -59,10 +65,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 			}, nil, nil
 		}
 
-		// Enforce row limit
-		sql := EnforceRowLimit(args.SQL, maxRows)
-
-		result, err := client.Query(ctx, args.Database, sql)
+		result, err := client.Query(ctx, args.Database, q.WithRowLimit(maxRows))
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
@@ -70,7 +73,25 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 			}, nil, nil
 		}
 
-		text := formatQueryResult(result)
+		// Arc was asked for maxRows+1 rows; getting them all means there are
+		// more. Statements sent unchanged are cut here too.
+		var notes []string
+		if len(result.Data) > maxRows {
+			result.Data = result.Data[:maxRows]
+			hint := "Narrow the statement to see the rest."
+			if q.Selectable() {
+				hint = "Aggregate (time_bucket, GROUP BY) or narrow the time range to see all of it."
+			}
+			notes = append(notes, fmt.Sprintf("**Showing the first %s; the query returned more.** %s", plural(maxRows, "row"), hint))
+		}
+		if result.RowsCapped {
+			notes = append(notes, fmt.Sprintf("**Arc's row cap (%d) cut this result; more rows exist.** Aggregate or narrow the time range.", result.RowCap))
+		}
+		if result.Truncated {
+			log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
+			notes = append(notes, "**Arc stopped partway through this result, so it is incomplete.** Try again, or narrow the query.")
+		}
+		text := formatQueryResult(result, notes)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
@@ -127,7 +148,7 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 			}, nil, nil
 		}
 
-		text := formatQueryResult(result)
+		text := formatQueryResult(result, nil)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
@@ -139,12 +160,18 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 }
 
 // formatQueryResult formats a QueryResponse as a readable markdown table.
-func formatQueryResult(result *arc.QueryResponse) string {
+// notes say the result is incomplete and why. They go first, so they
+// survive when TruncateResponse later cuts the text from the end.
+func formatQueryResult(result *arc.QueryResponse, notes []string) string {
 	if len(result.Columns) == 0 {
-		return fmt.Sprintf("Query returned no columns. (%d rows, %.1fms)", result.RowCount, result.ExecutionTimeMs)
+		return fmt.Sprintf("Query returned no columns. (%s, %.1fms)", plural(len(result.Data), "row"), result.ExecutionTimeMs)
 	}
 
 	var sb strings.Builder
+	for _, n := range notes {
+		sb.WriteString(n)
+		sb.WriteString("\n\n")
+	}
 
 	// Header
 	sb.WriteString("| ")
@@ -175,7 +202,11 @@ func formatQueryResult(result *arc.QueryResponse) string {
 		sb.WriteString(" |\n")
 	}
 
-	fmt.Fprintf(&sb, "\n*%d rows returned in %.1fms*", result.RowCount, result.ExecutionTimeMs)
+	verb := "returned"
+	if len(notes) > 0 {
+		verb = "shown"
+	}
+	fmt.Fprintf(&sb, "\n*%s %s in %.1fms*", plural(len(result.Data), "row"), verb, result.ExecutionTimeMs)
 
 	return sb.String()
 }
@@ -188,4 +219,12 @@ func truncateForLog(s string) string {
 		return s
 	}
 	return s[:maxLogLen] + "..."
+}
+
+// plural renders "1 row" / "2 rows".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

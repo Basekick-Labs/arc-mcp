@@ -23,6 +23,10 @@ type Error struct {
 	Kind   string // see the Kind* constants
 	Status int    // HTTP status when the error came from a response, 0 otherwise
 	Detail string // full detail — log to stderr, never send to LLM
+	// Message is Arc's own text for a request it refused as invalid (HTTP
+	// 400): a fixed validation message, such as "Dangerous SQL operation
+	// not allowed", safe to show the model. Empty otherwise.
+	Message string
 }
 
 // The Kind values Error can carry. The three permission kinds are kept
@@ -82,7 +86,28 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	case statusCode == 404:
 		kind = KindNotFound
 	}
-	return &Error{Kind: kind, Status: statusCode, Detail: detail}
+	e := &Error{Kind: kind, Status: statusCode, Detail: detail}
+	if statusCode == http.StatusBadRequest {
+		e.Message = refusalText(snippet)
+	}
+	return e
+}
+
+// refusalText is the first line of the error message in Arc's JSON error
+// body, at most 300 runes; "" for a body that is not Arc's (a proxy's HTML
+// page, say), which must not reach the model.
+func refusalText(body []byte) string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	msg, _, _ := strings.Cut(strings.TrimSpace(parsed.Error), "\n")
+	if r := []rune(msg); len(r) > 300 {
+		msg = string(r[:300]) + "…"
+	}
+	return strings.TrimSpace(msg)
 }
 
 // Arc sends 403 for three different things and distinguishes them only
@@ -162,12 +187,17 @@ func UserMessage(err error) string {
 			return "Arc could not read its own permission data and refused the request rather than guessing. This is a server-side fault, not a problem with the token or the database — tell the user to check the Arc server log."
 		case KindNotFound:
 			return "The requested database or measurement was not found in Arc."
-		case "too_large":
+		case KindTooLarge:
 			return "Arc returned a response that was too large to process."
-		case "parse":
+		case KindParse:
 			return "Arc returned an unexpected response format."
-		case "query":
+		case KindQuery:
 			return "Arc rejected the query — check the SQL syntax."
+		case KindServer:
+			if ae.Message != "" {
+				return "Arc refused the request: " + ae.Message
+			}
+			return "Arc returned an error — see server logs for details."
 		default:
 			return "Arc returned an error — see server logs for details."
 		}
@@ -217,11 +247,19 @@ type QueryRequest struct {
 type QueryResponse struct {
 	Success         bool            `json:"success"`
 	Columns         []string        `json:"columns"`
-	Data            [][]interface{} `json:"data"`
+	Data            [][]interface{} `json:"data"` // numbers are json.Number, see Query
 	RowCount        int             `json:"row_count"`
 	ExecutionTimeMs float64         `json:"execution_time_ms"`
 	Timestamp       string          `json:"timestamp"`
 	Error           string          `json:"error,omitempty"`
+	// RowsCapped is set when Arc's own governance row cap (RowCap) cut the
+	// result. Truncated is set when Arc stopped streaming partway; the data
+	// is real but incomplete, and TruncationReason says why (for the log,
+	// not the model). Both still come with success:true.
+	RowsCapped       bool   `json:"rows_capped,omitempty"`
+	RowCap           int64  `json:"row_cap,omitempty"`
+	Truncated        bool   `json:"truncated,omitempty"`
+	TruncationReason string `json:"truncation_reason,omitempty"`
 }
 
 // TokenVerifyResponse matches Arc's GET /api/v1/auth/verify response.
@@ -292,7 +330,7 @@ func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("decoding token verification response: %w", err)
 	}
 	if !result.Valid {
-		return nil, &Error{Kind: "auth", Detail: "verify token: Arc reported an invalid token"}
+		return nil, &Error{Kind: KindAuth, Detail: "verify token: Arc reported an invalid token"}
 	}
 	return result.Permissions, nil
 }
@@ -409,17 +447,23 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 		return nil, arcErrorFrom("query", resp.StatusCode, snippet)
 	}
 
+	// UseNumber keeps every value in Data as the exact text Arc sent
+	// (json.Number). Decoding into interface{} would otherwise make every
+	// number a float64: integers above 2^53 change value, and counts print
+	// as 1.783416e+06.
 	var result QueryResponse
-	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
+	dec := json.NewDecoder(respBody)
+	dec.UseNumber()
+	if err := dec.Decode(&result); err != nil {
 		detail := fmt.Sprintf("query: decoding response: %v", err)
 		log.Printf("arc error: %s", detail)
-		return nil, &Error{Kind: "parse", Detail: detail}
+		return nil, &Error{Kind: KindParse, Detail: detail}
 	}
 
 	if !result.Success {
 		detail := fmt.Sprintf("query: Arc error: %s", result.Error)
 		log.Printf("arc error: %s", detail)
-		return nil, &Error{Kind: "query", Detail: detail}
+		return nil, &Error{Kind: KindQuery, Detail: detail}
 	}
 	return &result, nil
 }

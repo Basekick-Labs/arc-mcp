@@ -3,6 +3,7 @@ package arc
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -111,5 +112,35 @@ func TestClient_VerifyToken(t *testing.T) {
 	}
 	if len(permissions) != 1 || permissions[0] != "read" {
 		t.Errorf("permissions = %v, want [read]", permissions)
+	}
+}
+
+// Arc sends integers exactly; they must reach the caller exactly. Decoding
+// into interface{} without UseNumber turns 9007199254740993 into
+// 9007199254740992 and a count of 1784100 into 1.7841e+06.
+func TestClient_Query_NumbersKeepArcText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"columns":["a","b","c","d","e","f"],`+
+			`"data":[[9007199254740993,1784100,10288.077731092437,-0.5,1e-7,null]],"row_count":1,"execution_time_ms":1.5}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "tok", time.Second)
+	res, err := c.Query(context.Background(), "db", "SELECT 1")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	want := []string{"9007199254740993", "1784100", "10288.077731092437", "-0.5", "1e-7"}
+	for i, w := range want {
+		if got := fmt.Sprintf("%v", res.Data[0][i]); got != w {
+			t.Errorf("cell %d = %s, want %s", i, got, w)
+		}
+	}
+	if res.Data[0][5] != nil {
+		t.Errorf("null cell = %#v, want nil", res.Data[0][5])
+	}
+	if res.ExecutionTimeMs != 1.5 {
+		t.Errorf("ExecutionTimeMs = %v, want 1.5", res.ExecutionTimeMs)
 	}
 }
