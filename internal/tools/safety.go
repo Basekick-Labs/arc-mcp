@@ -274,8 +274,8 @@ func (q *ReadQuery) WithRowLimit(maxRows int) string {
 		next := limitAt + 2
 		plainEnd := next == len(toks) || toks[next].is("offset") || toks[next].is(";")
 		if num.kind == numberToken && isDigits(num.text) && plainEnd {
-			// A number too large for uint64 is larger than maxRows too.
-			if n, err := strconv.ParseUint(num.text, 10, 64); err == nil && n <= uint64(maxRows) {
+			// A number too large for int64 is larger than maxRows too.
+			if n, err := strconv.ParseInt(num.text, 10, 64); err == nil && n <= int64(maxRows) {
 				return sql
 			}
 			return sql[:num.pos] + strconv.Itoa(maxRows+1) + sql[num.end:]
