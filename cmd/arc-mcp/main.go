@@ -339,6 +339,9 @@ func validateArcURL(rawURL, token string, insecure bool) error {
 	if isLoopbackHost(host) {
 		return nil
 	}
+	if l := strings.ToLower(strings.TrimSuffix(host, ".")); l == "localhost" || strings.HasSuffix(l, ".localhost") {
+		return fmt.Errorf("refusing to send credentials over plaintext HTTP to %q: only exactly localhost or a loopback IP counts as loopback (a configured HTTP_PROXY applies to other names) — use http://localhost or http://127.0.0.1, or https://", host)
+	}
 	if token == "" {
 		return fmt.Errorf("refusing to send the arc URL's query string or userinfo over plaintext HTTP to remote host %q — use https:// or pass --insecure", host)
 	}

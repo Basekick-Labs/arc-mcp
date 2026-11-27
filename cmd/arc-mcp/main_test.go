@@ -99,6 +99,7 @@ func TestValidateArcURL(t *testing.T) {
 		{"http IPv4-mapped loopback with token ok", "http://[::ffff:127.0.0.1]:8000", "abc", false, false},
 		// A name under .localhost is not exempt from HTTP_PROXY: remote.
 		{"http *.localhost with token rejected", "http://foo.localhost:8000", "abc", false, true},
+		{"http *.localhost in passthrough (caller tokens) rejected", "http://foo.localhost:8000", "caller", false, true},
 		{"http *.localhost with query and no token rejected", "http://foo.localhost:8000/?p=abc", "", false, true},
 		{"http *.localhost without token ok", "http://foo.localhost:8000", "", false, false},
 		{"http *.localhost with token and insecure ok", "http://foo.localhost:8000", "abc", true, false},
