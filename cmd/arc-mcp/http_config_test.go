@@ -89,3 +89,42 @@ func TestEnvOrDefaultInt(t *testing.T) {
 	}
 	badEnv = nil
 }
+
+func TestCheckPassthrough(t *testing.T) {
+	unsetTokens := func() {
+		for _, k := range []string{"ARC_TOKEN", "ARC_TOKEN_FILE", "ARC_MCP_HTTP_TOKEN", "ARC_MCP_HTTP_TOKEN_FILE"} {
+			t.Setenv(k, "")
+		}
+	}
+	tests := []struct {
+		name      string
+		env       string
+		transport string
+		flagTok   string
+		url       string
+		insecure  bool
+		wantErr   bool
+	}{
+		{"ok", "", "http", "", "https://arc.example.com", false, false},
+		{"stdio", "", "stdio", "", "https://arc.example.com", false, true},
+		{"ARC_TOKEN set", "ARC_TOKEN", "http", "", "https://arc.example.com", false, true},
+		{"ARC_TOKEN_FILE set", "ARC_TOKEN_FILE", "http", "", "https://arc.example.com", false, true},
+		{"--arc-token", "", "http", "x", "https://arc.example.com", false, true},
+		{"shared inbound token", "ARC_MCP_HTTP_TOKEN", "http", "", "https://arc.example.com", false, true},
+		{"shared inbound token file", "ARC_MCP_HTTP_TOKEN_FILE", "http", "", "https://arc.example.com", false, true},
+		{"insecure-listen", "", "http", "", "https://arc.example.com", true, true},
+		{"query string in the Arc URL", "", "http", "", "https://arc.example.com/?p=admin", false, true},
+		{"userinfo in the Arc URL", "", "http", "", "https://u:p@arc.example.com", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetTokens()
+			if tt.env != "" {
+				t.Setenv(tt.env, "/some/value")
+			}
+			if err := checkPassthrough(tt.transport, tt.flagTok, tt.url, tt.insecure); (err != nil) != tt.wantErr {
+				t.Errorf("err %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

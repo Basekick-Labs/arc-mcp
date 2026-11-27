@@ -11,7 +11,9 @@ Or port-forward locally:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arc-mcp.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
 
 and point your MCP client at http{{ if .Values.http.tlsSecretName }}s{{ end }}://localhost:{{ .Values.service.port }}/mcp
-{{- if .Values.http.tokenSecretRef.name }}, sending the token in Secret
+{{- if eq (toString .Values.auth.mode) "passthrough" }}, sending each
+user's own Arc token as "Authorization: Bearer <token>" (passthrough).
+{{- else if .Values.http.tokenSecretRef.name }}, sending the token in Secret
 {{ .Values.http.tokenSecretRef.name }} as "Authorization: Bearer <token>".
 {{- else }}.
 
@@ -19,7 +21,7 @@ WARNING: http.insecureListen is set: anyone who can reach the Service queries
 Arc with arc-mcp's Arc token, with no inbound token.
 {{- end }}
 
-{{- if and (not .Values.arc.tokenSecretRef.name) (not .Values.arc.token) }}
+{{- if and (ne (toString .Values.auth.mode) "passthrough") (not .Values.arc.tokenSecretRef.name) (not .Values.arc.token) }}
 
 WARNING: no Arc token is configured. Queries that require authentication will
 fail. Either set arc.token (dev/test only) or arc.tokenSecretRef.name pointing

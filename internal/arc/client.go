@@ -214,6 +214,16 @@ func Scoped(err error) bool {
 	return errors.As(err, &ae) && ae.Kind == KindScoped
 }
 
+// UserMessage is UserMessage for this client's errors: in passthrough mode
+// the token Arc rejected is the one the user's MCP client sends.
+func (c *Client) UserMessage(err error) string {
+	var ae *Error
+	if c != nil && c.passthrough != nil && errors.As(err, &ae) && ae != nil && ae.Kind == KindAuth {
+		return "Arc rejected the token your MCP client sent — it is missing, invalid or expired. Ask the user to check the Arc token in their MCP client's configuration."
+	}
+	return UserMessage(err)
+}
+
 // UserMessage returns a short, safe error message suitable for the LLM.
 // It never leaks internal detail (stack traces, paths, Arc query context,
 // Arc's URL).
@@ -335,6 +345,9 @@ type Client struct {
 	baseURL    string
 	token      string
 	httpClient *http.Client
+	// passthrough is set by EnablePassthrough: each request carries the
+	// caller's token from its context instead of token.
+	passthrough *passthroughState
 }
 
 // NewClient creates a new Arc API client. baseURL is Arc's base URL; see
@@ -394,7 +407,9 @@ func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", RedactError(err))
 	}
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -428,7 +443,9 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 	if err != nil {
 		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: creating the request: %v", RedactError(err)))
 	}
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -459,7 +476,9 @@ func (c *Client) ListMeasurements(ctx context.Context, database string) (*Measur
 	if err != nil {
 		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: creating the request: %v", RedactError(err)))
 	}
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -616,7 +635,9 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-arc-database", database)
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -675,8 +696,23 @@ func newExactDecoder(r io.Reader) *json.Decoder {
 	return dec
 }
 
-func (c *Client) setAuth(req *http.Request) {
+// setAuth sets the request's Authorization header. In passthrough mode the
+// token is the caller's, from the request's context, and a request without
+// one is refused here, before it is sent: Arc must never see a request on
+// a caller's behalf with no caller token (it could authenticate it from a
+// query string in the Arc URL instead). In static mode the context is
+// ignored and the configured token, if any, is used.
+func (c *Client) setAuth(req *http.Request) error {
+	if c.passthrough != nil {
+		t := tokenFrom(req.Context())
+		if t == "" {
+			return &Error{Kind: KindAuth, Detail: "passthrough: no caller token on the request"}
+		}
+		req.Header.Set("Authorization", "Bearer "+t)
+		return nil
+	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	return nil
 }

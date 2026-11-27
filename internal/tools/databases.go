@@ -37,7 +37,7 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: arc.UserMessage(err)},
+					&mcp.TextContent{Text: client.UserMessage(err)},
 				},
 				IsError: true,
 			}, nil, nil

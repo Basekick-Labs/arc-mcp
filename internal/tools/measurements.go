@@ -64,7 +64,7 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: arc.UserMessage(err)},
+					&mcp.TextContent{Text: client.UserMessage(err)},
 				},
 				IsError: true,
 			}, nil, nil
@@ -135,7 +135,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		budget := deadlineBudget(ctx, client)
 		columns, describeMs, err := describeColumns(ctx, client, args.Database, args.Measurement)
 		if err != nil {
-			text := arc.UserMessage(err)
+			text := client.UserMessage(err)
 			if reason := failureReason(budget, err); reason != "" {
 				text = "Could not describe the measurement: " + reason + "."
 			}

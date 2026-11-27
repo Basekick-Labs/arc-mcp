@@ -299,7 +299,7 @@ func RegisterMetrics(server *mcp.Server, client *arc.Client, maxResponseChars in
 
 		v, err := client.GetJSON(ctx, fam.path, query)
 		if err != nil {
-			return opsError(metricsErrorText(fam.name, client.Timeout(), err)), nil, nil
+			return opsError(metricsErrorText(client, fam.name, err)), nil, nil
 		}
 		var res MetricsResult
 		var text string
@@ -455,7 +455,8 @@ func compactJSON(v any) (string, error) {
 // queries or databases get text of their own. So do 400 and 429: Arc does not
 // send them on these routes, so their body is someone else's (a proxy's, say,
 // which may name its upstream), and the shared text would quote it.
-func metricsErrorText(name string, timeout time.Duration, err error) string {
+func metricsErrorText(client *arc.Client, name string, err error) string {
+	timeout := client.Timeout()
 	var ae *arc.Error
 	if !errors.As(err, &ae) {
 		log.Printf("arc_metrics %s: %v", name, err)
@@ -478,7 +479,7 @@ func metricsErrorText(name string, timeout time.Duration, err error) string {
 	case http.StatusBadRequest:
 		return "The request for Arc's " + name + " metrics was refused (HTTP 400); the answer is in the arc-mcp log."
 	}
-	return arc.UserMessage(ae)
+	return client.UserMessage(ae)
 }
 
 // unreachableText is the model's text when probing path got no answer.

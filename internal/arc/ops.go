@@ -74,7 +74,9 @@ func (c *Client) opsGet(ctx context.Context, path string, query url.Values) (*ht
 		return nil, opsError(KindNetwork, fmt.Sprintf("GET %s: creating the request: %v", path, err))
 	}
 	req.Header.Set("Accept", "application/json")
-	c.setAuth(req)
+	if err := c.setAuth(req); err != nil {
+		return nil, err
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, transportError("GET "+path, err)

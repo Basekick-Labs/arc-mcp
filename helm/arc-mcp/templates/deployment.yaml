@@ -4,11 +4,21 @@ arc-mcp Deployment: the arc-mcp image serving MCP over Streamable HTTP at
 gone; fail with the way forward rather than ignore them.
 */}}
 {{- $insecureListen := eq (toString .Values.http.insecureListen) "true" }}
+{{- $passthrough := eq (toString .Values.auth.mode) "passthrough" }}
+{{- if not (has (toString .Values.auth.mode) (list "static" "passthrough")) }}
+{{- fail "auth.mode is static or passthrough" }}
+{{- end }}
+{{- if $passthrough }}
+{{- if or .Values.arc.token .Values.arc.tokenSecretRef.name .Values.http.tokenSecretRef.name $insecureListen }}
+{{- fail "auth.mode=passthrough uses each caller's Arc token: unset arc.token, arc.tokenSecretRef.name, http.tokenSecretRef.name and http.insecureListen." }}
+{{- end }}
+{{- else }}
 {{- if .Values.gateway }}
 {{- fail "gateway.* values were removed: arc-mcp now serves MCP over Streamable HTTP itself, at /mcp (clients that used /sse must switch). Remove gateway.* (with helm upgrade --reuse-values, use --reset-then-reuse-values instead) and set http.tokenSecretRef.name or http.insecureListen. See \"Remote access over HTTP\" in the arc-mcp README." }}
 {{- end }}
 {{- if and (not .Values.http.tokenSecretRef.name) (not $insecureListen) }}
-{{- fail "set http.tokenSecretRef.name to a Secret holding the bearer token MCP clients send, or http.insecureListen=true to serve without one (anyone who can reach the Service then queries Arc with arc-mcp's token)." }}
+{{- fail "set http.tokenSecretRef.name to a Secret holding the bearer token MCP clients send, or http.insecureListen=true to serve without one (anyone who can reach the Service then queries Arc with arc-mcp's token), or auth.mode=passthrough." }}
+{{- end }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -70,12 +80,17 @@ spec:
           env:
             - name: ARC_URL
               value: {{ .Values.arc.url | quote }}
+            {{- if $passthrough }}
+            - name: ARC_MCP_AUTH_MODE
+              value: "passthrough"
+            {{- else }}
             - name: ARC_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "arc-mcp.tokenSecretName" . }}
                   key: {{ include "arc-mcp.tokenSecretKey" . }}
                   optional: true
+            {{- end }}
             - name: ARC_MCP_TOOLS
               value: {{ join "," .Values.arc.tools | quote }}
             {{- if .Values.arc.insecure }}
@@ -85,7 +100,7 @@ spec:
             {{- if .Values.http.tokenSecretRef.name }}
             - name: ARC_MCP_HTTP_TOKEN_FILE
               value: "/etc/arc-mcp/http-token/{{ default "token" .Values.http.tokenSecretRef.key }}"
-            {{- else }}
+            {{- else if not $passthrough }}
             - name: ARC_MCP_INSECURE_LISTEN
               value: "true"
             {{- end }}

@@ -39,6 +39,16 @@ arc:
   tools:
     - data
 
+# How callers authenticate (ARC_MCP_AUTH_MODE):
+#   static       arc-mcp queries Arc with its own token (arc.token or
+#                arc.tokenSecretRef), and callers present the shared
+#                http.tokenSecretRef token (or none, with http.insecureListen).
+#   passthrough  each caller's bearer token is its own Arc token, verified
+#                with Arc and sent on every query it makes. Set no arc token
+#                and no http token. Arc must have authentication on.
+auth:
+  mode: static
+
 # The MCP endpoint (arc-mcp --transport http): Streamable HTTP at /mcp,
 # liveness at /healthz.
 http:

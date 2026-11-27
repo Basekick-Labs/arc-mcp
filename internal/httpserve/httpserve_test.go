@@ -134,7 +134,7 @@ func TestBearerRequired(t *testing.T) {
 
 func TestStaticToken(t *testing.T) {
 	v := StaticToken(secret)
-	if v(context.Background(), secret) != nil {
+	if _, err := v(context.Background(), secret); err != nil {
 		t.Error("the right token was refused")
 	}
 	// The header's extra spaces are not part of the token.
@@ -143,7 +143,7 @@ func TestStaticToken(t *testing.T) {
 		t.Errorf("Bearer with two spaces refused: %v", err)
 	}
 	for _, bad := range []string{"", "x", secret + " ", strings.ToUpper(secret)} {
-		if v(context.Background(), bad) == nil {
+		if _, err := v(context.Background(), bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
 	}
