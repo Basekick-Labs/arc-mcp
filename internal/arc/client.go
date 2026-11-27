@@ -349,6 +349,15 @@ func NewClient(baseURL, token string, timeout time.Duration) *Client {
 	}
 }
 
+// NewClientWithTransport is NewClient with the HTTP transport given. Tests
+// use it to reach a fake Arc under a host name that resolves nowhere, so they
+// can check that the name never reaches the model.
+func NewClientWithTransport(baseURL, token string, timeout time.Duration, transport http.RoundTripper) *Client {
+	c := NewClient(baseURL, token, timeout)
+	c.httpClient.Transport = transport
+	return c
+}
+
 // Timeout is the limit on each request to Arc (arc-mcp's --timeout).
 func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
@@ -621,14 +630,8 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 		return nil, arcErrorFrom("query", resp.StatusCode, snippet)
 	}
 
-	// UseNumber keeps every value in Data as the exact text Arc sent
-	// (json.Number). Decoding into interface{} would otherwise make every
-	// number a float64: integers above 2^53 change value, and counts print
-	// as 1.783416e+06.
 	var result QueryResponse
-	dec := json.NewDecoder(respBody)
-	dec.UseNumber()
-	if err := dec.Decode(&result); err != nil {
+	if err := decodeExact(respBody, &result); err != nil {
 		detail := fmt.Sprintf("query: decoding response: %v", err)
 		log.Printf("arc error: %s", detail)
 		return nil, &Error{Kind: KindParse, Detail: detail}
@@ -654,6 +657,16 @@ func transportError(op string, err error) *Error {
 		return &Error{Kind: KindTimeout, Detail: detail}
 	}
 	return &Error{Kind: KindNetwork, Detail: detail}
+}
+
+// decodeExact decodes one JSON value from r into v, keeping every number as
+// the exact text Arc sent (json.Number) wherever v holds interface{} values.
+// Decoding into interface{} would otherwise make every number a float64:
+// integers above 2^53 change value, and counts print as 1.783416e+06.
+func decodeExact(r io.Reader, v any) error {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	return dec.Decode(v)
 }
 
 func (c *Client) setAuth(req *http.Request) {
