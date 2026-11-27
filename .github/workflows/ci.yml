@@ -82,15 +82,122 @@ jobs:
             GOOS=$os GOARCH=$arch go build -o /dev/null ./cmd/arc-mcp
           done
 
-  goreleaser-check:
+  release-dry-run:
+    # Runs .goreleaser.yml as a snapshot: builds every target, renders the
+    # archives, packages and the Homebrew formula, publishes nothing. Docker,
+    # signing and SBOMs are left to the tag build. No secrets are read, so a
+    # PR from a fork runs it the same way (the tap token is evaluated only
+    # when a release pushes the formula).
+    name: Release dry run
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+          cache: true
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
-          args: check
+          version: '~> v2.20' # 2.20.x, as release.yml; brews is kept until GoReleaser v3
+          install-only: true
+      - name: goreleaser check
+        # Exit 2 is "valid, but uses deprecated properties": brews is
+        # deprecated in favour of casks and kept on purpose (.goreleaser.yml).
+        # Every deprecation is still shown as a warning; any other failure fails.
+        # GoReleaser colours its output when CI is set: the escapes are
+        # stripped before the DEPRECATED lines become annotations.
+        run: |
+          rc=0
+          goreleaser check > check.log 2>&1 || rc=$?
+          cat check.log
+          sed 's/\x1b\[[0-9;]*m//g' check.log > check.txt
+          case $rc in
+            0) ;;
+            2) grep -o 'DEPRECATED:.*' check.txt | while read -r line; do echo "::warning::goreleaser check: $line"; done ;;
+            *) exit "$rc" ;;
+          esac
+      - name: GoReleaser snapshot
+        run: goreleaser release --snapshot --clean --skip=publish,sign,sbom,docker
+      - name: Check the rendered formula
+        # Four per-platform URLs, each with its archive's sha256, the install
+        # and test lines, and the version the formula's test compares against.
+        run: |
+          f=dist/homebrew/Formula/arc-mcp.rb
+          v=$(jq -r .version dist/metadata.json)
+          cat "$f"
+          test "$(grep -c 'url "https://github.com/basekick-labs/arc-mcp/releases/download/' "$f")" -eq 4
+          for p in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            n="arc-mcp_${v}_${p}.tar.gz"
+            sum=$(awk -v n="$n" '$2 == n { print $1 }' dist/checksums.txt)
+            test -n "$sum"
+            grep -A1 "url \".*/$n\"" "$f" | grep -q "sha256 \"$sum\""
+          done
+          grep -qF 'bin.install "arc-mcp"' "$f"
+          grep -qF 'assert_match version.to_s, shell_output("#{bin}/arc-mcp --version")' "$f"
+          tar -xzf "dist/arc-mcp_${v}_linux_amd64.tar.gz" -C "$RUNNER_TEMP" arc-mcp
+          test "$("$RUNNER_TEMP/arc-mcp" --version)" = "$v"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            dist/metadata.json
+            dist/homebrew/Formula/arc-mcp.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  formula:
+    # Installs the dry run's formula the way brew installs the released one,
+    # from the local archives: Homebrew refuses a formula file outside a tap,
+    # so it goes into a throwaway local tap, its URLs rewritten to file://
+    # (the sha256s stay valid). Then the formula's own test. The macOS leg
+    # is the only place CI runs the darwin binary GoReleaser builds.
+    name: Formula (${{ matrix.os }})
+    needs: release-dry-run
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions: {}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dry-run
+          path: dist
+      - name: Put Homebrew on PATH (Linux)
+        # Preinstalled on the Ubuntu image, but not on PATH.
+        if: runner.os == 'Linux'
+        run: |
+          if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            echo "::error::no Homebrew at /home/linuxbrew/.linuxbrew on this runner image"; exit 1
+          fi
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+      - name: Install from a local tap and run the formula's test
+        run: |
+          v=$(jq -r .version dist/metadata.json)
+          brew tap-new --no-git local/arcmcp-ci
+          tap=$(brew --repository local/arcmcp-ci)
+          sed "s#https://github.com/basekick-labs/arc-mcp/releases/download/[^/]*/#file://$PWD/dist/#" \
+            dist/homebrew/Formula/arc-mcp.rb > "$tap/Formula/arc-mcp.rb"
+          if grep -q 'releases/download/' "$tap/Formula/arc-mcp.rb"; then
+            echo "::error::a formula URL still points at a release"; exit 1
+          fi
+          brew install local/arcmcp-ci/arc-mcp
+          test "$(arc-mcp --version)" = "$v"
+          brew test local/arcmcp-ci/arc-mcp
 
   helm-lint:
     runs-on: ubuntu-latest
