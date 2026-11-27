@@ -17,11 +17,11 @@ type header struct {
 // value, null included. jwk, jku, x5u and x5c carry or point to a key or a
 // certificate, and keys come only from the configured key set. An embedded
 // jwk is also where GHSA-mgcc-cww5-fp2q bites: go-jose up to 4.1.5 spends
-// excess CPU validating a crafted RSA key in it, before any signature check.
-// crit and b64 change how the token is read, and nothing here implements an
-// extension. x5t and x5t#S256 are only certificate
-// thumbprints and are allowed: some authorization servers put x5t next to
-// kid.
+// excess CPU validating a crafted RSA key in it, before any signature check
+// (measured on 4.1.4). crit and b64 change how the token is read, and
+// nothing here implements an extension. x5t and x5t#S256 are only
+// certificate thumbprints and are allowed: some authorization servers put
+// x5t next to kid.
 var refusedMembers = map[string]bool{
 	"jwk": true, "jku": true, "x5u": true, "x5c": true,
 	"crit": true, "b64": true,

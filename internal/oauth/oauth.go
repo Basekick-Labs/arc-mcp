@@ -11,6 +11,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,11 +126,12 @@ type Config struct {
 	// Audience must be one of the aud values, exactly.
 	Audience string
 	// JWKSURL is where the authorization server publishes its signing
-	// keys: https, or http to a loopback host only.
+	// keys: https, or http to exactly localhost or a loopback IP.
 	JWKSURL string
-	// HTTPClient fetches the key set; nil uses a plain client. Either way
-	// redirects are refused and the fetch is bounded by a 10 s timeout.
-	HTTPClient *http.Client
+	// TLSConfig, when set, is used for the https fetch (a private CA, for
+	// example). The fetch never goes through a proxy from the environment,
+	// follows no redirect and gives up after 10 s.
+	TLSConfig *tls.Config
 	// UntypedAccessToken decides tokens whose typ header is "JWT" or absent,
 	// which RFC 9068 §4 refuses: true only when the verified token shows it
 	// is an access token, not (say) an ID token for the same audience. It
@@ -151,8 +153,9 @@ type Token struct {
 	// client_id would refuse its user tokens, and nothing here restricts
 	// which clients may present a token.
 	ClientID string
-	// Scopes is the space-delimited scope claim, split. A scope that is not
-	// a string refuses the token as malformed.
+	// Scopes is the scope claim split on spaces or, without one, scp (a
+	// string or an array of strings, as Entra and Okta send it). Either of
+	// another type refuses the token as malformed.
 	Scopes []string
 	Expiry time.Time
 	// Type is the typ header as sent ("" when absent).
@@ -201,14 +204,18 @@ func New(cfg Config) (*Verifier, error) {
 	if err := checkJWKSURL(cfg.JWKSURL); err != nil {
 		return nil, err
 	}
-	client := &http.Client{}
-	if cfg.HTTPClient != nil {
-		c := *cfg.HTTPClient
-		client = &c
-	}
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	if client.Timeout <= 0 || client.Timeout > fetchTimeout {
-		client.Timeout = fetchTimeout
+	// No Proxy: the keys are the trust root, never relayed by HTTP(S)_PROXY.
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: fetchTimeout}).DialContext,
+			TLSClientConfig:     cfg.TLSConfig.Clone(),
+			TLSHandshakeTimeout: fetchTimeout,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        2,
+			IdleConnTimeout:     90 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       fetchTimeout,
 	}
 	now := time.Now
 	return &Verifier{
@@ -234,19 +241,18 @@ func checkJWKSURL(raw string) error {
 	}
 	switch {
 	case u.Scheme == "https":
-	case u.Scheme == "http" && isLoopbackHost(u.Hostname()):
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
 	default:
 		return fmt.Errorf("oauth: JWKS URL must use https (http only to a loopback host), got %s://%s", u.Scheme, u.Host)
 	}
 	return nil
 }
 
-func isLoopbackHost(host string) bool {
-	if host == "localhost" || strings.HasSuffix(strings.ToLower(host), ".localhost") {
-		return true
-	}
+// isLoopback: exactly localhost or a loopback IP literal. Names under
+// .localhost are not taken: where they resolve depends on the resolver.
+func isLoopback(host string) bool {
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
 }
 
 // Refresh fetches the key set now (at startup, for example). The error
@@ -267,13 +273,15 @@ type claims struct {
 	AZP       string           `json:"azp"`
 	ClientID  string           `json:"client_id"`
 	Scope     *string          `json:"scope"`
+	SCP       scopes           `json:"scp"`
 }
 
 // Verify checks raw, the token without its "Bearer " prefix. Cheap
 // refusals come first: the size and header checks, then the unverified
 // issuer, so a token from another issuer never makes the key set be
 // fetched. go-jose parses the token only after its header has passed and a
-// key fitting its alg was found.
+// key fitting its alg was found. A token without a kid is refused as an
+// unknown key: authorization servers that omit kid are not supported.
 func (v *Verifier) Verify(ctx context.Context, raw string) (*Token, error) {
 	if raw == "" {
 		return nil, refuse(ReasonMissing)
@@ -327,6 +335,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (*Token, error) {
 	if t.ClientID == "" {
 		t.ClientID = c.ClientID
 	}
+	t.Scopes = c.SCP
 	if c.Scope != nil {
 		t.Scopes = strings.Fields(*c.Scope)
 	}
@@ -366,6 +375,18 @@ func (v *Verifier) isAccessToken(t *Token) bool {
 		return v.untyped != nil && v.untyped(t)
 	}
 	return false
+}
+
+// scopes is scp: a space-delimited string or an array of strings.
+type scopes []string
+
+func (s *scopes) UnmarshalJSON(b []byte) error {
+	var str string
+	if josejson.Unmarshal(b, &str) == nil {
+		*s = strings.Fields(str)
+		return nil
+	}
+	return josejson.Unmarshal(b, (*[]string)(s))
 }
 
 // unverifiedIssuer reads iss from a payload whose signature is not checked

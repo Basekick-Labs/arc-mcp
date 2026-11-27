@@ -35,9 +35,14 @@ const (
 	// fetch, so a flood of made-up kids costs one fetch per cooldown.
 	refetchCooldown = 30 * time.Second
 	// refreshInterval: a set older than this is fetched again in the
-	// background, so a key the authorization server withdrew stops being
-	// trusted. Until the new set arrives the old one is used.
+	// background; until the new set arrives the old one is used.
 	refreshInterval = 15 * time.Minute
+	// maxKeyAge: a set not refreshed for this long is no longer used (every
+	// lookup is KeyFetchFailed), so a withdrawn key dies even if fetches fail.
+	maxKeyAge = 24 * time.Hour
+	// maxWaiters bounds the lookups waiting on one fetch (as callerauth's
+	// maxWaiting); past it a lookup gets the temporary reason at once.
+	maxWaiters = 64
 )
 
 // key is one usable signing key from the set.
@@ -83,57 +88,71 @@ type keySet struct {
 }
 
 type fetch struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	waiters int // lookups waiting on it; s.mu
 }
 
-// lookup returns the key named kid. An unknown kid fetches the set again,
-// unless the last fetch started less than refetchCooldown ago; concurrent
-// lookups share one fetch.
+// lookup returns the key named kid. An unknown kid, or any kid once the set
+// is older than maxKeyAge, fetches the set again unless the last fetch
+// started less than refetchCooldown ago; concurrent lookups share one fetch.
 func (s *keySet) lookup(ctx context.Context, kid string) (key, error) {
 	s.mu.Lock()
 	now := s.now()
 	cooling := !s.attempted.IsZero() && now.Sub(s.attempted) < refetchCooldown
-	if k, ok := s.keys[kid]; ok {
+	current := !s.loaded.IsZero() && now.Sub(s.loaded) < maxKeyAge
+	if k, ok := s.keys[kid]; ok && current {
 		if s.flight == nil && !cooling && now.Sub(s.loaded) >= refreshInterval {
 			s.startLocked()
 		}
 		s.mu.Unlock()
 		return k, nil
 	}
-	if s.flight == nil && cooling {
-		r := ReasonKeyCooldown
-		if s.loaded.IsZero() {
-			r = ReasonKeyFetchFailed
-		}
-		wait := refetchCooldown - now.Sub(s.attempted)
+	joined := s.flight != nil
+	if (!joined && cooling) || (joined && s.flight.waiters >= maxWaiters) {
+		err := s.unavailableLocked(now, current)
 		s.mu.Unlock()
-		return key{}, &Error{Reason: r, RetryAfter: wait}
+		return key{}, err
 	}
-	if s.flight == nil {
+	if !joined {
 		s.startLocked()
 	}
 	f := s.flight
+	f.waiters++
 	s.mu.Unlock()
 
+	done := false
 	select {
 	case <-f.done:
+		done = true
 	case <-ctx.Done():
-		return key{}, &Error{Reason: ReasonKeyFetchFailed, RetryAfter: refetchCooldown}
-	}
-	if f.err != nil {
-		return key{}, &Error{Reason: ReasonKeyFetchFailed, RetryAfter: refetchCooldown}
 	}
 	s.mu.Lock()
-	k, ok := s.keys[kid]
-	s.mu.Unlock()
-	if !ok {
-		return key{}, refuse(ReasonUnknownKey)
+	defer s.mu.Unlock()
+	f.waiters--
+	if !done || f.err != nil {
+		return key{}, &Error{Reason: ReasonKeyFetchFailed, RetryAfter: refetchCooldown}
 	}
-	return k, nil
+	if k, ok := s.keys[kid]; ok {
+		return k, nil
+	}
+	if joined { // the fetch began before this lookup, maybe before its key existed
+		return key{}, s.unavailableLocked(s.now(), true)
+	}
+	return key{}, refuse(ReasonUnknownKey)
 }
 
-// refresh fetches the set now, or waits for the fetch in progress.
+// unavailableLocked: KeyCooldown with a current set, else KeyFetchFailed.
+func (s *keySet) unavailableLocked(now time.Time, current bool) error {
+	r := ReasonKeyCooldown
+	if !current {
+		r = ReasonKeyFetchFailed
+	}
+	return &Error{Reason: r, RetryAfter: max(refetchCooldown-now.Sub(s.attempted), time.Second)}
+}
+
+// refresh fetches the set now, or waits for the fetch in progress. A set
+// with no usable key is installed (it withdraws every key) and reported.
 func (s *keySet) refresh(ctx context.Context) error {
 	s.mu.Lock()
 	if s.flight == nil {
@@ -143,10 +162,15 @@ func (s *keySet) refresh(ctx context.Context) error {
 	s.mu.Unlock()
 	select {
 	case <-f.done:
-		return f.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f.err == nil && len(s.keys) == 0 {
+		return fetchError("the set has no usable signing key")
+	}
+	return f.err
 }
 
 // startLocked starts a fetch; s.mu is held. The fetch runs on its own
@@ -244,8 +268,10 @@ func (r *rawKey) private() bool {
 // parseKeySet keeps the keys that can verify a signature: kty RSA (at least
 // 2048 bits), EC or OKP Ed25519, with use absent or "sig", key_ops absent or
 // holding "verify", a kid, and an alg (if any) on the allowlist. Every other
-// key is ignored, as are both keys of a duplicated kid. No usable key fails
-// the fetch, so the last good set stays.
+// key is ignored, as are both keys of a duplicated kid. A set that parses is
+// authoritative even with no usable key: it replaces the old one, so
+// publishing {"keys":[]} withdraws every key. A failure keeps the old set
+// (until maxKeyAge).
 func parseKeySet(body []byte) (map[string]key, error) {
 	var set struct {
 		Keys []josejson.RawMessage `json:"keys"`
@@ -269,9 +295,6 @@ func parseKeySet(body []byte) (map[string]key, error) {
 			continue
 		}
 		keys[kid] = k
-	}
-	if len(keys) == 0 {
-		return nil, fetchError("no usable signing key")
 	}
 	return keys, nil
 }
