@@ -232,6 +232,7 @@ func TestVerify(t *testing.T) {
 		noParse bool   // go-jose must not have been called
 	}{
 		{"RS256 at+jwt", func() string { return rs() }, 0, false},
+		{"client_id when there is no azp", func() string { return rs(del("azp"), set("client_id", "mcp-client")) }, 0, false},
 		{"PS256 application/at+jwt", func() string { return sign(t, rsaKey, jose.PS256, "rsa", "application/at+jwt", payload(now)) }, 0, false},
 		{"ES256 AT+JWT, aud array", func() string {
 			return sign(t, ecKey, jose.ES256, "ec", "AT+JWT", payload(now, set("aud", []string{"other", testAudience})))
