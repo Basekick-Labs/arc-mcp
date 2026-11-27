@@ -4,6 +4,7 @@
 # Triggered by a git tag push matching v*. Produces:
 #   - Platform binaries (linux/darwin/windows × amd64/arm64, skip windows/arm64)
 #   - .tar.gz / .zip archives
+#   - arc-mcp-<version>.mcpb, the Claude Desktop extension (mcpb/pack.sh)
 #   - checksums.txt (sha256)
 #   - SPDX SBOM per archive via syft
 #   - .deb and .rpm packages (amd64, arm64)
@@ -51,8 +52,28 @@ builds:
       - -s -w
       - -X main.Version={{.Version}}
 
+# The darwin amd64 + arm64 binaries merged into one, for the Claude Desktop
+# extension only: its manifest has one darwin entry point, with no arch key
+# (mcpb#10). The post hook packs dist/arc-mcp-<version>.mcpb (mcpb/pack.sh)
+# after every build is done and before archives and checksums, so a failed
+# pack stops the release before anything is published. The hook starts
+# from an empty environment plus PATH: it sees none of the release's tokens.
+universal_binaries:
+  - id: arc-mcp-universal
+    ids: [arc-mcp]
+    name_template: arc-mcp
+    replace: false
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    hooks:
+      post:
+        - cmd: env -i "PATH={{ .Env.PATH }}" sh mcpb/pack.sh "{{ .Path }}" "{{ .Version }}" "{{ .CommitTimestamp }}"
+          output: true
+
 archives:
   - id: default
+    # Only the per-platform builds: without this the universal binary would
+    # ship as a sixth, darwin_all archive.
+    ids: [arc-mcp]
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
@@ -74,6 +95,10 @@ archives:
 checksum:
   name_template: 'checksums.txt'
   algorithm: sha256
+  # The extension, so the signed checksums.txt covers it. An exact name, not
+  # a pattern: a missing bundle fails the checksum step.
+  extra_files:
+    - glob: ./dist/arc-mcp-{{ .Version }}.mcpb
 
 sboms:
   - artifacts: archive
@@ -236,6 +261,8 @@ release:
   # checksums.txt and its signature are new. A rerun also resets a
   # hand-edited release title and prerelease flag; the notes are kept.
   replace_existing_artifacts: true
+  extra_files:
+    - glob: ./dist/arc-mcp-{{ .Version }}.mcpb
   name_template: "arc-mcp v{{ .Version }}"
   header: |
     arc-mcp {{ .Version }} — MCP server for [Arc](https://github.com/basekick-labs/arc).

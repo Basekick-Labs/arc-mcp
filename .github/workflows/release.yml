@@ -2,12 +2,14 @@ name: Release
 
 # Fires on every v* tag, or by hand (workflow_dispatch) for an existing tag:
 # the newest final tag, or a prerelease. GoReleaser builds the archives,
-# packages, images and the Homebrew formula, and publishes images → GitHub
-# release → formula (.goreleaser.yml). A formula push that fails would leave
+# packages, the Claude Desktop extension (.mcpb, packed before checksums by
+# mcpb/pack.sh), images and the Homebrew formula, and publishes images →
+# GitHub release → formula (.goreleaser.yml). A formula push that fails would leave
 # a complete release with no tap entry, so the job first refuses a tag that
 # is not on main, an older final tag, and a missing or dead tap token.
 # Rerunning a tag replaces the release's assets (replace_existing_artifacts);
-# the archives rebuild byte-identical, so the formula's sha256s still hold.
+# the archives and the .mcpb rebuild byte-identical, so the formula's sha256s
+# and the bundle's checksum line still hold.
 #
 # Actions are SHA-pinned here: this workflow holds contents:write,
 # packages:write, an OIDC identity that mints signing certificates in the

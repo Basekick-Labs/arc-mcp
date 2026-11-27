@@ -1,0 +1,95 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/v2.1.2/schemas/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "arc-mcp",
+  "display_name": "Arc",
+  "version": "0.0.0",
+  "description": "Query your Arc time-series lakehouse: discover databases and measurements, describe their schema, and run read-only SQL.",
+  "author": {
+    "name": "Basekick Labs",
+    "url": "https://github.com/basekick-labs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/basekick-labs/arc-mcp"
+  },
+  "homepage": "https://github.com/basekick-labs/arc-mcp",
+  "documentation": "https://github.com/basekick-labs/arc-mcp#readme",
+  "support": "https://github.com/basekick-labs/arc-mcp/issues",
+  "license": "MIT",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/arc-mcp",
+    "mcp_config": {
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "chmod u+x \"$0\" 2>/dev/null; exec \"$0\" --transport stdio --auth-mode static --tools data --insecure=false",
+        "${__dirname}/server/arc-mcp"
+      ],
+      "env": {
+        "ARC_URL": "${user_config.arc_url}",
+        "ARC_TOKEN": "${user_config.arc_token}",
+        "ARC_TOKEN_FILE": ""
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}${/}server${/}arc-mcp.exe",
+          "args": [
+            "--transport",
+            "stdio",
+            "--auth-mode",
+            "static",
+            "--tools",
+            "data",
+            "--insecure=false"
+          ]
+        }
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "list_databases",
+      "description": "List the databases in Arc"
+    },
+    {
+      "name": "list_measurements",
+      "description": "List the measurements in a database"
+    },
+    {
+      "name": "describe_measurement",
+      "description": "Columns, types, time range and statistics of a measurement"
+    },
+    {
+      "name": "query",
+      "description": "Run a read-only SQL query"
+    },
+    {
+      "name": "get_sample_data",
+      "description": "Sample rows from a measurement"
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ]
+  },
+  "user_config": {
+    "arc_url": {
+      "type": "string",
+      "title": "Arc URL",
+      "description": "Your Arc, for example http://localhost:8000 or https://arc.example.com. A remote Arc must use https.",
+      "default": "http://localhost:8000",
+      "required": false
+    },
+    "arc_token": {
+      "type": "string",
+      "title": "Arc token",
+      "description": "An Arc API token with read permission only.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}
