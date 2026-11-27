@@ -21,7 +21,7 @@ import (
 func allToolsSession(t *testing.T, dbs, meas string, query func(string) (int, string)) *mcp.ClientSession {
 	t.Helper()
 	return newSession(t, routeHandler{dbs: dbs, meas: meas, query: &fakeArc{reply: query}}, func(server *mcp.Server, client *arc.Client) {
-		RegisterAll(server, client, 500, 50_000)
+		RegisterAll(server, client, Groups{Data: true}, 500, 50_000)
 	})
 }
 
