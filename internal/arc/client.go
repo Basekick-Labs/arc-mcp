@@ -24,8 +24,8 @@ type Error struct {
 	Status int    // HTTP status when the error came from a response, 0 otherwise
 	Detail string // full detail — log to stderr, never send to LLM
 	// Message is text safe to show the model, set where it can act on it:
-	// Arc's fixed validation message for a refused request (HTTP 400), the
-	// fixable part of a failed query (redacted, see queryErrorText), or a
+	// Arc's fixed validation message for a refused request (HTTP 400), its
+	// governance reason for a refused query (HTTP 429), the fixable part of a failed query (redacted, see queryErrorText), or a
 	// fixed hint for a query that ran out of memory, timed out or lost data
 	// mid-run. Empty otherwise; UserMessage then gives the generic text.
 	Message string
@@ -98,6 +98,10 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	e := &Error{Kind: kind, Status: statusCode, Detail: detail}
 	switch {
 	case statusCode == http.StatusBadRequest:
+		e.Message = refusalText(snippet)
+	case statusCode == http.StatusTooManyRequests:
+		// Arc's governance refusal: a fixed reason such as "Rate limit
+		// exceeded: 10 queries per minute" or "Daily query quota exceeded".
 		e.Message = refusalText(snippet)
 	case op == "query" && statusCode == http.StatusInternalServerError:
 		if isOutOfMemory(snippet) {
@@ -228,7 +232,7 @@ func UserMessage(err error) string {
 			return "Arc could not be reached. Ask the user to check that the Arc server is running at the configured URL."
 		case KindServer:
 			switch {
-			case ae.Message != "" && ae.Status == http.StatusBadRequest:
+			case ae.Message != "" && (ae.Status == http.StatusBadRequest || ae.Status == http.StatusTooManyRequests):
 				return "Arc refused the request: " + ae.Message
 			case ae.Message != "":
 				// Only the query path sets Message on other statuses.
@@ -323,6 +327,9 @@ func NewClient(baseURL, token string, timeout time.Duration) *Client {
 		},
 	}
 }
+
+// Timeout is the limit on each request to Arc (arc-mcp's --timeout).
+func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
 // Health checks if the Arc instance is reachable.
 func (c *Client) Health(ctx context.Context) error {
