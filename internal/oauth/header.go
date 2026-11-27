@@ -15,11 +15,11 @@ type header struct {
 
 // refusedMembers are header members that preParse refuses whatever their
 // value, null included. jwk, jku, x5u and x5c carry or point to a key or a
-// certificate: keys come only from the configured key set, and go-jose
-// parsing such a member is the path of GHSA-mgcc-cww5-fp2q (an embedded RSA
-// JWK that costs seconds of CPU before any signature check, fixed in go-jose
-// 4.1.6). crit and b64 change how the token is read, and nothing here
-// implements an extension. x5t and x5t#S256 are only certificate
+// certificate, and keys come only from the configured key set. An embedded
+// jwk is also where GHSA-mgcc-cww5-fp2q bites: go-jose up to 4.1.5 spends
+// excess CPU validating a crafted RSA key in it, before any signature check.
+// crit and b64 change how the token is read, and nothing here implements an
+// extension. x5t and x5t#S256 are only certificate
 // thumbprints and are allowed: some authorization servers put x5t next to
 // kid.
 var refusedMembers = map[string]bool{
