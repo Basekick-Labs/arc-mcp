@@ -15,10 +15,16 @@ import (
 // tests exercise the registered handlers, not helpers next to them.
 func newSession(t *testing.T, arcHandler http.Handler, register func(*mcp.Server, *arc.Client)) *mcp.ClientSession {
 	t.Helper()
+	return newSessionTimeout(t, arcHandler, 5*time.Second, register)
+}
+
+// newSessionTimeout is newSession with the client's --timeout set.
+func newSessionTimeout(t *testing.T, arcHandler http.Handler, timeout time.Duration, register func(*mcp.Server, *arc.Client)) *mcp.ClientSession {
+	t.Helper()
 	arcSrv := httptest.NewServer(arcHandler)
 	t.Cleanup(arcSrv.Close)
 
-	client := arc.NewClient(arcSrv.URL, "tok", 5*time.Second)
+	client := arc.NewClient(arcSrv.URL, "tok", timeout)
 	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp-test", Version: "test"}, nil)
 	register(server, client)
 
