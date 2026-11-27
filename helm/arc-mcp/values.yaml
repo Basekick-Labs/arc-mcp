@@ -34,6 +34,10 @@ arc:
   maxRows: 500
   timeout: "30s"
   maxResponseSize: 50000
+  # Tool groups arc-mcp serves (ARC_MCP_TOOLS): data, and ops for Arc's
+  # health and metrics tools. A list: --set 'arc.tools={data,ops}'.
+  tools:
+    - data
 
 # Gateway that wraps arc-mcp's stdio as HTTP/SSE so remote LLM clients can
 # connect. Default uses ghcr.io/basekick-labs/arc-mcp-gateway, which bundles

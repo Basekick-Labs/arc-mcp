@@ -63,6 +63,8 @@ spec:
                   optional: true
             - name: ARC_MCP_MAX_ROWS
               value: {{ .Values.arc.maxRows | quote }}
+            - name: ARC_MCP_TOOLS
+              value: {{ join "," .Values.arc.tools | quote }}
             {{- if .Values.arc.insecure }}
             - name: ARC_MCP_INSECURE
               value: "1"
@@ -103,6 +105,8 @@ spec:
                   name: {{ include "arc-mcp.tokenSecretName" . }}
                   key: {{ include "arc-mcp.tokenSecretKey" . }}
                   optional: true
+            - name: ARC_MCP_TOOLS
+              value: {{ join "," .Values.arc.tools | quote }}
             {{- if .Values.arc.insecure }}
             - name: ARC_MCP_INSECURE
               value: "1"
