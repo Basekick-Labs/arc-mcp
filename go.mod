@@ -5,6 +5,7 @@ go 1.26
 toolchain go1.26.11
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/google/jsonschema-go v0.4.2
 	github.com/modelcontextprotocol/go-sdk v1.5.0
 )
