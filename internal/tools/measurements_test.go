@@ -391,7 +391,7 @@ func TestDescribe_DescribeFailureReason(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fake := &fakeArc{replyCtx: func(ctx context.Context, sql string) (int, string) { return tt.reply(ctx) }}
+			fake := &fakeArc{replyCtx: func(ctx context.Context, _ string) (int, string) { return tt.reply(ctx) }}
 			cs := newSessionTimeout(t, fake, 200*time.Millisecond, func(server *mcp.Server, client *arc.Client) {
 				RegisterDescribeMeasurement(server, client, 50_000)
 			})
@@ -409,7 +409,7 @@ func TestDescribe_DescribeFailureReason(t *testing.T) {
 // A caller deadline sooner than --timeout: the text names the time the
 // statistics actually had.
 func TestDescribe_StatsTimeoutNamesTheDeadlineThatFired(t *testing.T) {
-	fake := &fakeArc{replyCtx: func(ctx context.Context, sql string) (int, string) { return waitForCancel(ctx) }}
+	fake := &fakeArc{replyCtx: func(ctx context.Context, _ string) (int, string) { return waitForCancel(ctx) }}
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 	client := arc.NewClient(srv.URL, "tok", 5*time.Second)
