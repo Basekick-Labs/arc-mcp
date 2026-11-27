@@ -3,10 +3,11 @@ arc-mcp Deployment: the arc-mcp image serving MCP over Streamable HTTP at
 /mcp (--transport http). The supergateway image and the gateway.* values are
 gone; fail with the way forward rather than ignore them.
 */}}
-{{- if hasKey .Values "gateway" }}
-{{- fail "gateway.* values were removed: arc-mcp now serves MCP over Streamable HTTP itself, at /mcp (clients that used /sse must switch). Remove gateway.* and set http.tokenSecretRef.name (or http.insecureListen). See the chart README." }}
+{{- $insecureListen := eq (toString .Values.http.insecureListen) "true" }}
+{{- if .Values.gateway }}
+{{- fail "gateway.* values were removed: arc-mcp now serves MCP over Streamable HTTP itself, at /mcp (clients that used /sse must switch). Remove gateway.* (with helm upgrade --reuse-values, use --reset-then-reuse-values instead) and set http.tokenSecretRef.name or http.insecureListen. See \"Remote access over HTTP\" in the arc-mcp README." }}
 {{- end }}
-{{- if and (not .Values.http.tokenSecretRef.name) (not .Values.http.insecureListen) }}
+{{- if and (not .Values.http.tokenSecretRef.name) (not $insecureListen) }}
 {{- fail "set http.tokenSecretRef.name to a Secret holding the bearer token MCP clients send, or http.insecureListen=true to serve without one (anyone who can reach the Service then queries Arc with arc-mcp's token)." }}
 {{- end }}
 apiVersion: apps/v1
@@ -57,6 +58,9 @@ spec:
             - {{ .Values.arc.maxResponseSize | quote }}
             - "--max-concurrent"
             - {{ .Values.http.maxConcurrent | quote }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             {{- if .Values.http.tlsSecretName }}
             - "--tls-cert"
             - "/etc/arc-mcp/tls/tls.crt"
@@ -85,13 +89,16 @@ spec:
             - name: ARC_MCP_INSECURE_LISTEN
               value: "true"
             {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.http.port }}
               protocol: TCP
           {{- with .Values.livenessProbe }}
           livenessProbe:
-            {{- if $.Values.http.tlsSecretName }}
+            {{- if and $.Values.http.tlsSecretName .httpGet }}
             {{- toYaml (merge (dict "httpGet" (dict "scheme" "HTTPS")) .) | nindent 12 }}
             {{- else }}
             {{- toYaml . | nindent 12 }}
@@ -99,7 +106,7 @@ spec:
           {{- end }}
           {{- with .Values.readinessProbe }}
           readinessProbe:
-            {{- if $.Values.http.tlsSecretName }}
+            {{- if and $.Values.http.tlsSecretName .httpGet }}
             {{- toYaml (merge (dict "httpGet" (dict "scheme" "HTTPS")) .) | nindent 12 }}
             {{- else }}
             {{- toYaml . | nindent 12 }}

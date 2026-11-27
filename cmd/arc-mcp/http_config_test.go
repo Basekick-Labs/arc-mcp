@@ -64,8 +64,28 @@ func TestResolveHTTPToken(t *testing.T) {
 	if tok, err := resolveHTTPToken(); tok != "from-env" || err != nil {
 		t.Errorf("env: %q %v", tok, err)
 	}
+	t.Setenv("ARC_MCP_HTTP_TOKEN", " \t ")
+	if _, err := resolveHTTPToken(); err == nil {
+		t.Error("a blank ARC_MCP_HTTP_TOKEN was accepted as no token")
+	}
 	t.Setenv("ARC_MCP_HTTP_TOKEN", "")
 	if tok, err := resolveHTTPToken(); tok != "" || err != nil {
 		t.Errorf("none: %q %v", tok, err)
 	}
+}
+
+func TestEnvOrDefaultInt(t *testing.T) {
+	badEnv = nil
+	t.Setenv("ARC_MCP_TEST_INT", "16")
+	if n := envOrDefaultInt("ARC_MCP_TEST_INT", 8); n != 16 || badEnv != nil {
+		t.Errorf("16: %d %v", n, badEnv)
+	}
+	for _, v := range []string{"abc", "4x", "1.5"} {
+		badEnv = nil
+		t.Setenv("ARC_MCP_TEST_INT", v)
+		if n := envOrDefaultInt("ARC_MCP_TEST_INT", 8); n != 8 || badEnv == nil {
+			t.Errorf("%q accepted as %d", v, n)
+		}
+	}
+	badEnv = nil
 }

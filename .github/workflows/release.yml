@@ -143,7 +143,7 @@ jobs:
           # Drop --rm so docker logs can still read the log after exit, and
           # feed /dev/null to stdin so the exit is deterministic. The health
           # check is expected to fail (invalid URL); we only assert the server
-          # booted far enough to log. Tightens once --version lands (PR 3).
+          # booted far enough to log.
           docker run -d --name smoke -i \
             -e ARC_URL=http://127.0.0.1:65535 \
             ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }} \
@@ -153,3 +153,17 @@ jobs:
           docker logs smoke 2>&1 | tee /tmp/smoke.log
           docker rm -f smoke || true
           grep -q "arc-mcp server starting" /tmp/smoke.log
+
+      - name: Verify the HTTP transport answers /healthz
+        run: |
+          docker run -d --name smoke-http -p 127.0.0.1:18080:8080 \
+            -e ARC_URL=http://127.0.0.1:65535 \
+            -e ARC_MCP_HTTP_TOKEN=smoke-test-token \
+            ghcr.io/basekick-labs/arc-mcp:${{ steps.version.outputs.version }} \
+            --transport http --listen 0.0.0.0:8080
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:18080/healthz && break; sleep 1; done
+          docker logs smoke-http 2>&1 | tee /tmp/smoke-http.log
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' http://127.0.0.1:18080/mcp -d '{}')
+          docker rm -f smoke-http || true
+          grep -q "arc-mcp serving" /tmp/smoke-http.log
+          test "$code" = 401

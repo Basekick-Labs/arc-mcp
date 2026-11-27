@@ -60,8 +60,12 @@ http:
   tlsSecretName: ""
 
 # Room for queries in flight to finish on shutdown: arc-mcp waits up to
-# 4 x arc.timeout + 5s (125s at the default 30s).
+# 4 x arc.timeout + 5s (125s at the default 30s). Raise it with arc.timeout.
 terminationGracePeriodSeconds: 130
+
+# More arc-mcp flags, and more environment variables for its container.
+extraArgs: []
+extraEnv: []
 
 service:
   type: ClusterIP

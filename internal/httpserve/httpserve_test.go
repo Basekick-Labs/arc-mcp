@@ -3,11 +3,20 @@ package httpserve
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +137,11 @@ func TestStaticToken(t *testing.T) {
 	if v(context.Background(), secret) != nil {
 		t.Error("the right token was refused")
 	}
+	// The header's extra spaces are not part of the token.
+	srv := endpoint(t, Options{Verify: StaticToken(secret)})
+	if _, err := connect(t, srv, " "+secret); err != nil {
+		t.Errorf("Bearer with two spaces refused: %v", err)
+	}
 	for _, bad := range []string{"", "x", secret + " ", strings.ToUpper(secret)} {
 		if v(context.Background(), bad) == nil {
 			t.Errorf("%q accepted", bad)
@@ -172,10 +186,11 @@ func TestBodyLimit(t *testing.T) {
 // loopback with a foreign Host header is refused, unless AllowAnyHost.
 func TestDNSRebindingProtection(t *testing.T) {
 	for _, allow := range []bool{false, true} {
-		srv := endpoint(t, Options{AllowAnyHost: allow})
+		srv := endpoint(t, Options{AllowAnyHost: allow, Verify: StaticToken(secret)})
 		body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}`
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, strings.NewReader(body))
 		req.Host = "evil.example.com"
+		req.Header.Set("Authorization", "Bearer "+secret)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
 		resp, err := srv.Client().Do(req)
@@ -183,8 +198,12 @@ func TestDNSRebindingProtection(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = resp.Body.Close()
-		if refused := resp.StatusCode == http.StatusForbidden; refused == allow {
-			t.Errorf("AllowAnyHost=%v: status %d", allow, resp.StatusCode)
+		want := http.StatusForbidden
+		if allow {
+			want = http.StatusOK
+		}
+		if resp.StatusCode != want {
+			t.Errorf("AllowAnyHost=%v: status %d, want %d", allow, resp.StatusCode, want)
 		}
 	}
 }
@@ -204,6 +223,10 @@ func TestListenGuard(t *testing.T) {
 		{tcp("192.168.1.10"), Options{}, true},
 		{tcp("192.168.1.10"), Options{Verify: StaticToken(secret)}, false},
 		{tcp("192.168.1.10"), Options{InsecureListen: true}, false},
+		// Without the Host check, only a token stops DNS rebinding.
+		{tcp("127.0.0.1"), Options{AllowAnyHost: true}, true},
+		{tcp("127.0.0.1"), Options{AllowAnyHost: true, Verify: StaticToken(secret)}, false},
+		{tcp("127.0.0.1"), Options{AllowAnyHost: true, InsecureListen: true}, false},
 	}
 	for _, tt := range tests {
 		if err := checkListener(tt.addr, tt.opts); (err != nil) != tt.wantErr {
@@ -284,21 +307,36 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-// Serve stops when its context is done, after requests in flight.
+// Serve stops when its context is done, after the request in flight.
 func TestServeShutsDown(t *testing.T) {
+	arcSrv, gate := slowArc(t)
 	ln, err := Listen(Options{Listen: "127.0.0.1:0"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Serve(ctx, ln, Handler(mcpServer(t), Options{}), Options{QueryTimeout: time.Second}) }()
-	resp, err := http.Get("http://" + ln.Addr().String() + "/healthz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
+	go func() {
+		done <- Serve(ctx, ln, Handler(mcpServerFor(t, arcSrv.URL), Options{}), Options{QueryTimeout: 5 * time.Second})
+	}()
+	callDone := make(chan string, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(callRequest(t, "http://"+ln.Addr().String()+Path, ""))
+		if err != nil {
+			callDone <- err.Error()
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		callDone <- string(b)
+	}()
+	<-gate.started
 	cancel()
+	time.Sleep(100 * time.Millisecond)
+	close(gate.release)
+	if out := <-callDone; !strings.Contains(out, "9007199254740993") {
+		t.Errorf("the call in flight did not finish: %q", out)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -311,4 +349,194 @@ func TestServeShutsDown(t *testing.T) {
 		_ = resp.Body.Close()
 		t.Error("still serving after shutdown")
 	}
+}
+
+// gate holds the slow fake Arc's queries until release is closed.
+type gate struct {
+	started        chan struct{}
+	release        chan struct{}
+	inFlight, peak atomic.Int32
+}
+
+// slowArc is a fake Arc whose queries wait for the gate, counting how many
+// run at once.
+func slowArc(t *testing.T) (*httptest.Server, *gate) {
+	t.Helper()
+	g := &gate{started: make(chan struct{}, 100), release: make(chan struct{})}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := g.inFlight.Add(1)
+		defer g.inFlight.Add(-1)
+		for p := g.peak.Load(); n > p && !g.peak.CompareAndSwap(p, n); p = g.peak.Load() {
+		}
+		g.started <- struct{}{}
+		<-g.release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true,"columns":["n"],"data":[[9007199254740993]],"row_count":1,"execution_time_ms":1}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, g
+}
+
+func mcpServerFor(t *testing.T, arcURL string) *mcp.Server {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp", Version: "test"}, nil)
+	tools.RegisterAll(server, arc.NewClient(arcURL, "arc-token", 5*time.Second), tools.Groups{Data: true}, 500, 50_000)
+	return server
+}
+
+const callBody = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"database":"db","sql":"SELECT n FROM t"}}}`
+
+// callRequest is a raw tools/call POST, as a client of the 2025-03-26
+// protocol sends it (no MCP-Protocol-Version header).
+func callRequest(t *testing.T, url, token string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(callBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req
+}
+
+// The cap holds on tool calls through the real handler: two calls with a
+// cap of one never run two Arc queries at once.
+func TestHandlerConcurrencyCap(t *testing.T) {
+	arcSrv, g := slowArc(t)
+	srv := httptest.NewServer(Handler(mcpServerFor(t, arcSrv.URL), Options{MaxConcurrent: 1}))
+	t.Cleanup(srv.Close)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if resp, err := srv.Client().Do(callRequest(t, srv.URL+Path, "")); err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+	}
+	<-g.started
+	time.Sleep(200 * time.Millisecond)
+	close(g.release)
+	wg.Wait()
+	if g.peak.Load() != 1 {
+		t.Errorf("peak Arc queries %d with a cap of 1", g.peak.Load())
+	}
+}
+
+// A JSON-RPC batch would run its calls in parallel past the cap: refused.
+func TestBatchRefused(t *testing.T) {
+	srv := endpoint(t, Options{MaxConcurrent: 1})
+	for _, body := range []string{"[" + callBody + "," + callBody + "]", " \n[" + callBody + "]"} {
+		req := callRequest(t, srv.URL+Path, "")
+		req.Body = io.NopCloser(strings.NewReader(body))
+		req.ContentLength = int64(len(body))
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("batch: status %d, want 400", resp.StatusCode)
+		}
+	}
+}
+
+// Without the token, every method gets 401, and the body is not read: an
+// oversized one gets 401, not 413.
+func TestUnauthenticatedNeverReachesMCP(t *testing.T) {
+	srv := endpoint(t, Options{Verify: StaticToken(secret)})
+	for _, m := range []string{http.MethodGet, http.MethodDelete, http.MethodPost, http.MethodPut} {
+		req, _ := http.NewRequest(m, srv.URL+Path, nil)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status %d, want 401", m, resp.StatusCode)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, bytes.NewReader(make([]byte, MaxBodyBytes+1)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("oversized unauthenticated body: status %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestLogField(t *testing.T) {
+	for in, want := range map[string]string{
+		"tools/call":             "tools/call",
+		"/mcp":                   "/mcp",
+		"q\nhttp POST /mcp 200":  `"q\nhttp POST /mcp 200"`,
+		"a b":                    `"a b"`,
+		strings.Repeat("x", 200): strings.Repeat("x", 128) + "...",
+	} {
+		if got := logField(in); got != want {
+			t.Errorf("logField(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TLS files are loaded by Listen: a missing one is refused before serving,
+// and a good pair serves HTTPS.
+func TestListenTLS(t *testing.T) {
+	if _, err := Listen(Options{Listen: "127.0.0.1:0", TLSCertFile: "/nonexistent.crt", TLSKeyFile: "/nonexistent.key"}); err == nil {
+		t.Fatal("missing TLS files accepted")
+	}
+	certFile, keyFile := selfSigned(t)
+	ln, err := Listen(Options{Listen: "127.0.0.1:0", TLSCertFile: certFile, TLSKeyFile: keyFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, ln, Handler(mcpServer(t), Options{}), Options{}) }()
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // self-signed test certificate
+	resp, err := client.Get("https://" + ln.Addr().String() + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.TLS == nil || resp.StatusCode != 200 {
+		t.Errorf("TLS %v, status %d", resp.TLS != nil, resp.StatusCode)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Error(err)
+	}
+}
+
+func selfSigned(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kder, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "c.pem"), filepath.Join(dir, "k.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
 }

@@ -75,6 +75,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Refusing to start: --tls-cert and --tls-key go together")
 		os.Exit(2)
 	}
+	if *maxConcurrent < 0 {
+		fmt.Fprintf(os.Stderr, "Refusing to start: --max-concurrent %d is negative; use 0 for no limit\n", *maxConcurrent)
+		os.Exit(2)
+	}
+	if *transport == "stdio" {
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "listen", "insecure-listen", "tls-cert", "tls-key", "max-concurrent", "allow-any-host":
+				log.Printf("--%s applies to --transport http only; ignored over stdio", f.Name)
+			}
+		})
+	}
 	var httpToken string
 	if *transport == "http" {
 		t, err := resolveHTTPToken()
@@ -126,6 +138,36 @@ func main() {
 		log.Printf("WARNING: --insecure is set; Bearer token will be sent over plaintext HTTP")
 	}
 
+	// The HTTP listener is opened and checked (address guard, TLS files)
+	// before arc-mcp contacts Arc with its token.
+	var (
+		ln       net.Listener
+		httpOpts httpserve.Options
+	)
+	if *transport == "http" {
+		httpOpts = httpserve.Options{
+			Listen:         *listen,
+			InsecureListen: *insecureListen,
+			TLSCertFile:    *tlsCert,
+			TLSKeyFile:     *tlsKey,
+			AllowAnyHost:   *allowAnyHost,
+			MaxConcurrent:  *maxConcurrent,
+			QueryTimeout:   *timeout,
+		}
+		if httpToken != "" {
+			httpOpts.Verify = httpserve.StaticToken(httpToken)
+		}
+		if os.Getenv("MCPGODEBUG") != "" {
+			log.Printf("WARNING: MCPGODEBUG is set (%q): it can turn off the MCP SDK's DNS-rebinding and cross-origin protection", os.Getenv("MCPGODEBUG"))
+		}
+		var err error
+		ln, err = httpserve.Listen(httpOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	// Create Arc client
 	client := arc.NewClient(*arcURL, *arcToken, *timeout)
 
@@ -166,24 +208,7 @@ func main() {
 	// Register tools
 	tools.RegisterAll(server, client, groups, *maxRows, *maxResponseSize)
 
-	if *transport == "http" {
-		opts := httpserve.Options{
-			Listen:         *listen,
-			InsecureListen: *insecureListen,
-			TLSCertFile:    *tlsCert,
-			TLSKeyFile:     *tlsKey,
-			AllowAnyHost:   *allowAnyHost,
-			MaxConcurrent:  *maxConcurrent,
-			QueryTimeout:   *timeout,
-		}
-		if httpToken != "" {
-			opts.Verify = httpserve.StaticToken(httpToken)
-		}
-		ln, err := httpserve.Listen(opts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
-			os.Exit(2)
-		}
+	if ln != nil {
 		scheme := "http"
 		if *tlsCert != "" {
 			scheme = "https"
@@ -195,7 +220,7 @@ func main() {
 		log.Printf("arc-mcp serving %s://%s%s (%s; max-rows=%d, timeout=%s, max-concurrent=%d)", scheme, ln.Addr(), httpserve.Path, auth, *maxRows, *timeout, *maxConcurrent)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		if err := httpserve.Serve(ctx, ln, httpserve.Handler(server, opts), opts); err != nil {
+		if err := httpserve.Serve(ctx, ln, httpserve.Handler(server, httpOpts), httpOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
 		}
@@ -344,17 +369,31 @@ func resolveHTTPToken() (string, error) {
 		}
 		return t, nil
 	}
-	return strings.TrimSpace(os.Getenv("ARC_MCP_HTTP_TOKEN")), nil
+	if v, set := os.LookupEnv("ARC_MCP_HTTP_TOKEN"); set && v != "" {
+		t := strings.TrimSpace(v)
+		if t == "" {
+			return "", errors.New("ARC_MCP_HTTP_TOKEN is set but blank")
+		}
+		return t, nil
+	}
+	return "", nil
 }
 
+// envOrDefaultInt reads an integer environment variable; unset is fallback,
+// a value that is not an integer ("abc", "4x") is refused at startup.
 func envOrDefaultInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		var n int
-		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
-			return n
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
 	}
-	return fallback
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		if badEnv == nil {
+			badEnv = fmt.Errorf("%s=%q is not an integer", key, v)
+		}
+		return fallback
+	}
+	return n
 }
 
 // resolveToken returns the Arc API token using the following precedence:

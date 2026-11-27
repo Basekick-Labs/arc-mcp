@@ -111,7 +111,7 @@ arc-mcp --transport http --listen 0.0.0.0:8080
 - **TLS.** The bearer token travels in every request. Serve HTTPS with `--tls-cert`/`--tls-key`, or terminate TLS at a proxy in front of arc-mcp. A proxy on the same host that forwards to `127.0.0.1` with the public `Host` header is refused by the DNS-rebinding protection; pass `--allow-any-host` for that setup, and only for it.
 - **Stateless.** Each request is answered on its own (JSON responses, no long-lived stream), so any number of replicas can sit behind a load balancer.
 - At most `--max-concurrent` requests (default 8) are served at once; the rest wait. Request bodies are limited to 2 MiB. On SIGTERM, requests in flight get up to 4 × `--timeout` + 5s to finish.
-- Requests must be `Content-Type: application/json` and accept `application/json, text/event-stream`, as the MCP specification says. Browser clients are not supported (no CORS).
+- Requests must carry `Content-Type: application/json` exactly (a `; charset=utf-8` parameter is refused with 415) and accept `application/json, text/event-stream`, as the MCP specification says. Browser clients are not supported (no CORS).
 
 Clients connect with the URL and the header. For Claude Code:
 
@@ -119,7 +119,7 @@ Clients connect with the URL and the header. For Claude Code:
 claude mcp add --transport http arc http://host:8080/mcp --header "Authorization: Bearer $ARC_MCP_HTTP_TOKEN"
 ```
 
-Clients configured with JSON (Cursor, Windsurf and others) take a `url` and `headers`:
+Clients configured with JSON that support remote servers take the URL and the header; Cursor's form is below (field names vary: Windsurf, for one, calls the URL `serverUrl`, so check your client's documentation):
 
 ```json
 {
@@ -132,7 +132,21 @@ Clients configured with JSON (Cursor, Windsurf and others) take a `url` and `hea
 }
 ```
 
-**Upgrading from the `arc-mcp-gateway` image.** Earlier releases exposed HTTP through a separate image that wrapped arc-mcp with supergateway, serving the older HTTP+SSE transport at `/sse`. That image is no longer published. Run the `arc-mcp` image with `--transport http` instead, and point clients at `/mcp`. The Helm chart's `gateway.*` values are gone: set `http.tokenSecretRef.name` (or `http.insecureListen`); the chart refuses to render with the old values.
+**Upgrading from the `arc-mcp-gateway` image.** Earlier releases exposed HTTP through a separate image that wrapped arc-mcp with supergateway, serving the older HTTP+SSE transport at `/sse`. That image is no longer published. Run the `arc-mcp` image with `--transport http` instead, and point clients at `/mcp`. With Docker Compose, set `ARC_MCP_VERSION` in your `.env` to a release that has the HTTP transport (an `.env` copied from an older example pins one that does not) and add `ARC_MCP_HTTP_TOKEN`.
+
+With the Helm chart, the `gateway.*` values are gone and the chart refuses to render while they are set (with `helm upgrade --reuse-values`, use `--reset-then-reuse-values`). The new values:
+
+| Value | Meaning | Default |
+|-------|---------|---------|
+| `http.tokenSecretRef.name`, `.key` | Secret holding the inbound bearer token, mounted as a file | (none), `token` |
+| `http.insecureListen` | Serve without an inbound token (restrict who can reach the Service yourself) | `false` |
+| `http.tlsSecretName` | `kubernetes.io/tls` Secret to serve HTTPS from | (none) |
+| `http.maxConcurrent` | Requests served at once | `8` |
+| `http.port` | Container port | `8080` |
+| `terminationGracePeriodSeconds` | Shutdown grace; keep it above 4 × `arc.timeout` + 5s | `130` |
+| `extraArgs`, `extraEnv` | More flags and environment variables for arc-mcp | `[]` |
+
+One of `http.tokenSecretRef.name` and `http.insecureListen` is required. Probes use `/healthz`.
 
 ## Docker Compose (quick-start)
 

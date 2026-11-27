@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,8 +78,18 @@ func StaticToken(secret string) Verifier {
 // Listen opens the listener and checks it: a listener that is not on a
 // loopback address needs an inbound token unless InsecureListen is set. The
 // check is on the address actually bound, so a host name, "", 0.0.0.0, ::
-// and IPv4-mapped forms are all judged the same way.
+// and IPv4-mapped forms are all judged the same way. With TLS files, the
+// certificate is loaded here and the listener serves TLS, so a missing or
+// bad file is refused before arc-mcp starts serving.
 func Listen(opts Options) (net.Listener, error) {
+	var tlsConfig *tls.Config
+	if opts.TLSCertFile != "" || opts.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading the TLS certificate: %w", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
 	ln, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
 		return nil, err
@@ -86,6 +98,9 @@ func Listen(opts Options) (net.Listener, error) {
 		_ = ln.Close()
 		return nil, err
 	}
+	if tlsConfig != nil {
+		ln = tls.NewListener(ln, tlsConfig)
+	}
 	return ln, nil
 }
 
@@ -93,6 +108,11 @@ func checkListener(addr net.Addr, opts Options) error {
 	tcp, ok := addr.(*net.TCPAddr)
 	loopback := ok && tcp.IP.IsLoopback()
 	switch {
+	case loopback && opts.AllowAnyHost && opts.Verify == nil && !opts.InsecureListen:
+		// Without the Host check and without a token, a web page that
+		// rebinds its name to 127.0.0.1 is same-origin and gets through.
+		return errors.New("refusing --allow-any-host without an inbound token: any web page open on this machine could reach the endpoint through DNS rebinding. " +
+			"Set ARC_MCP_HTTP_TOKEN_FILE (or ARC_MCP_HTTP_TOKEN), or pass --insecure-listen")
 	case loopback:
 		return nil
 	case opts.Verify == nil && !opts.InsecureListen:
@@ -121,11 +141,14 @@ func Handler(server *mcp.Server, opts Options) http.Handler {
 		DisableLocalhostProtection: opts.AllowAnyHost,
 	})
 
+	// Outermost first: authenticate, then read and check the body, then
+	// wait for a slot, so neither an unauthenticated client nor a slow
+	// upload holds one.
 	var h http.Handler = mcpHandler
-	h = rpcInfo(h)
 	if opts.MaxConcurrent > 0 {
 		h = limitConcurrency(h, opts.MaxConcurrent)
 	}
+	h = rpcInfo(h)
 	if opts.Verify != nil {
 		h = requireBearer(h, opts.Verify)
 	}
@@ -166,13 +189,7 @@ func Serve(ctx context.Context, ln net.Listener, handler http.Handler, opts Opti
 		ErrorLog:          log.Default(),
 	}
 	errc := make(chan error, 1)
-	go func() {
-		if opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
-			errc <- srv.ServeTLS(ln, opts.TLSCertFile, opts.TLSKeyFile)
-		} else {
-			errc <- srv.Serve(ln)
-		}
-	}()
+	go func() { errc <- srv.Serve(ln) }()
 	select {
 	case err := <-errc:
 		return err
@@ -182,7 +199,8 @@ func Serve(ctx context.Context, ln net.Listener, handler http.Handler, opts Opti
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return err
+		log.Printf("shutdown: requests still running after %s were cut off", grace)
+		_ = srv.Close()
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -229,9 +247,16 @@ type reqInfo struct {
 	method, tool string
 }
 
-// rpcInfo caps the body and notes the JSON-RPC method and tool name for the
-// access log, then hands the body on unchanged. It runs after authentication,
-// so an unauthenticated body is never read.
+// rpcInfo caps the body, refuses JSON-RPC batches, and notes the JSON-RPC
+// method and tool name for the access log, then hands the body on
+// unchanged. With an inbound token it runs after authentication, so an
+// unauthenticated body is never read.
+//
+// Batches: the SDK still accepts them from clients of protocol versions
+// before 2025-06-18 and runs their calls in parallel, so one request could
+// run any number of Arc queries past the concurrency cap. MCP has dropped
+// batching, and arc-mcp's stateless one-call-per-request mode has no use
+// for it.
 func rpcInfo(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body == nil || r.Method != http.MethodPost {
@@ -240,7 +265,16 @@ func rpcInfo(next http.Handler) http.Handler {
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
 		if err != nil {
-			http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "request body unreadable", http.StatusBadRequest)
+			}
+			return
+		}
+		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && t[0] == '[' {
+			http.Error(w, "JSON-RPC batches are not supported: send one message per request", http.StatusBadRequest)
 			return
 		}
 		if info, ok := r.Context().Value(reqInfoKey{}).(*reqInfo); ok {
@@ -305,13 +339,30 @@ func accessLog(next http.Handler) http.Handler {
 		if sw.status == 0 {
 			sw.status = http.StatusOK
 		}
-		line := fmt.Sprintf("http %s %s %d %s peer=%s", r.Method, r.URL.Path, sw.status, time.Since(start).Round(time.Millisecond), r.RemoteAddr)
+		// Everything the client controls is quoted and cut, so it cannot
+		// forge a log line or flood the log.
+		line := fmt.Sprintf("http %s %s %d %s peer=%s", logField(r.Method), logField(r.URL.Path), sw.status, time.Since(start).Round(time.Millisecond), r.RemoteAddr)
 		if info.method != "" {
-			line += " rpc=" + info.method
+			line += " rpc=" + logField(info.method)
 		}
 		if info.tool != "" {
-			line += " tool=" + info.tool
+			line += " tool=" + logField(info.tool)
 		}
 		log.Print(line)
 	})
+}
+
+// logField is a client-supplied value as it goes in the access log: cut to
+// 128 bytes, and quoted when it holds anything but plain printable ASCII
+// (a newline would otherwise start a forged line).
+func logField(s string) string {
+	if len(s) > 128 {
+		s = s[:128] + "..."
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= ' ' || c >= 0x7f || c == '"' {
+			return strconv.Quote(s)
+		}
+	}
+	return s
 }
