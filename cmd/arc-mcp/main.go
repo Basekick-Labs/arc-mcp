@@ -309,7 +309,8 @@ func tokenScopeLog(permissions []string, remote bool) []string {
 }
 
 // validateArcURL rejects configurations that would send a Bearer token over
-// cleartext HTTP to a non-loopback host. A query string or userinfo in the
+// cleartext HTTP to a non-loopback host (see isLoopbackHost for which hosts
+// count as loopback). A query string or userinfo in the
 // URL follows the same rule as a token: both are sent on every request and
 // can carry credentials. Passing --insecure (or setting ARC_MCP_INSECURE)
 // bypasses the check but logs a prominent warning. Errors name the URL
@@ -338,14 +339,26 @@ func validateArcURL(rawURL, token string, insecure bool) error {
 	if isLoopbackHost(host) {
 		return nil
 	}
+	if l := strings.ToLower(strings.TrimSuffix(host, ".")); l == "localhost" || strings.HasSuffix(l, ".localhost") {
+		return fmt.Errorf("refusing to send credentials over plaintext HTTP to %q: only exactly localhost or a loopback IP counts as loopback (a configured HTTP_PROXY applies to other names) — use http://localhost or http://127.0.0.1, or https://", host)
+	}
 	if token == "" {
 		return fmt.Errorf("refusing to send the arc URL's query string or userinfo over plaintext HTTP to remote host %q — use https:// or pass --insecure", host)
 	}
 	return fmt.Errorf("refusing to send Bearer token over plaintext HTTP to remote host %q — use https:// or pass --insecure", host)
 }
 
+// isLoopbackHost reports whether host may receive credentials over plaintext
+// HTTP. host is a URL's Hostname(), so IPv6 comes without brackets. Only
+// exactly "localhost" and loopback IP literals (127.0.0.0/8, ::1 and their
+// IPv4-mapped forms) count: they are the hosts net/http's
+// ProxyFromEnvironment never sends to HTTP_PROXY, whatever NO_PROXY says, so
+// the request reaches the host itself. Any other spelling can go through a
+// configured proxy, in cleartext, so it counts as remote: a name under
+// .localhost, "LOCALHOST" or "localhost." (the proxy rule compares the name
+// exactly), 0.0.0.0.
 func isLoopbackHost(host string) bool {
-	if host == "localhost" || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+	if host == "localhost" {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {

@@ -36,7 +36,7 @@ ARC_URL=http://localhost:8000 ARC_TOKEN_FILE=/path/to/token \
 | `ARC_MCP_TOOLS` | Tool groups to serve: `data`, `ops` or `data,ops` (see [Operations tools](#operations-tools-opt-in)) | `data` |
 | `ARC_MCP_TIMEOUT` | Query timeout (`30s`, `2m`) | `30s` |
 | `ARC_MCP_MAX_RESPONSE_SIZE` | Size limit of an answer, in characters | `50000` |
-| `ARC_MCP_INSECURE` | `true` to allow a token over plaintext HTTP to a non-loopback Arc | `false` |
+| `ARC_MCP_INSECURE` | `true` to allow a token over plaintext HTTP to a non-loopback Arc (loopback is exactly `localhost` or a `127.x.x.x`/`::1` address; a name under `.localhost` is not, since a configured `HTTP_PROXY` applies to it) | `false` |
 | `ARC_MCP_TRANSPORT` | `stdio` or `http` (see [Remote access over HTTP](#remote-access-over-http)) | `stdio` |
 | `ARC_MCP_LISTEN` | HTTP: address to listen on | `127.0.0.1:8080` |
 | `ARC_MCP_HTTP_TOKEN_FILE` | HTTP: file containing the bearer token clients must send | (none) |

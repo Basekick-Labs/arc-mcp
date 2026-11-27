@@ -1,7 +1,11 @@
 package main
 
 import (
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,6 +96,15 @@ func TestValidateArcURL(t *testing.T) {
 		{"http localhost with token ok", "http://localhost:8000", "abc", false, false},
 		{"http 127.0.0.1 with token ok", "http://127.0.0.1:8000", "abc", false, false},
 		{"http ::1 with token ok", "http://[::1]:8000", "abc", false, false},
+		{"http IPv4-mapped loopback with token ok", "http://[::ffff:127.0.0.1]:8000", "abc", false, false},
+		// A name under .localhost is not exempt from HTTP_PROXY: remote.
+		{"http *.localhost with token rejected", "http://foo.localhost:8000", "abc", false, true},
+		{"http *.localhost in passthrough (caller tokens) rejected", "http://foo.localhost:8000", "caller", false, true},
+		{"http *.localhost with query and no token rejected", "http://foo.localhost:8000/?p=abc", "", false, true},
+		{"http *.localhost without token ok", "http://foo.localhost:8000", "", false, false},
+		{"http *.localhost with token and insecure ok", "http://foo.localhost:8000", "abc", true, false},
+		{"https *.localhost with token ok", "https://foo.localhost:8000", "abc", false, false},
+		{"http LOCALHOST with token rejected", "http://LOCALHOST:8000", "abc", false, true},
 		{"http remote with token rejected", "http://arc.example.com", "abc", false, true},
 		{"http remote without token ok", "http://arc.example.com", "", false, false},
 		{"http remote with token and insecure ok", "http://arc.example.com", "abc", true, false},
@@ -135,6 +148,91 @@ func TestValidateArcURL_ErrorsOmitQueryAndUserinfo(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "arc.example.com") {
 			t.Errorf("%q: error does not name the host: %v", raw, err)
+		}
+	}
+}
+
+// loopbackHosts are Hostname() values (IPv6 without brackets) and whether
+// they may receive credentials over plaintext HTTP.
+var loopbackHosts = []struct {
+	host string
+	want bool
+}{
+	{"localhost", true},
+	{"127.0.0.1", true},
+	{"127.1.2.3", true},
+	{"127.255.255.255", true},
+	{"::1", true},
+	{"0:0:0:0:0:0:0:1", true},
+	{"::ffff:127.0.0.1", true},
+	// Proxied when HTTP_PROXY is set: the proxy rule exempts only exactly
+	// "localhost" and loopback IP literals.
+	{"LOCALHOST", false},
+	{"Localhost", false},
+	{"localhost.", false},
+	{"foo.localhost", false},
+	{"FOO.LOCALHOST", false},
+	{"localhost.example.com", false},
+	{"0.0.0.0", false},
+	{"::", false},
+	{"128.0.0.1", false},
+	// Not IP literals: resolved as names.
+	{"127.1", false},
+	{"::1%lo", false},
+	// Hostname() strips the brackets; a bracketed value is not a host.
+	{"[::1]", false},
+	{"", false},
+}
+
+func TestIsLoopbackHost(t *testing.T) {
+	for _, tt := range loopbackHosts {
+		if got := isLoopbackHost(tt.host); got != tt.want {
+			t.Errorf("isLoopbackHost(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
+}
+
+// Every host isLoopbackHost accepts must be one net/http never sends to a
+// proxy. ProxyFromEnvironment reads the environment once per process, so the
+// check runs in a child test process with HTTP_PROXY set and NO_PROXY empty.
+func TestLoopbackHostsAreNeverProxied(t *testing.T) {
+	if os.Getenv("ARC_MCP_TEST_PROXY_CHILD") == "1" {
+		checkLoopbackHostsNotProxied(t)
+		return
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLoopbackHostsAreNeverProxied$")
+	// The lowercase names come first: on Windows, where names are
+	// case-insensitive, the last duplicate wins.
+	cmd.Env = append(os.Environ(),
+		"ARC_MCP_TEST_PROXY_CHILD=1",
+		"http_proxy=", "HTTP_PROXY=http://proxy.invalid:3128",
+		"no_proxy=", "NO_PROXY=",
+		"REQUEST_METHOD=", // not a CGI process, which would refuse HTTP_PROXY
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("child test failed: %v\n%s", err, out)
+	}
+}
+
+func checkLoopbackHostsNotProxied(t *testing.T) {
+	proxyFor := func(host string) *url.URL {
+		t.Helper()
+		u := &url.URL{Scheme: "http", Host: net.JoinHostPort(host, "8000")}
+		p, err := http.ProxyFromEnvironment(&http.Request{URL: u})
+		if err != nil {
+			t.Fatalf("ProxyFromEnvironment(%s): %v", u, err)
+		}
+		return p
+	}
+	if proxyFor("arc.example.com") == nil {
+		t.Fatal("HTTP_PROXY is not in effect in the child; the check would prove nothing")
+	}
+	for _, tt := range loopbackHosts {
+		if tt.host == "" || strings.HasPrefix(tt.host, "[") {
+			continue
+		}
+		if isLoopbackHost(tt.host) && proxyFor(tt.host) != nil {
+			t.Errorf("%q counts as loopback but a request to it goes through HTTP_PROXY", tt.host)
 		}
 	}
 }
