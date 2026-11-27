@@ -78,6 +78,7 @@ type idp struct {
 	srv      *httptest.Server
 	body     atomic.Value // []byte
 	location atomic.Value // string: a Location header, for redirects
+	gate     atomic.Value // chan struct{}: when set, each fetch waits for it to close
 	status   atomic.Int64
 	hits     atomic.Int64
 }
@@ -88,6 +89,9 @@ func newIDP(t testing.TB, keys ...any) *idp {
 	p.serve(t, keys...)
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		p.hits.Add(1)
+		if g, _ := p.gate.Load().(chan struct{}); g != nil {
+			<-g
+		}
 		if loc, _ := p.location.Load().(string); loc != "" {
 			w.Header().Set("Location", loc)
 		}
@@ -217,13 +221,17 @@ func TestVerify(t *testing.T) {
 	now := start
 	jwkHdr, _ := json.Marshal(jwk(&rsaOther.PublicKey, "MARKER", ""))
 	hmacKey, _ := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	rs := func(e ...func(map[string]any)) string {
+		return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, e...))
+	}
+	hdr := func(members string) string { return unsigned(`{"alg":"RS256","kid":"rsa"`+members+`}`, payload(now)) }
 	cases := []struct {
 		name    string
 		tok     func() string
 		want    Reason // 0: accepted
 		noParse bool   // go-jose must not have been called
 	}{
-		{"RS256 at+jwt", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now)) }, 0, false},
+		{"RS256 at+jwt", func() string { return rs() }, 0, false},
 		{"PS256 application/at+jwt", func() string { return sign(t, rsaKey, jose.PS256, "rsa", "application/at+jwt", payload(now)) }, 0, false},
 		{"ES256 AT+JWT, aud array", func() string {
 			return sign(t, ecKey, jose.ES256, "ec", "AT+JWT", payload(now, set("aud", []string{"other", testAudience})))
@@ -233,63 +241,35 @@ func TestVerify(t *testing.T) {
 		{"RS512 on a key pinned to RS512, x5t kept", func() string {
 			return sign(t, rsaKey, jose.RS512, "rs512", "at+jwt", payload(now), "x5t", "dGh1bWI")
 		}, 0, false},
-		{"exp inside the leeway", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("exp", now.Add(-Leeway+time.Second).Unix())))
-		}, 0, false},
-		{"expired at the leeway edge", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("exp", now.Add(-Leeway).Unix())))
-		}, ReasonExpired, false},
-		{"nbf at the leeway edge", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("nbf", now.Add(Leeway).Unix())))
-		}, 0, false},
-		{"nbf in the future", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("nbf", now.Add(Leeway+time.Second).Unix())))
-		}, ReasonNotYetValid, false},
-		{"iat in the future", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("iat", now.Add(Leeway+time.Second).Unix())))
-		}, ReasonNotYetValid, false},
-		{"issuer with a trailing slash", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("iss", testIssuer+"/")))
-		}, ReasonWrongIssuer, true},
-		{"wrong audience", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("aud", "mcp-client")))
-		}, ReasonWrongAudience, false},
-		{"no aud", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, del("aud"))) }, ReasonWrongAudience, false},
-		{"no exp", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, del("exp"))) }, ReasonMalformed, false},
-		{"exp not a number", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("exp", "soon")))
-		}, ReasonMalformed, false},
-		{"no sub", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, del("sub"))) }, ReasonMalformed, false},
-		{"scope not a string", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("scope", []string{"arc"})))
-		}, ReasonMalformed, false},
+		{"exp inside the leeway", func() string { return rs(set("exp", now.Add(-Leeway+time.Second).Unix())) }, 0, false},
+		{"expired at the leeway edge", func() string { return rs(set("exp", now.Add(-Leeway).Unix())) }, ReasonExpired, false},
+		{"nbf at the leeway edge", func() string { return rs(set("nbf", now.Add(Leeway).Unix())) }, 0, false},
+		{"nbf in the future", func() string { return rs(set("nbf", now.Add(Leeway+time.Second).Unix())) }, ReasonNotYetValid, false},
+		{"iat in the future", func() string { return rs(set("iat", now.Add(Leeway+time.Second).Unix())) }, ReasonNotYetValid, false},
+		{"issuer with a trailing slash", func() string { return rs(set("iss", testIssuer+"/")) }, ReasonWrongIssuer, true},
+		{"wrong audience", func() string { return rs(set("aud", "mcp-client")) }, ReasonWrongAudience, false},
+		{"no aud", func() string { return rs(del("aud")) }, ReasonWrongAudience, false},
+		{"no exp", func() string { return rs(del("exp")) }, ReasonMalformed, false},
+		{"exp not a number", func() string { return rs(set("exp", "soon")) }, ReasonMalformed, false},
+		{"no sub", func() string { return rs(del("sub")) }, ReasonMalformed, false},
+		{"scope not a string", func() string { return rs(set("scope", []string{"arc"})) }, ReasonMalformed, false},
 		{"bad signature", func() string { return sign(t, rsaOther, jose.RS256, "rsa", "at+jwt", payload(now)) }, ReasonBadSignature, false},
 		{"alg none", func() string { return unsigned(`{"alg":"none","kid":"rsa","typ":"at+jwt"}`, payload(now)) }, ReasonMalformed, true},
-		{"HS256 keyed with the public key", func() string {
-			return sign(t, hmacKey, jose.HS256, "rsa", "at+jwt", payload(now))
-		}, ReasonMalformed, true},
+		{"HS256 keyed with the public key", func() string { return sign(t, hmacKey, jose.HS256, "rsa", "at+jwt", payload(now)) }, ReasonMalformed, true},
 		{"ES256 naming an RSA key", func() string { return sign(t, ecKey, jose.ES256, "rsa", "at+jwt", payload(now)) }, ReasonUnknownKey, true},
 		{"ES384 naming a P-256 key", func() string { return sign(t, ec384Key, jose.ES384, "ec", "at+jwt", payload(now)) }, ReasonUnknownKey, true},
-		{"RS256 naming a key pinned to RS512", func() string {
-			return sign(t, rsaKey, jose.RS256, "rs512", "at+jwt", payload(now))
-		}, ReasonUnknownKey, true},
+		{"RS256 naming a key pinned to RS512", func() string { return sign(t, rsaKey, jose.RS256, "rs512", "at+jwt", payload(now)) }, ReasonUnknownKey, true},
 		{"no kid", func() string { return unsigned(`{"alg":"RS256","typ":"at+jwt"}`, payload(now)) }, ReasonUnknownKey, true},
-		{"embedded jwk", func() string {
-			return unsigned(`{"alg":"RS256","kid":"rsa","jwk":`+string(jwkHdr)+`}`, payload(now))
-		}, ReasonMalformed, true},
-		{"jku", func() string { return unsigned(`{"alg":"RS256","kid":"rsa","jku":"`+r.idp.srv.URL+`"}`, payload(now)) }, ReasonMalformed, true},
-		{"x5u", func() string {
-			return unsigned(`{"alg":"RS256","kid":"rsa","x5u":"https://x.example/c"}`, payload(now))
-		}, ReasonMalformed, true},
-		{"x5c", func() string { return unsigned(`{"alg":"RS256","kid":"rsa","x5c":["MIIB"]}`, payload(now)) }, ReasonMalformed, true},
-		{"jwk null", func() string { return unsigned(`{"alg":"RS256","kid":"rsa","jwk":null}`, payload(now)) }, ReasonMalformed, true},
-		{"crit", func() string { return unsigned(`{"alg":"RS256","kid":"rsa","crit":["exp"]}`, payload(now)) }, ReasonMalformed, true},
-		{"b64", func() string { return unsigned(`{"alg":"RS256","kid":"rsa","b64":false}`, payload(now)) }, ReasonMalformed, true},
+		{"embedded jwk", func() string { return hdr(`,"jwk":` + string(jwkHdr)) }, ReasonMalformed, true},
+		{"jku", func() string { return hdr(`,"jku":"` + r.idp.srv.URL + `"`) }, ReasonMalformed, true},
+		{"x5u", func() string { return hdr(`,"x5u":"https://x.example/c"`) }, ReasonMalformed, true},
+		{"x5c", func() string { return hdr(`,"x5c":["MIIB"]`) }, ReasonMalformed, true},
+		{"jwk null", func() string { return hdr(`,"jwk":null`) }, ReasonMalformed, true},
+		{"crit", func() string { return hdr(`,"crit":["exp"]`) }, ReasonMalformed, true},
+		{"b64", func() string { return hdr(`,"b64":false`) }, ReasonMalformed, true},
 		{"duplicate alg", func() string { return unsigned(`{"alg":"none","kid":"rsa","alg":"RS256"}`, payload(now)) }, ReasonMalformed, true},
-		{"oversized", func() string {
-			return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now, set("pad", strings.Repeat("a", MaxTokenBytes))))
-		}, ReasonMalformed, true},
-		{"not base64url", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(now)) + "=" }, ReasonMalformed, true},
+		{"oversized", func() string { return rs(set("pad", strings.Repeat("a", MaxTokenBytes))) }, ReasonMalformed, true},
+		{"not base64url", func() string { return rs() + "=" }, ReasonMalformed, true},
 		{"typ JWT, no rule configured", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "JWT", payload(now)) }, ReasonNotAccessToken, false},
 		{"no typ, no rule configured", func() string { return sign(t, rsaKey, jose.RS256, "rsa", "", payload(now)) }, ReasonNotAccessToken, false},
 		{"empty", func() string { return "" }, ReasonMissing, true},
@@ -413,6 +393,35 @@ func TestRotationAndCooldown(t *testing.T) {
 	checkRefusal(t, err, ReasonKeyFetchFailed)
 	if _, err := r.verify(rotated); err != nil {
 		t.Fatalf("known key after a failed fetch: %v", err)
+	}
+}
+
+// Lookups that arrive during a fetch wait for it; one that gives up neither
+// starts another fetch nor cancels this one for the others.
+func TestLookupsShareOneFetch(t *testing.T) {
+	r := newRig(t, Config{})
+	gate := make(chan struct{})
+	r.idp.gate.Store(gate)
+	tok := sign(t, ecKey, jose.ES256, "ec", "at+jwt", payload(start))
+	done := make(chan error, 1)
+	go func() { _, err := r.verify(tok); done <- err }()
+	for r.idp.hits.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := r.v.Verify(ctx, tok)
+	checkRefusal(t, err, ReasonKeyFetchFailed)
+	r.v.keys.mu.Lock()
+	f := r.v.keys.flight
+	r.v.keys.mu.Unlock()
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatalf("the waiting lookup: %v", err)
+	}
+	<-f.done
+	if n := r.idp.hits.Load(); n != 1 {
+		t.Fatalf("fetches = %d, want 1", n)
 	}
 }
 
