@@ -71,7 +71,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 		result, err := client.Query(ctx, args.Database, q.WithRowLimit(maxRows))
 		if err != nil {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
+				Content: []mcp.Content{&mcp.TextContent{Text: client.UserMessage(err)}},
 				IsError: true,
 			}, nil, nil
 		}
@@ -159,7 +159,7 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 			r, err := client.Query(ctx, args.Database, sql)
 			if err != nil {
 				return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
+					Content: []mcp.Content{&mcp.TextContent{Text: client.UserMessage(err)}},
 					IsError: true,
 				}, nil, nil
 			}

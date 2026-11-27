@@ -49,29 +49,60 @@ type Options struct {
 	AllowAnyHost bool
 	// MaxConcurrent caps the /mcp requests served at once; 0 means no cap.
 	MaxConcurrent int
+	// RequireTLS refuses a non-loopback listener without TLS files: in
+	// passthrough the bearer token is a caller's Arc credential. Leave it
+	// false when TLS terminates in front of arc-mcp.
+	RequireTLS bool
 	// QueryTimeout is arc-mcp's --timeout, which sizes the write timeout and
 	// the shutdown grace period; 0 means queries have no deadline.
 	QueryTimeout time.Duration
 }
 
 // Verifier authenticates a bearer token. It returns nil when the token is
-// accepted. #1 (forwarding the caller's token to Arc) can plug in here.
-type Verifier func(ctx context.Context, token string) error
+// accepted, with an identity for the access log ("" when there is none);
+// ErrUnavailable when it cannot tell right now (the client gets 503, not
+// 401); any other error refuses the token.
+type Verifier func(ctx context.Context, token string) (identity string, err error)
+
+// ErrUnavailable is a Verifier's answer when it cannot check the token now.
+var ErrUnavailable = errors.New("token verification unavailable")
 
 // errInvalidToken is a Verifier's refusal.
 var errInvalidToken = errors.New("invalid token")
+
+// BearerToken is the token of an "Authorization: Bearer <token>" header:
+// the scheme matched without regard to case, the token trimmed. A token
+// with anything but visible ASCII is no token (Arc could not be sent it).
+// requireBearer and the passthrough middleware both read it here, so the
+// token forwarded is exactly the one verified.
+func BearerToken(h http.Header) (string, bool) {
+	scheme, token, ok := strings.Cut(h.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	for i := 0; i < len(token); i++ {
+		if c := token[i]; c <= ' ' || c >= 0x7f {
+			return "", false
+		}
+	}
+	return token, true
+}
 
 // StaticToken is a Verifier for one shared secret. The comparison is on
 // SHA-256 digests in constant time, so neither the content nor the length of
 // the secret leaks through timing.
 func StaticToken(secret string) Verifier {
 	want := sha256.Sum256([]byte(secret))
-	return func(_ context.Context, token string) error {
+	return func(_ context.Context, token string) (string, error) {
 		got := sha256.Sum256([]byte(token))
 		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-			return errInvalidToken
+			return "", errInvalidToken
 		}
-		return nil
+		return "", nil
 	}
 }
 
@@ -115,6 +146,9 @@ func checkListener(addr net.Addr, opts Options) error {
 			"Set ARC_MCP_HTTP_TOKEN_FILE (or ARC_MCP_HTTP_TOKEN), or pass --insecure-listen")
 	case loopback:
 		return nil
+	case opts.RequireTLS && opts.TLSCertFile == "":
+		return fmt.Errorf("refusing to listen on %s without TLS: every request carries a caller's Arc token. "+
+			"Set --tls-cert and --tls-key, or pass --tls-upstream when TLS terminates in front of arc-mcp", addr)
 	case opts.Verify == nil && !opts.InsecureListen:
 		return fmt.Errorf("refusing to listen on %s without an inbound token: anyone who can reach it could query Arc with arc-mcp's token. "+
 			"Set ARC_MCP_HTTP_TOKEN_FILE (or ARC_MCP_HTTP_TOKEN), listen on 127.0.0.1, or pass --insecure-listen", addr)
@@ -209,15 +243,28 @@ func Serve(ctx context.Context, ln net.Listener, handler http.Handler, opts Opti
 }
 
 // requireBearer refuses a request without an accepted bearer token: 401 with
-// WWW-Authenticate. Neither the header nor the verifier's error reaches the
-// response or the log.
+// WWW-Authenticate, or 503 when the verifier cannot tell. Neither the header
+// nor the verifier's error reaches the response or the log.
 func requireBearer(next http.Handler, verify Verifier) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-		if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || verify(r.Context(), strings.TrimSpace(token)) != nil {
+		token, ok := BearerToken(r.Header)
+		var identity string
+		err := errInvalidToken
+		if ok {
+			identity, err = verify(r.Context(), token)
+		}
+		switch {
+		case errors.Is(err, ErrUnavailable):
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "the token cannot be verified right now; try again shortly", http.StatusServiceUnavailable)
+			return
+		case err != nil:
 			w.Header().Set("WWW-Authenticate", `Bearer realm="arc-mcp"`)
 			http.Error(w, "unauthorized: a valid bearer token is required", http.StatusUnauthorized)
 			return
+		}
+		if info, ok := r.Context().Value(reqInfoKey{}).(*reqInfo); ok {
+			info.caller = identity
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -244,7 +291,7 @@ func limitConcurrency(next http.Handler, n int) http.Handler {
 type reqInfoKey struct{}
 
 type reqInfo struct {
-	method, tool string
+	method, tool, caller string
 }
 
 // rpcInfo caps the body, refuses JSON-RPC batches, and notes the JSON-RPC
@@ -347,6 +394,9 @@ func accessLog(next http.Handler) http.Handler {
 		}
 		if info.tool != "" {
 			line += " tool=" + logField(info.tool)
+		}
+		if info.caller != "" {
+			line += " caller=" + logField(info.caller)
 		}
 		log.Print(line) //nolint:gosec // #nosec G706 -- client values pass through logField
 	})

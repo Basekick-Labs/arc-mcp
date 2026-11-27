@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
+	"github.com/basekick-labs/arc-mcp/internal/callerauth"
 	"github.com/basekick-labs/arc-mcp/internal/httpserve"
 	"github.com/basekick-labs/arc-mcp/internal/tools"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -53,6 +54,8 @@ func main() {
 	tlsCert := flag.String("tls-cert", envOrDefault("ARC_MCP_TLS_CERT_FILE", ""), "HTTP transport: TLS certificate file (with --tls-key) to serve HTTPS")
 	tlsKey := flag.String("tls-key", envOrDefault("ARC_MCP_TLS_KEY_FILE", ""), "HTTP transport: TLS key file (with --tls-cert)")
 	maxConcurrent := flag.Int("max-concurrent", envOrDefaultInt("ARC_MCP_MAX_CONCURRENT", defaultMaxConcurrent), "HTTP transport: requests served at once (0 for no limit)")
+	tlsUpstream := flag.Bool("tls-upstream", envBool("ARC_MCP_TLS_UPSTREAM"), "HTTP transport: TLS terminates in front of arc-mcp (a proxy or ingress), so passthrough may listen without --tls-cert")
+	authMode := flag.String("auth-mode", envOrDefault("ARC_MCP_AUTH_MODE", "static"), "HTTP transport: static (arc-mcp's own Arc token, the default) or passthrough (each caller's bearer token is its Arc token)")
 	allowAnyHost := flag.Bool("allow-any-host", envBool("ARC_MCP_ALLOW_ANY_HOST"), "HTTP transport: accept any Host header on a loopback listener (for a TLS proxy on the same host); turns off DNS-rebinding protection")
 	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics)")
 	version := flag.Bool("version", false, "Print version and exit")
@@ -83,13 +86,26 @@ func main() {
 	if *transport == "stdio" {
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "listen", "insecure-listen", "tls-cert", "tls-key", "max-concurrent", "allow-any-host":
+			case "listen", "insecure-listen", "tls-cert", "tls-key", "tls-upstream", "max-concurrent", "allow-any-host", "auth-mode":
 				log.Printf("--%s applies to --transport http only; ignored over stdio", f.Name)
 			}
 		})
 	}
+	switch *authMode {
+	case "static", "passthrough":
+	default:
+		fmt.Fprintf(os.Stderr, "Refusing to start: unknown --auth-mode/ARC_MCP_AUTH_MODE %q; use static or passthrough\n", *authMode)
+		os.Exit(2)
+	}
+	passthrough := *authMode == "passthrough"
+	if passthrough {
+		if err := checkPassthrough(*transport, *arcToken, *arcURL, *insecureListen); err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+	}
 	var httpToken string
-	if *transport == "http" {
+	if *transport == "http" && !passthrough {
 		t, err := resolveHTTPToken()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
@@ -122,21 +138,38 @@ func main() {
 	// All logging goes to stderr to avoid corrupting the MCP stdio protocol
 	log.SetOutput(os.Stderr)
 
-	// Resolve token: ARC_TOKEN_FILE > ARC_TOKEN > --arc-token flag.
-	token, err := resolveToken(*arcToken)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
-		os.Exit(2)
+	// Resolve token: ARC_TOKEN_FILE > ARC_TOKEN > --arc-token flag. In
+	// passthrough there is none (checkPassthrough refused one).
+	if !passthrough {
+		token, err := resolveToken(*arcToken)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+		*arcToken = token
 	}
-	*arcToken = token
 
 	// Guard against sending Bearer tokens over cleartext to remote hosts.
-	if err := validateArcURL(*arcURL, *arcToken, *insecure); err != nil {
+	// In passthrough every request carries a caller's token.
+	guardToken := *arcToken
+	if passthrough {
+		guardToken = "caller"
+	}
+	if err := validateArcURL(*arcURL, guardToken, *insecure); err != nil {
 		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
 		os.Exit(2)
 	}
 	if *insecure {
 		log.Printf("WARNING: --insecure is set; Bearer token will be sent over plaintext HTTP")
+	}
+
+	// Create the Arc client (no network yet). In passthrough it sends each
+	// caller's token, verified by callerVerifier, and never one of its own.
+	client := arc.NewClient(*arcURL, *arcToken, *timeout)
+	var callerVerifier *callerauth.Verifier
+	if passthrough {
+		callerVerifier = callerauth.New(client)
+		client.EnablePassthrough(callerVerifier.Forget)
 	}
 
 	// The HTTP listener is opened and checked (address guard, TLS files)
@@ -154,9 +187,13 @@ func main() {
 			AllowAnyHost:   *allowAnyHost,
 			MaxConcurrent:  *maxConcurrent,
 			QueryTimeout:   *timeout,
+			RequireTLS:     passthrough && !*tlsUpstream,
 		}
 		if httpToken != "" {
 			httpOpts.Verify = httpserve.StaticToken(httpToken)
+		}
+		if callerVerifier != nil {
+			httpOpts.Verify = callerVerifier.Verify
 		}
 		if os.Getenv("MCPGODEBUG") != "" {
 			log.Print("WARNING: MCPGODEBUG is set: it can turn off the MCP SDK's DNS-rebinding and cross-origin protection")
@@ -168,9 +205,6 @@ func main() {
 			os.Exit(2)
 		}
 	}
-
-	// Create Arc client
-	client := arc.NewClient(*arcURL, *arcToken, *timeout)
 
 	// Verify connectivity
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -185,6 +219,12 @@ func main() {
 	}
 	// Skipped when Arc is unreachable: a second failure would only repeat
 	// the health warning above.
+	if passthrough {
+		if err := checkArcEnforcesAuth(client, healthy); err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+	}
 	if *arcToken != "" && healthy {
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		permissions, err := client.VerifyToken(verifyCtx)
@@ -208,6 +248,9 @@ func main() {
 
 	// Register tools
 	tools.RegisterAll(server, client, groups, *maxRows, *maxResponseSize)
+	if passthrough {
+		server.AddReceivingMiddleware(callerauth.Middleware)
+	}
 
 	if ln != nil {
 		scheme := "http"
@@ -215,7 +258,10 @@ func main() {
 			scheme = "https"
 		}
 		auth := "no inbound token"
-		if httpToken != "" {
+		switch {
+		case passthrough:
+			auth = "passthrough: each caller's bearer token is its Arc token"
+		case httpToken != "":
 			auth = "bearer token required"
 		}
 		log.Printf("arc-mcp serving %s://%s%s (%s; max-rows=%d, timeout=%s, max-concurrent=%d)", scheme, ln.Addr(), httpserve.Path, auth, *maxRows, *timeout, *maxConcurrent)
@@ -368,16 +414,27 @@ func resolveHTTPToken() (string, error) {
 		if t == "" {
 			return "", fmt.Errorf("ARC_MCP_HTTP_TOKEN_FILE %q is empty", path)
 		}
-		return t, nil
+		return t, checkHTTPToken("ARC_MCP_HTTP_TOKEN_FILE", t)
 	}
 	if v, set := os.LookupEnv("ARC_MCP_HTTP_TOKEN"); set && v != "" {
 		t := strings.TrimSpace(v)
 		if t == "" {
 			return "", errors.New("ARC_MCP_HTTP_TOKEN is set but blank")
 		}
-		return t, nil
+		return t, checkHTTPToken("ARC_MCP_HTTP_TOKEN", t)
 	}
 	return "", nil
+}
+
+// checkHTTPToken refuses an inbound token clients could not send: a bearer
+// token is visible ASCII with no spaces (httpserve.BearerToken).
+func checkHTTPToken(name, t string) error {
+	for i := 0; i < len(t); i++ {
+		if c := t[i]; c <= ' ' || c >= 0x7f {
+			return fmt.Errorf("%s holds a space, control or non-ASCII character; a bearer token is visible ASCII only (for example openssl rand -hex 32)", name)
+		}
+	}
+	return nil
 }
 
 // envOrDefaultInt reads an integer environment variable; unset is fallback,
@@ -470,4 +527,49 @@ func dataInstructions(maxRows int) string {
 		"4. Start with a recent window and widen it deliberately.\n" +
 		"5. Arc blocks some words anywhere in a query, even as column names (load, copy, set, ...): double-quote such a name, as in \"load\".\n" +
 		"6. When a query fails, the error says why (a misspelled column and its candidates, a bad cast): fix the SQL rather than retrying it as is."
+}
+
+// checkPassthrough refuses the configurations passthrough cannot honour,
+// before anything reaches the network: it needs the HTTP transport (stdio
+// carries no caller token); no Arc token of arc-mcp's own (the caller's is
+// the only one), nor an inbound shared token (both would be the
+// Authorization header); no --insecure-listen (every request is
+// authenticated); and an Arc URL without a query string or userinfo, which
+// Arc could take a token from in place of the caller's.
+func checkPassthrough(transport, arcTokenFlag, arcURL string, insecureListen bool) error {
+	switch {
+	case transport != "http":
+		return errors.New("--auth-mode passthrough needs --transport http: over stdio there is no caller token to pass through")
+	case os.Getenv("ARC_TOKEN_FILE") != "" || os.Getenv("ARC_TOKEN") != "" || arcTokenFlag != "":
+		return errors.New("--auth-mode passthrough uses each caller's token: unset ARC_TOKEN, ARC_TOKEN_FILE and --arc-token")
+	case os.Getenv("ARC_MCP_HTTP_TOKEN_FILE") != "" || os.Getenv("ARC_MCP_HTTP_TOKEN") != "":
+		return errors.New("--auth-mode passthrough authenticates callers with their Arc tokens: unset ARC_MCP_HTTP_TOKEN and ARC_MCP_HTTP_TOKEN_FILE")
+	case insecureListen:
+		return errors.New("--auth-mode passthrough authenticates every request: drop --insecure-listen")
+	}
+	if u, err := url.Parse(arcURL); err == nil && (u.RawQuery != "" || u.User != nil) {
+		return errors.New("--auth-mode passthrough: the Arc URL must not carry a query string or userinfo (Arc could read a token from them instead of the caller's)")
+	}
+	return nil
+}
+
+// checkArcEnforcesAuth refuses passthrough against an Arc that does not
+// check tokens, where the callers' tokens would decide nothing. When Arc
+// is unreachable it cannot be checked: a warning, and each caller's
+// verification answers 503 until Arc is back.
+func checkArcEnforcesAuth(client *arc.Client, healthy bool) error {
+	if !healthy {
+		log.Print("Warning: Arc is unreachable, so whether it enforces authentication was not checked; callers get 503 until Arc answers")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	switch err := client.ProbeAuthEnforced(ctx); {
+	case errors.Is(err, arc.ErrAuthNotEnforced):
+		return fmt.Errorf("--auth-mode passthrough: Arc does not check tokens (%v), so callers' tokens would decide nothing. Turn on Arc's authentication, or use the static mode", err)
+	case err != nil:
+		return fmt.Errorf("--auth-mode passthrough: could not confirm that Arc checks tokens: %v", err)
+	}
+	log.Print("Passthrough: Arc enforces authentication; each caller's token is verified with Arc")
+	return nil
 }

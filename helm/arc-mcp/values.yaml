@@ -39,6 +39,16 @@ arc:
   tools:
     - data
 
+# How callers authenticate (ARC_MCP_AUTH_MODE):
+#   static       arc-mcp queries Arc with its own token (arc.token or
+#                arc.tokenSecretRef), and callers present the shared
+#                http.tokenSecretRef token (or none, with http.insecureListen).
+#   passthrough  each caller's bearer token is its own Arc token, verified
+#                with Arc and sent on every query it makes. Set no arc token
+#                and no http token. Arc must have authentication on.
+auth:
+  mode: static
+
 # The MCP endpoint (arc-mcp --transport http): Streamable HTTP at /mcp,
 # liveness at /healthz.
 http:
@@ -58,6 +68,9 @@ http:
   # Serve HTTPS from a kubernetes.io/tls Secret (tls.crt, tls.key). Otherwise
   # terminate TLS at your ingress: the bearer token travels in every request.
   tlsSecretName: ""
+  # TLS terminates in front of arc-mcp (your ingress). Passthrough needs this
+  # or tlsSecretName: its bearer tokens are callers' Arc credentials.
+  tlsUpstream: false
 
 # Room for queries in flight to finish on shutdown: arc-mcp waits up to
 # 4 x arc.timeout + 5s (125s at the default 30s). Raise it with arc.timeout.

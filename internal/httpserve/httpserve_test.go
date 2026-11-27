@@ -134,7 +134,7 @@ func TestBearerRequired(t *testing.T) {
 
 func TestStaticToken(t *testing.T) {
 	v := StaticToken(secret)
-	if v(context.Background(), secret) != nil {
+	if _, err := v(context.Background(), secret); err != nil {
 		t.Error("the right token was refused")
 	}
 	// The header's extra spaces are not part of the token.
@@ -143,7 +143,7 @@ func TestStaticToken(t *testing.T) {
 		t.Errorf("Bearer with two spaces refused: %v", err)
 	}
 	for _, bad := range []string{"", "x", secret + " ", strings.ToUpper(secret)} {
-		if v(context.Background(), bad) == nil {
+		if _, err := v(context.Background(), bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
 	}
@@ -551,4 +551,42 @@ func get(t *testing.T, url string) *http.Request {
 		t.Fatal(err)
 	}
 	return req
+}
+
+func TestBearerToken(t *testing.T) {
+	for header, want := range map[string]string{
+		"Bearer abc":       "abc",
+		"bearer abc":       "abc",
+		"BEARER  abc  ":    "abc",
+		"Bearer a\tb":      "",
+		"Bearer a b":       "",
+		"Bearer p\u00e4ss": "",
+		"Bearer a\x00":     "",
+		"Basic abc":        "",
+		"Bearer":           "",
+		"Bearer ":          "",
+		"abc":              "",
+	} {
+		h := http.Header{}
+		h.Set("Authorization", header)
+		got, ok := BearerToken(h)
+		if got != want || ok != (want != "") {
+			t.Errorf("%q: %q %v, want %q", header, got, ok, want)
+		}
+	}
+}
+
+func TestRequireTLS(t *testing.T) {
+	lan := &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8080}
+	lo := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
+	v := StaticToken(secret)
+	if checkListener(lan, Options{Verify: v, RequireTLS: true}) == nil {
+		t.Error("plain HTTP on a LAN address accepted with RequireTLS")
+	}
+	if err := checkListener(lan, Options{Verify: v, RequireTLS: true, TLSCertFile: "c", TLSKeyFile: "k"}); err != nil {
+		t.Errorf("TLS refused: %v", err)
+	}
+	if err := checkListener(lo, Options{Verify: v, RequireTLS: true}); err != nil {
+		t.Errorf("loopback refused: %v", err)
+	}
 }

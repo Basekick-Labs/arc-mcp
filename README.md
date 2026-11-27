@@ -45,6 +45,8 @@ ARC_URL=http://localhost:8000 ARC_TOKEN_FILE=/path/to/token \
 | `ARC_MCP_MAX_CONCURRENT` | HTTP: requests served at once (`0` for no limit) | `8` |
 | `ARC_MCP_TLS_CERT_FILE`, `ARC_MCP_TLS_KEY_FILE` | HTTP: serve HTTPS with this certificate and key | (none) |
 | `ARC_MCP_ALLOW_ANY_HOST` | HTTP: accept any `Host` header on a loopback listener (see below) | `false` |
+| `ARC_MCP_AUTH_MODE` | HTTP: `static` or `passthrough` (see [Authentication modes](#authentication-modes)) | `static` |
+| `ARC_MCP_TLS_UPSTREAM` | HTTP: `true` when TLS terminates in front of arc-mcp (lets passthrough listen without `--tls-cert`) | `false` |
 
 Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused at startup.
 
@@ -64,6 +66,8 @@ Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused a
 | `--max-concurrent` | HTTP: requests served at once | `8` |
 | `--tls-cert`, `--tls-key` | HTTP: serve HTTPS | (none) |
 | `--allow-any-host` | HTTP: turn off DNS-rebinding protection on a loopback listener | `false` |
+| `--auth-mode` | HTTP: `static` or `passthrough` | `static` |
+| `--tls-upstream` | HTTP: TLS terminates in front of arc-mcp | `false` |
 
 Every flag also has the environment variable in the table above. The inbound HTTP token has no flag, so it never shows in the process list.
 
@@ -104,7 +108,7 @@ arc-mcp --transport http --listen 0.0.0.0:8080
 
 - MCP endpoint: `http://host:8080/mcp`. Liveness: `GET /healthz` (does not call Arc, needs no token).
 - **Inbound token.** With `ARC_MCP_HTTP_TOKEN_FILE` or `ARC_MCP_HTTP_TOKEN` set, every request to `/mcp` needs `Authorization: Bearer <token>`. arc-mcp refuses to listen on a non-loopback address without one, unless `--insecure-listen` is set. On `127.0.0.1` the token is optional.
-- **One token for everyone.** The inbound token is a shared secret for the endpoint, not per-user authentication: every client acts with arc-mcp's Arc token, and Arc sees all their queries as that token. Give arc-mcp a read-only Arc token, and use the access log (one line per request: peer, JSON-RPC method, tool) to see who did what.
+- **One token for everyone** (the default, static mode). The inbound token is a shared secret for the endpoint, not per-user authentication: every client acts with arc-mcp's Arc token, and Arc sees all their queries as that token. Give arc-mcp a read-only Arc token, and use the access log (one line per request: peer, JSON-RPC method, tool) to see who did what. For a token per user, see [Authentication modes](#authentication-modes).
 - **TLS.** The bearer token travels in every request. Serve HTTPS with `--tls-cert`/`--tls-key`, or terminate TLS at a proxy in front of arc-mcp. A proxy on the same host that forwards to `127.0.0.1` with the public `Host` header is refused by the DNS-rebinding protection; pass `--allow-any-host` for that setup, and only for it.
 - **Stateless.** Each request is answered on its own (JSON responses, no long-lived stream), so any number of replicas can sit behind a load balancer.
 - At most `--max-concurrent` requests (default 8) are served at once; the rest wait. Request bodies are limited to 2 MiB. On SIGTERM, requests in flight get up to 4 × `--timeout` + 5s to finish.
@@ -130,6 +134,30 @@ Clients configured with JSON that support remote servers take the URL and the he
   }
 }
 ```
+
+### Authentication modes
+
+| | `static` (default) | `passthrough` |
+|---|---|---|
+| Arc token used | arc-mcp's own (`ARC_TOKEN_FILE`) | each caller's own |
+| Clients send | the shared `ARC_MCP_HTTP_TOKEN` | their Arc token |
+| Arc's permissions and limits | the same for every client | per caller |
+| Use it when | one team, one read token, a private network | several users or tenants who each have Arc tokens |
+
+With `--auth-mode passthrough` (`ARC_MCP_AUTH_MODE=passthrough`), each client sends its own Arc token as `Authorization: Bearer <token>`. arc-mcp checks it with Arc's `/api/v1/auth/verify` and sends it on every request it makes to Arc for that client; it never queries Arc with a token of its own. Arc then applies each caller's permissions, database scopes and row caps.
+
+```bash
+ARC_URL=https://arc.example.com arc-mcp --transport http --listen 0.0.0.0:8080 --auth-mode passthrough --tls-cert cert.pem --tls-key key.pem
+claude mcp add --transport http arc https://arc-mcp.example.com/mcp --header 'Authorization: Bearer ${ARC_TOKEN}'
+```
+
+- **Arc must check tokens.** arc-mcp refuses to start when Arc's authentication is off (or when it cannot tell what is answering), since callers' tokens would then decide nothing. When Arc is unreachable at startup it starts anyway, and answers 503 until Arc is back.
+- **Refused combinations:** stdio (no caller token to pass); an Arc token of arc-mcp's own (`ARC_TOKEN`, `ARC_TOKEN_FILE`, `--arc-token`); the shared `ARC_MCP_HTTP_TOKEN` (both are the `Authorization` header); `--insecure-listen`; an Arc URL with a query string or userinfo (Arc could read a token from them instead of the caller's).
+- A missing or invalid token gets 401; when Arc cannot answer the check, 503 with `Retry-After`. A valid token is remembered for up to 60 seconds (never past its expiry), so a token revoked in Arc still passes arc-mcp's check for up to a minute, but every query it sends is refused by Arc at once, and arc-mcp then forgets it.
+- arc-mcp's read-only checks, row cap and size limit apply whatever the caller's token allows: an admin token reads no more than a read token. A token carrying write, delete or admin is logged once with a warning; callers should use read tokens.
+- **Who did what.** The access log names each caller by Arc's token id (`caller=arc-token:42`), and Arc's own audit log, when enabled (an Arc Enterprise feature; reads are recorded only with `audit_log.include_reads`), records the token's name for each query. Arc sees every request coming from arc-mcp's address, so the access log's `peer=` is the only record of the caller's address.
+- **TLS is required** on a non-loopback address: the bearer token is a caller's Arc credential. Use `--tls-cert`/`--tls-key`, or `--tls-upstream` (`ARC_MCP_TLS_UPSTREAM`) when a proxy or ingress terminates TLS in front of arc-mcp. The Arc URL follows the same rule as a static token: `https://`, a loopback address, or `--insecure`.
+- **Helm:** `--set auth.mode=passthrough`, with no `arc.token`, `arc.tokenSecretRef` or `http.tokenSecretRef`; with `http.tlsSecretName` or `http.tlsUpstream=true`; and an `https://` `arc.url` or `arc.insecure=true` (the default `arc.url` is plain HTTP inside the cluster).
 
 **Upgrading from the `arc-mcp-gateway` image.** Earlier releases exposed HTTP through a separate image that wrapped arc-mcp with supergateway, serving the older HTTP+SSE transport at `/sse`. That image is no longer published. Run the `arc-mcp` image with `--transport http` instead, and point clients at `/mcp`. With Docker Compose, set `ARC_MCP_VERSION` in your `.env` to a release that has the HTTP transport (an `.env` copied from an older example pins one that does not) and add `ARC_MCP_HTTP_TOKEN`.
 
