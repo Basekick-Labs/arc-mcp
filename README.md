@@ -229,9 +229,9 @@ Get recent sample rows from a measurement, ordered by time descending.
 
 ## Safety
 
-- **Read-only:** All write operations (INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, etc.) are blocked before reaching Arc
+- **Read-only:** Only one read statement runs per call: SELECT, FROM, VALUES, WITH, PIVOT, UNPIVOT, SHOW, DESCRIBE, SUMMARIZE or EXPLAIN. arc-mcp applies a subset of Arc's own query checks so that a refusal comes back with a reason the model can act on: Arc refuses words such as `load`, `copy` and `set` anywhere in a query, so a column with one of those names has to be double-quoted (`AS "load"`). When Arc refuses something arc-mcp did not check, Arc's validation message is passed through. Arc's checks and a read-only token remain the real boundary
 - **Permission answers are kept apart:** Arc's 401 (token missing, invalid or expired), its 403 for a token without read permission, its 403 for a token scoped to other databases, and its 404 for a database that does not exist produce four different messages. arc-mcp never retries a refusal and never widens a token's reach to work around one
-- **Row limits:** Queries are capped at 500 rows by default (configurable)
+- **Row limits:** Queries return at most 500 rows by default (`--max-rows` / `ARC_MCP_MAX_ROWS`, 1 to 100,000). arc-mcp asks Arc for one row more than it shows: it appends `LIMIT 501` when the query has no LIMIT of its own and lowers a larger one, leaving the WHERE clause untouched so Arc still prunes partitions by time. When more rows exist, the answer says so at the top instead of looking complete
 - **Response truncation:** Large responses are truncated to prevent overwhelming LLM context windows
 - **Timeout:** 30-second default query timeout
 

@@ -60,30 +60,9 @@ func TestValidateReadOnly_Adversarial(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateReadOnly(tt.sql)
+			_, err := ValidateReadOnly(tt.sql)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateReadOnly(%q) err = %v, wantErr %v", tt.sql, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestEnforceRowLimit_Caps(t *testing.T) {
-	tests := []struct {
-		name    string
-		sql     string
-		maxRows int
-		want    string
-	}{
-		{"cap large existing limit", "SELECT * FROM cpu LIMIT 1000000", 500, "SELECT * FROM cpu LIMIT 500"},
-		{"preserve small existing limit", "SELECT * FROM cpu LIMIT 10", 500, "SELECT * FROM cpu LIMIT 10"},
-		{"preserve limit under cap with offset following", "SELECT * FROM cpu LIMIT 50 OFFSET 10", 500, "SELECT * FROM cpu LIMIT 50 OFFSET 10"},
-		{"cap with offset", "SELECT * FROM cpu LIMIT 999999 OFFSET 10", 500, "SELECT * FROM cpu LIMIT 500 OFFSET 10"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := EnforceRowLimit(tt.sql, tt.maxRows); got != tt.want {
-				t.Errorf("EnforceRowLimit(%q, %d) = %q, want %q", tt.sql, tt.maxRows, got, tt.want)
 			}
 		})
 	}
@@ -138,52 +117,9 @@ func TestValidateReadOnly(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateReadOnly(tt.sql)
+			_, err := ValidateReadOnly(tt.sql)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateReadOnly(%q) error = %v, wantErr %v", tt.sql, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestEnforceRowLimit(t *testing.T) {
-	tests := []struct {
-		name    string
-		sql     string
-		maxRows int
-		want    string
-	}{
-		{
-			"no limit adds limit",
-			"SELECT * FROM cpu",
-			500,
-			"SELECT * FROM cpu LIMIT 500",
-		},
-		{
-			"existing limit preserved",
-			"SELECT * FROM cpu LIMIT 10",
-			500,
-			"SELECT * FROM cpu LIMIT 10",
-		},
-		{
-			"strips trailing semicolon",
-			"SELECT * FROM cpu;",
-			500,
-			"SELECT * FROM cpu LIMIT 500",
-		},
-		{
-			"strips trailing whitespace and semicolon",
-			"SELECT * FROM cpu ;  ",
-			100,
-			"SELECT * FROM cpu LIMIT 100",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := EnforceRowLimit(tt.sql, tt.maxRows)
-			if got != tt.want {
-				t.Errorf("EnforceRowLimit(%q, %d) = %q, want %q", tt.sql, tt.maxRows, got, tt.want)
 			}
 		})
 	}

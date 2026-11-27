@@ -45,6 +45,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	if c := tools.ClampRowLimit(*maxRows); c != *maxRows {
+		log.Printf("max-rows %d is outside %d..%d; using %d", *maxRows, tools.MinRowLimit, tools.MaxRowLimit, c)
+		*maxRows = c
+	}
+
 	// All logging goes to stderr to avoid corrupting the MCP stdio protocol
 	log.SetOutput(os.Stderr)
 

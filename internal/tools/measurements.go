@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
@@ -118,9 +120,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			}, nil, nil
 		}
 
-		// Safe to interpolate: ValidateIdentifier ensured args.Measurement is [A-Za-z_][A-Za-z0-9_]*.
-		schemaSQL := fmt.Sprintf("SELECT * FROM %s LIMIT 0", args.Measurement)
-		schemaResult, err := client.Query(ctx, args.Database, schemaSQL)
+		columns, err := describeColumns(ctx, client, args.Database, args.Measurement)
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -129,48 +129,29 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 				IsError: true,
 			}, nil, nil
 		}
+		if len(columns) == 0 {
+			// Arc answers a measurement with no files, or no such
+			// measurement, with an empty result rather than a 404.
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf(
+						"Measurement '%s' has no data in database '%s', or does not exist. Call list_measurements to see what exists.",
+						args.Measurement, args.Database)},
+				},
+				IsError: true,
+			}, nil, nil
+		}
 
-		// Get stats: count, min/max time
+		// Safe to interpolate: ValidateIdentifier ensured args.Measurement is [A-Za-z_][A-Za-z0-9_]*.
 		statsSQL := fmt.Sprintf("SELECT count(*) as row_count, min(time) as earliest, max(time) as latest FROM %s", args.Measurement)
 		statsResult, err := client.Query(ctx, args.Database, statsSQL)
 
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
-
-		// Schema
 		sb.WriteString("### Columns\n\n")
-		if len(schemaResult.Columns) > 0 {
-			sb.WriteString("| Column | Type |\n|--------|------|\n")
-			// We get columns from the schema query; types come from the first row if DESCRIBE is used,
-			// but LIMIT 0 only gives column names. Use DESCRIBE for types.
-			for _, col := range schemaResult.Columns {
-				fmt.Fprintf(&sb, "| %s | — |\n", col)
-			}
-		}
-
-		// Try to get column types via DESCRIBE
-		describeSQL := fmt.Sprintf("DESCRIBE %s", args.Measurement)
-		descResult, descErr := client.Query(ctx, args.Database, describeSQL)
-		if descErr == nil && len(descResult.Data) > 0 {
-			sb.Reset()
-			fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
-			sb.WriteString("### Columns\n\n")
-			sb.WriteString("| Column | Type | Nullable |\n|--------|------|----------|\n")
-			for _, row := range descResult.Data {
-				if len(row) == 0 {
-					continue
-				}
-				colName := escapeMarkdownCell(row[0])
-				colType := ""
-				nullable := ""
-				if len(row) > 1 {
-					colType = escapeMarkdownCell(row[1])
-				}
-				if len(row) > 2 {
-					nullable = escapeMarkdownCell(row[2])
-				}
-				fmt.Fprintf(&sb, "| %s | %s | %s |\n", colName, colType, nullable)
-			}
+		sb.WriteString("| Column | Type |\n|--------|------|\n")
+		for _, c := range columns {
+			fmt.Fprintf(&sb, "| %s | %s |\n", escapeMarkdownCell(c.name), escapeMarkdownCell(c.typ))
 		}
 
 		// Stats
@@ -193,4 +174,92 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			},
 		}, nil, nil
 	})
+}
+
+// unknownType stands in for a column type Arc did not report.
+const unknownType = "—"
+
+// column is one column of a measurement; typ is unknownType when unknown.
+type column struct {
+	name, typ string
+}
+
+// describeColumns returns a measurement's columns and types.
+//
+// `DESCRIBE <measurement>` does not work on Arc (the measurement is not a
+// DuckDB table), but `DESCRIBE SELECT * FROM <measurement>` does: Arc
+// rewrites the FROM as it does for any query. If an Arc version refuses
+// that statement (see describeRefused), fall back to
+// `SELECT * FROM <measurement> LIMIT 0` for the names alone. Any other
+// failure (auth, a timeout, a broken file, Arc unreachable) is returned as
+// is: a second query would fail the same way and double the wait.
+//
+// No columns and no error means Arc found no data for the measurement.
+func describeColumns(ctx context.Context, client *arc.Client, database, measurement string) ([]column, error) {
+	// Safe to interpolate: the caller validated measurement with ValidateIdentifier.
+	desc, err := client.Query(ctx, database, fmt.Sprintf("DESCRIBE SELECT * FROM %s", measurement))
+	if err == nil {
+		nameIdx, typeIdx := indexOf(desc.Columns, "column_name", 0), indexOf(desc.Columns, "column_type", 1)
+		var cols []column
+		for _, row := range desc.Data {
+			if nameIdx >= len(row) {
+				continue
+			}
+			c := column{name: fmt.Sprintf("%v", row[nameIdx]), typ: unknownType}
+			if typeIdx < len(row) && row[typeIdx] != nil {
+				c.typ = fmt.Sprintf("%v", row[typeIdx])
+			}
+			cols = append(cols, c)
+		}
+		return cols, nil
+	}
+	if !describeRefused(err) {
+		return nil, err
+	}
+	log.Printf("describe_measurement: DESCRIBE SELECT refused (%v); falling back to column names only", err)
+
+	names, err := client.Query(ctx, database, fmt.Sprintf("SELECT * FROM %s LIMIT 0", measurement))
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]column, len(names.Columns))
+	for i, n := range names.Columns {
+		cols[i] = column{name: n, typ: unknownType}
+	}
+	return cols, nil
+}
+
+// describeRefused reports whether Arc refused the DESCRIBE statement itself,
+// as opposed to failing for a reason a second query would hit too: a
+// validation refusal (400), a rejected query, or a 500 that is a DuckDB
+// parser error. Other 500s (a corrupt file, out of memory)
+// would fail the fallback query too.
+func describeRefused(err error) bool {
+	var ae *arc.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch {
+	case ae.Kind == arc.KindQuery:
+		return true
+	case ae.Kind != arc.KindServer:
+		return false
+	case ae.Status == http.StatusBadRequest:
+		return true
+	case ae.Status == http.StatusInternalServerError:
+		// Not "mentions DESCRIBE": DuckDB echoes the statement in every
+		// error, so that would match a broken file too.
+		return strings.Contains(strings.ToLower(ae.Detail), "parser error")
+	}
+	return false
+}
+
+// indexOf returns the position of name in cols, or fallback when absent.
+func indexOf(cols []string, name string, fallback int) int {
+	for i, c := range cols {
+		if c == name {
+			return i
+		}
+	}
+	return fallback
 }

@@ -1,13 +1,10 @@
 package tools
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,37 +30,17 @@ const (
 // handler, not a helper next to it.
 func callTool(t *testing.T, status int, body, tool string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
-
-	arcSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	arcHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(arcSrv.Close)
+	})
+	session := newSession(t, arcHandler, func(server *mcp.Server, client *arc.Client) {
+		RegisterListDatabases(server, client)
+		RegisterListMeasurements(server, client)
+	})
 
-	client := arc.NewClient(arcSrv.URL, "tok", 5*time.Second)
-	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp-test", Version: "test"}, nil)
-	RegisterListDatabases(server, client)
-	RegisterListMeasurements(server, client)
-
-	serverT, clientT := mcp.NewInMemoryTransports()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	t.Cleanup(cancel)
-
-	serverSession, err := server.Connect(ctx, serverT, nil)
-	if err != nil {
-		t.Fatalf("server connect: %v", err)
-	}
-	t.Cleanup(func() { _ = serverSession.Close() })
-
-	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
-	session, err := mcpClient.Connect(ctx, clientT, nil)
-	if err != nil {
-		t.Fatalf("client connect: %v", err)
-	}
-	t.Cleanup(func() { _ = session.Close() })
-
-	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	res, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", tool, err)
 	}
