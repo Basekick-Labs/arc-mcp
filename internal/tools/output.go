@@ -35,7 +35,7 @@ type Truncation struct {
 // QueryOutput is the structured result of query and get_sample_data.
 type QueryOutput struct {
 	Columns     []string `json:"columns" jsonschema:"The result's column names, in order."`
-	ColumnTypes []string `json:"column_types" jsonschema:"Arc's type name for each column, parallel to columns: int64, float64, utf8, bool, timestamp[us], date32, decimal(18, 2) and so on. Use it only when its length equals columns'; it is empty when Arc did not report types (an Arc before 27.01.1, the node that answered in a cluster being upgraded, or Arc's fallback path). The names describe the column, not the JSON value: timestamps and dates arrive as RFC 3339 strings in UTC, binary as base64, string_encoded, list, struct, map and unknown: columns as strings, and a float NaN or infinity as null."`
+	ColumnTypes []string `json:"column_types" jsonschema:"Arc's type name for each column, parallel to columns: int64, float64, utf8, bool, timestamp[us], date32 and so on (decimals read int64 or float64, as Arc sends their values). Use it only when its length equals columns'; it is empty when Arc did not report types (an Arc before 27.01.1, the node that answered in a cluster being upgraded, or Arc's fallback path), or when they did not fit the answer's size limit with at least one row. The names describe the column, not the JSON value: timestamps and dates arrive as RFC 3339 strings in UTC, binary as base64, string_encoded, list, struct, map and unknown: columns as strings, and a float NaN or infinity as null."`
 	Rows        [][]any  `json:"rows" jsonschema:"The rows shown, one value per column. Numbers are exactly as Arc sent them (a JavaScript client parsing them as doubles loses integers above 2^53; the text is exact). Strings and nested values longer than 512 characters are cut with an ellipsis, as in the text."`
 	// RowCount is len(Rows).
 	RowCount        int          `json:"row_count" jsonschema:"The number of rows in rows."`
@@ -159,9 +159,11 @@ const maxCellRunes = 512
 
 // renderResult renders a query result as markdown and as QueryOutput.
 // When maxChars > 0, rows are added while both the table text and the
-// structured rows' JSON stay within the budget, so text and structured
-// content always describe the same prefix of the result and neither passes
-// the limit; a row too large to fit alone is not shown, and a note says so.
+// structured content's JSON (its column header and rows) stay within the
+// budget, so text and structured content always describe the same prefix of
+// the result and neither passes the limit, unless the column names alone
+// are wider than it; column types are dropped when they would keep every
+// row out. A row too large to fit alone is not shown, and a note says why.
 // noData is the text when Arc read nothing.
 func renderResult(result *arc.QueryResponse, notes []note, noData string, maxChars int) (string, QueryOutput) {
 	notes = append([]note(nil), notes...)
@@ -196,38 +198,52 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 	for _, n := range notes {
 		budget -= len(n.markdown()) + 2
 	}
-	// The structured header (columns and their types) is sent whole; it
+	// The structured header (columns and their types) is sent whole and
 	// counts against the same budget as the rows, so rows are added only
-	// while header and rows together fit.
-	header, _ := json.Marshal(struct {
-		C []string `json:"columns"`
-		T []string `json:"column_types"`
-	}{out.Columns, out.ColumnTypes})
-	jsonSize := len(header)
-	shown := 0
-	for _, row := range result.Data {
-		var line strings.Builder
-		line.WriteString("| ")
-		for i, val := range row {
-			if i > 0 {
-				line.WriteString(" | ")
-			}
-			line.WriteString(escapeMarkdownCell(val))
-		}
-		line.WriteString(" |\n")
-		srow := structuredRow(row)
-		b, _ := json.Marshal(srow)
-		if maxChars > 0 && (table.Len()+line.Len() > budget || jsonSize+len(b)+1 > budget) {
-			break
-		}
-		table.WriteString(line.String())
-		out.Rows = append(out.Rows, srow)
-		jsonSize += len(b) + 1
-		shown++
+	// while header and rows together fit. Types are worth less than rows:
+	// when they keep every row out, they are dropped (column_types empty)
+	// and the rows measured again. Only column names wider than the budget
+	// make the structured content larger than it.
+	headerSize := func(types []string) int {
+		b, _ := json.Marshal(struct {
+			C []string `json:"columns"`
+			T []string `json:"column_types"`
+		}{out.Columns, types})
+		return len(b)
 	}
+	headerText := table.String()
+	fill := func(jsonStart int) (lines string, rows [][]any, jsonSize int) {
+		var tb strings.Builder
+		tb.WriteString(headerText)
+		rows = [][]any{}
+		jsonSize = jsonStart
+		for _, row := range result.Data {
+			line := markdownRow(row)
+			srow := structuredRow(row)
+			b, _ := json.Marshal(srow)
+			if maxChars > 0 && (tb.Len()+len(line) > budget || jsonSize+len(b)+1 > budget) {
+				break
+			}
+			tb.WriteString(line)
+			rows = append(rows, srow)
+			jsonSize += len(b) + 1
+		}
+		return tb.String(), rows, jsonSize
+	}
+	lines, rows, _ := fill(headerSize(out.ColumnTypes))
+	if len(rows) == 0 && len(result.Data) > 0 && maxChars > 0 && len(out.ColumnTypes) > 0 {
+		if l2, r2, _ := fill(headerSize([]string{})); len(r2) > 0 {
+			out.ColumnTypes = []string{}
+			lines, rows = l2, r2
+		}
+	}
+	table.Reset()
+	table.WriteString(lines)
+	out.Rows = rows
+	shown := len(rows)
 	switch {
-	case shown == 0 && len(result.Data) > 0 && maxChars > 0 && jsonSize > budget:
-		notes = append(notes, note{"size_budget", "No rows shown: the column names and types alone fill the answer's size limit.", "Select fewer columns."})
+	case shown == 0 && len(result.Data) > 0 && headerBlocksFirstRow(result.Data[0], len(headerText), headerSize(out.ColumnTypes), budget):
+		notes = append(notes, note{"size_budget", "No rows shown: the column names alone fill the answer's size limit.", "Select fewer columns."})
 	case shown == 0 && len(result.Data) > 0:
 		notes = append(notes, note{"size_budget", "No rows shown: a single row is larger than the answer's size limit.", "Select fewer columns."})
 	case shown < len(result.Data):
@@ -318,4 +334,29 @@ func columnTypes(result *arc.QueryResponse) []string {
 		types[i] = t
 	}
 	return types
+}
+
+// markdownRow is one row of the markdown table.
+func markdownRow(row []any) string {
+	var line strings.Builder
+	line.WriteString("| ")
+	for i, val := range row {
+		if i > 0 {
+			line.WriteString(" | ")
+		}
+		line.WriteString(escapeMarkdownCell(val))
+	}
+	line.WriteString(" |\n")
+	return line.String()
+}
+
+// headerBlocksFirstRow reports whether the first row was kept out by the
+// column header rather than by its own size: it fits the budget alone, in
+// the text and in the structured rows, but not after the header.
+func headerBlocksFirstRow(row []any, textHeader, jsonHeader, budget int) bool {
+	line := markdownRow(row)
+	b, _ := json.Marshal(structuredRow(row))
+	alone := len(line) <= budget && len(b)+1 <= budget
+	withHeader := textHeader+len(line) <= budget && jsonHeader+len(b)+1 <= budget
+	return alone && !withHeader
 }

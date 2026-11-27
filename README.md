@@ -300,7 +300,7 @@ The server reads JSON-RPC from stdin and writes to stdout. All logs go to stderr
 
 ### Structured output
 
-Every tool declares an MCP `outputSchema` and returns `structuredContent` on success, next to its markdown text: `query` and `get_sample_data` return `columns`, `column_types` (Arc's type name per column, such as `int64`, `utf8` or `timestamp[us]`; empty with an Arc before 27.01.1), `rows` (numbers exactly as Arc sent them), `row_count`, `truncated` with the reasons (`row_limit`, `arc_row_cap`, `size_budget`, `stream_incomplete`) and `no_data`; `describe_measurement` returns columns with types and typed statistics; the listing tools return their lists. Clients that only read text are unaffected.
+Every tool declares an MCP `outputSchema` and returns `structuredContent` on success, next to its markdown text: `query` and `get_sample_data` return `columns`, `column_types` (Arc's type name per column, such as `int64`, `utf8` or `timestamp[us]`; empty when Arc did not send them, as an Arc before 27.01.1 does not, or when they would keep every row out of the size limit), `rows` (numbers exactly as Arc sent them), `row_count`, `truncated` with the reasons (`row_limit`, `arc_row_cap`, `size_budget`, `stream_incomplete`) and `no_data`; `describe_measurement` returns columns with types and typed statistics; the listing tools return their lists. Clients that only read text are unaffected.
 
 ### list_databases
 
