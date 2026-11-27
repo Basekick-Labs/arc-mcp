@@ -16,10 +16,11 @@ type ListDatabasesArgs struct{}
 // RegisterListDatabases registers the list_databases tool.
 func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_databases",
-		Title:       "List databases",
-		Annotations: readOnly("List databases"),
-		Description: "List all databases in the Arc instance. Returns database names and measurement counts.",
+		Name:         "list_databases",
+		OutputSchema: databasesOutputSchema,
+		Title:        "List databases",
+		Annotations:  readOnly("List databases"),
+		Description:  "List all databases in the Arc instance. Returns database names and measurement counts.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 
@@ -42,12 +43,16 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 			}, nil, nil
 		}
 
+		structured := DatabasesOutput{Databases: []DatabaseInfo{}, Count: len(dbResult.Databases)}
+		for _, db := range dbResult.Databases {
+			structured.Databases = append(structured.Databases, DatabaseInfo{Name: db.Name, MeasurementCount: db.MeasurementCount})
+		}
 		if len(dbResult.Databases) == 0 {
-			return &mcp.CallToolResult{
+			return withStructured(&mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: "No databases found."},
 				},
-			}, nil, nil
+			}, structured), nil, nil
 		}
 
 		var sb strings.Builder
@@ -55,10 +60,10 @@ func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 		for _, db := range dbResult.Databases {
 			fmt.Fprintf(&sb, "- **%s** (%d measurements)\n", db.Name, db.MeasurementCount)
 		}
-		return &mcp.CallToolResult{
+		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: sb.String()},
 			},
-		}, nil, nil
+		}, structured), nil, nil
 	})
 }

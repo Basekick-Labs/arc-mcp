@@ -336,8 +336,7 @@ func escapeMarkdownCell(v any) string {
 		s = fmt.Sprintf("%v", v)
 	}
 
-	// Truncate very long cells.
-	const maxCellRunes = 512
+	// Truncate very long cells (maxCellRunes, shared with the structured rows).
 	runes := []rune(s)
 	if len(runes) > maxCellRunes {
 		s = string(runes[:maxCellRunes]) + "…"

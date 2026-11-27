@@ -125,18 +125,43 @@ func TestQuery_LimitsAndCutsRows(t *testing.T) {
 	}
 }
 
-// When the character cap also fires, it cuts from the end; the row note
-// must still be there.
-func TestQuery_RowNoteSurvivesCharacterCap(t *testing.T) {
+// When the size budget is reached the table stops at a row boundary: the
+// row-limit note stays first, a size note says how many rows are shown, and
+// the structured rows are the same rows.
+func TestQuery_SizeBudgetStopsAtARowBoundary(t *testing.T) {
 	fake := &fakeArc{reply: func(string) (int, string) { return 200, rowsBody(501) }}
-	cs := dataSession(t, fake, 500, 300)
-
-	text, _ := call(t, cs, "query", map[string]any{"database": "db", "sql": "SELECT n FROM t"})
-	if !strings.HasPrefix(text, "**Showing the first 500 rows") {
-		t.Errorf("row note lost:\n%s", text)
+	cs := newSession(t, fake, func(server *mcp.Server, client *arc.Client) {
+		RegisterQuery(server, client, 500, 900)
+	})
+	res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{Name: "query", Arguments: map[string]any{"database": "db", "sql": "SELECT n FROM t"}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(text, "[truncated") {
-		t.Errorf("character cap did not fire:\n%s", text)
+	text := resultText(t, res)
+	if !strings.HasPrefix(text, "**Showing the first 500 rows") || !strings.Contains(text, "the answer reached its size limit") {
+		t.Fatalf("notes wrong:\n%s", text)
+	}
+	shown := len(dataRow.FindAllString(text, -1))
+	b, _ := json.Marshal(res.StructuredContent)
+	var out QueryOutput
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if shown == 0 || out.RowCount != shown || len(out.Rows) != shown || !out.Truncated {
+		t.Errorf("text shows %d rows, structured %d (%d), truncated %v", shown, out.RowCount, len(out.Rows), out.Truncated)
+	}
+	var reasons []string
+	for _, tr := range out.Truncation {
+		reasons = append(reasons, tr.Reason)
+	}
+	if strings.Join(reasons, ",") != "row_limit,size_budget" {
+		t.Errorf("truncation %v", out.Truncation)
+	}
+	if len(text) > 900 || strings.Contains(text, "[truncated") {
+		t.Errorf("text is %d chars or was cut by the backstop", len(text))
+	}
+	if b, _ := json.Marshal(out.Rows); len(b) > 900 {
+		t.Errorf("structured rows are %d bytes, over the 900 budget", len(b))
 	}
 }
 

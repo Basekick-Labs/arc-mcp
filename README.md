@@ -45,7 +45,7 @@ arc-mcp \
 | `--arc-token` | Arc API token | `$ARC_TOKEN` |
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
-| `--max-response-size` | Max response characters | `50000` |
+| `--max-response-size` | Size limit of an answer, in characters (minimum 4000). Applies to the text and to the structured rows alike, each stopping at a row boundary | `50000` |
 
 ### Token hygiene
 
@@ -184,6 +184,10 @@ The server reads JSON-RPC from stdin and writes to stdout. All logs go to stderr
 
 ## Available Tools
 
+### Structured output
+
+Every tool declares an MCP `outputSchema` and returns `structuredContent` on success, next to its markdown text: `query` and `get_sample_data` return `columns`, `rows` (numbers exactly as Arc sent them), `row_count`, `truncated` with the reasons (`row_limit`, `arc_row_cap`, `size_budget`, `stream_incomplete`) and `no_data`; `describe_measurement` returns columns with types and typed statistics; the listing tools return their lists. Clients that only read text are unaffected.
+
 ### list_databases
 
 List all databases in the Arc instance. Needs a token with read permission.
@@ -235,7 +239,7 @@ Get recent sample rows from a measurement, ordered by time descending.
 - **Read-only:** Only one read statement runs per call: SELECT, FROM, VALUES, WITH, PIVOT, UNPIVOT, SHOW, DESCRIBE, SUMMARIZE or EXPLAIN. arc-mcp applies a subset of Arc's own query checks so that a refusal comes back with a reason the model can act on: Arc refuses words such as `load`, `copy` and `set` anywhere in a query, so a column with one of those names has to be double-quoted (`AS "load"`). When Arc refuses something arc-mcp did not check, Arc's validation message is passed through. Arc's checks and a read-only token remain the real boundary
 - **Permission answers are kept apart:** Arc's 401 (token missing, invalid or expired), its 403 for a token without read permission, its 403 for a token scoped to other databases, and its 404 for a database that does not exist produce four different messages. arc-mcp never retries a refusal and never widens a token's reach to work around one
 - **Row limits:** Queries return at most 500 rows by default (`--max-rows` / `ARC_MCP_MAX_ROWS`, 1 to 100,000). arc-mcp asks Arc for one row more than it shows: it appends `LIMIT 501` when the query has no LIMIT of its own and lowers a larger one, leaving the WHERE clause untouched so Arc still prunes partitions by time. When more rows exist, the answer says so at the top instead of looking complete
-- **Response truncation:** Large responses are truncated to prevent overwhelming LLM context windows
+- **Size limit:** an answer stops at the last row that fits `--max-response-size`, in the text and in the structured output alike, and says how many rows it shows
 - **Timeout:** 30-second default query timeout; a query that runs out of time tells the model to aggregate or narrow the time range
 - **Read-only, declared:** every tool carries the MCP read-only annotation, so clients can run it without asking each time
 - **Errors the model can act on:** when DuckDB rejects a query (a misspelled column and its candidates, a bad cast, a missing GROUP BY), its message is passed back with Arc's rewritten SQL and every storage path removed; storage and server faults stay generic
