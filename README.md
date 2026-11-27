@@ -36,6 +36,7 @@ arc-mcp \
 | `ARC_TOKEN` | Arc API token | (none) |
 | `ARC_TOKEN_FILE` | File containing the Arc API token | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
+| `ARC_MCP_TOOLS` | Tool groups to serve: `data`, `ops` or `data,ops` (see [Operations tools](#operations-tools-opt-in)) | `data` |
 
 ### CLI Flags
 
@@ -46,6 +47,7 @@ arc-mcp \
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Size limit of an answer, in characters (minimum 4000). Applies to the text and to the structured rows alike, each stopping at a row boundary | `50000` |
+| `--tools` | Tool groups to serve, comma-separated: `data`, `ops` | `$ARC_MCP_TOOLS` or `data` |
 
 ### Token hygiene
 
@@ -233,6 +235,63 @@ Execute a read-only SQL query (DuckDB dialect). Supports SELECT, aggregations, J
 Get recent sample rows from a measurement, ordered by time descending.
 
 **Example prompt:** "Show me some recent data from the temperature measurement"
+
+## Operations tools (opt-in)
+
+Two more tools report on the Arc server itself rather than on the data in it.
+They are off by default, so a data-only setup never sees them: turn them on
+with `--tools=data,ops` (or `ARC_MCP_TOOLS=data,ops`), or serve them alone with
+`--tools=ops`. A name that is not a group stops arc-mcp at startup with the list
+of valid ones; an empty value means `data`. In the Helm chart, set `arc.tools`
+as a list: `--set 'arc.tools={data,ops}'`.
+
+### arc_health
+
+Probes `/health` (is Arc alive) and `/ready` (should traffic go to it) and
+returns each probe's HTTP status and Arc's answer. A not-ready answer (HTTP
+503, with Arc's reason) is a result, not an error. Arc answers these probes
+without checking the token, so a healthy answer does not mean the token works.
+
+**Example prompt:** "Is Arc healthy?"
+
+### arc_metrics
+
+Reads one family of Arc's own metrics:
+
+| `family` | Arc route | What it holds |
+|---|---|---|
+| `endpoints` | `/api/v1/metrics/endpoints` | HTTP, ingest, query, buffer, storage, compaction and auth activity |
+| `query_pool` | `/api/v1/metrics/query-pool` | The DuckDB connection pool |
+| `memory` | `/api/v1/metrics/memory` | Go runtime and garbage collector |
+| `counters` | `/api/v1/metrics` | Every counter Arc keeps (the largest answer) |
+| `system_history` | `/api/v1/metrics/timeseries/system` | CPU, memory and goroutines over time |
+| `application_history` | `/api/v1/metrics/timeseries/application` | Ingest and query counters over time |
+| `api_history` | `/api/v1/metrics/timeseries/api` | HTTP requests and latency over time |
+
+`minutes` (history families only, 1 to 1440, default 10) is the look-back. Arc
+records a point every 5 seconds and keeps 30 minutes of them by default
+(`metrics.timeseries_interval_seconds`, `metrics.timeseries_retention_minutes`
+in Arc's configuration). A history answer carries at most 20 points: when Arc
+has more, arc-mcp keeps every k-th one counting back from the newest, which is
+always kept, and says so in `sampled_every`. `from` and `to` are the timestamps
+of the oldest and the newest point returned, the window actually covered. Numbers come
+through exactly as Arc sends them. An answer that does not fit
+`--max-response-size` is refused, naming the setting, rather than cut short.
+
+```json
+{"family":"api_history","history":{"from":"2026-11-27T01:35:36.157-03:00","to":"2026-11-27T01:45:06.156-03:00","total_points":120,"sampled_every":6,"points":[{"timestamp":"2026-11-27T01:35:36.157-03:00","values":{"http_requests_total":51200,"http_latency_avg_us":840,"...":"..."}},"..."]}}
+```
+
+**Example prompts:**
+- "Is Arc healthy?" → `arc_health`
+- "Why are queries slow?" → `arc_metrics` with `query_pool`, then `api_history`
+- "Is ingest keeping up?" → `arc_metrics` with `endpoints`, then `application_history`
+
+Both tools describe only the Arc node at the configured URL. In a cluster each
+node answers for itself, so point arc-mcp at the node you want to inspect;
+behind a load balancer or a Kubernetes Service, successive calls may reach
+different nodes. Arc's application logs are not included: reading them needs an
+admin token, and arc-mcp asks for a read-only one.
 
 ## Safety
 
