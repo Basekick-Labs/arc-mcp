@@ -184,20 +184,26 @@ func opsSession(t *testing.T, arcHandler http.Handler, o opsOpts) (*mcp.ClientSe
 	return cs, addr
 }
 
+// callOps calls an ops tool and checks every answer, success or error, for
+// Arc's address (the fake listens on loopback) and for the raw-error
+// fall-through of arc.UserMessage.
 func callOps(t *testing.T, cs *mcp.ClientSession, tool string, args map[string]any) (string, *mcp.CallToolResult) {
 	t.Helper()
 	res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{Name: tool, Arguments: args})
 	if err != nil {
 		t.Fatalf("CallTool(%s, %v): %v", tool, args, err)
 	}
-	return resultText(t, res), res
+	text := resultText(t, res)
+	assertNoLeak(t, text, "127.0.0.1")
+	assertNoLeak(t, text, "[::1]")
+	return text, res
 }
 
-// assertNoLeak fails when text carries Arc's address or the raw-error
+// assertNoLeak fails when text carries Arc's host or addr, or the raw-error
 // fall-through of arc.UserMessage.
 func assertNoLeak(t *testing.T, text, addr string) {
 	t.Helper()
-	for _, leak := range []string{fakeHost, addr, "127.0.0.1", "Arc error:", "dial tcp"} {
+	for _, leak := range []string{fakeHost, addr, "Arc error:", "dial tcp"} {
 		if strings.Contains(text, leak) {
 			t.Errorf("answer carries %q:\n%s", leak, text)
 		}
@@ -789,17 +795,19 @@ func TestHealth_ReadyTimesOutAfterHealth(t *testing.T) {
 // remains, so the tool never takes longer than the timeout.
 func TestHealth_OneDeadlineForBothProbes(t *testing.T) {
 	fake := &opsArc{routes: map[string]opsRoute{
-		"/health": {status: 200, body: healthBody, delay: 300 * time.Millisecond},
-		"/ready":  {status: 200, body: readyBody, delay: 300 * time.Millisecond},
+		"/health": {status: 200, body: healthBody, delay: 500 * time.Millisecond},
+		"/ready":  {status: 200, body: readyBody, delay: 500 * time.Millisecond},
 	}}
-	cs, _ := opsSession(t, fake, opsOpts{timeout: 450 * time.Millisecond})
+	// /health answers with 300 ms of the 800 ms left, which /ready (500 ms)
+	// cannot use up; with a deadline per probe, both would answer.
+	cs, _ := opsSession(t, fake, opsOpts{timeout: 800 * time.Millisecond})
 	start := time.Now()
 	text, res := callOps(t, cs, "arc_health", nil)
 	if res.IsError || !strings.HasPrefix(text, `{"health":{"http_status":200,`) || !strings.HasSuffix(text, `"ready":{"error":"timed out"}}`) {
 		t.Errorf("isErr=%v %s", res.IsError, text)
 	}
 	if took := time.Since(start); took > 2*time.Second {
-		t.Errorf("took %s for a 450ms timeout", took)
+		t.Errorf("took %s for an 800ms timeout", took)
 	}
 }
 
