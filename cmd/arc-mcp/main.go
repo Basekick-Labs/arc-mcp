@@ -41,6 +41,7 @@ func main() {
 	timeout := flag.Duration("timeout", defaultTimeout, "Query timeout")
 	maxResponseSize := flag.Int("max-response-size", defaultMaxResponseSize, "Maximum response size in characters")
 	insecure := flag.Bool("insecure", envOrDefault("ARC_MCP_INSECURE", "") != "", "Allow token auth over plaintext HTTP to non-loopback hosts (credentials will be sent in cleartext)")
+	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics)")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -53,6 +54,18 @@ func main() {
 		log.Printf("max-response-size %d is below %d; using %d", *maxResponseSize, minResponseSize, minResponseSize)
 		*maxResponseSize = minResponseSize
 	}
+
+	// Before anything reaches the network, so a typo is refused at once.
+	groups, blank, err := tools.ParseGroups(*toolGroups)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+		os.Exit(2)
+	}
+	if blank {
+		log.Printf("--tools/ARC_MCP_TOOLS names no tool group; using the default, %s", tools.DefaultGroups)
+	}
+	log.Printf("Tool groups: %s", groups)
+
 	if c := tools.ClampRowLimit(*maxRows); c != *maxRows {
 		log.Printf("max-rows %d is outside %d..%d; using %d", *maxRows, tools.MinRowLimit, tools.MaxRowLimit, c)
 		*maxRows = c
@@ -112,11 +125,11 @@ func main() {
 		Name:    "arc-mcp",
 		Version: Version,
 	}, &mcp.ServerOptions{
-		Instructions: serverInstructions(*maxRows),
+		Instructions: serverInstructions(*maxRows, groups),
 	})
 
 	// Register tools
-	tools.RegisterAll(server, client, *maxRows, *maxResponseSize)
+	tools.RegisterAll(server, client, groups, *maxRows, *maxResponseSize)
 
 	// Run on stdio
 	log.Printf("arc-mcp server starting (max-rows=%d, timeout=%s)", *maxRows, *timeout)
@@ -235,11 +248,37 @@ func resolveToken(flagValue string) (string, error) {
 	return flagValue, nil
 }
 
-// serverInstructions is what every client receives on connect: what Arc is,
-// and the habits that make queries on it cheap and right. Per-tool detail
-// lives in the tool descriptions. The pruning rule is Arc's own
-// (internal/pruning/time_bounds.go in the arc repo); keep it in step.
-func serverInstructions(maxRows int) string {
+// serverInstructions is what every client receives on connect, for the tool
+// groups served: the data text alone by default, byte for byte what it was
+// before groups existed, and a paragraph on the operations tools when they
+// are on. Per-tool detail lives in the tool descriptions.
+func serverInstructions(maxRows int, groups tools.Groups) string {
+	var parts []string
+	if groups.Data {
+		parts = append(parts, dataInstructions(maxRows))
+	} else {
+		parts = append(parts, opsOnlyLead)
+	}
+	if groups.Ops {
+		parts = append(parts, opsInstructions)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// opsOnlyLead replaces the data text when only the operations tools are on:
+// there is no query to give habits for.
+const opsOnlyLead = "Arc is a time-series lakehouse. This server has only its operations tools: they report on the Arc server itself, and cannot read the data stored in it."
+
+// opsInstructions is the paragraph on the operations tools.
+const opsInstructions = "Operations tools: arc_health says whether Arc is alive and ready for traffic; " +
+	"arc_metrics returns Arc's own metrics (endpoint activity, the query pool, memory, every counter) and the last minutes of its system, application and API history. " +
+	"They describe only the Arc node at the configured URL: in a cluster each node answers for itself, and behind a load balancer each call may reach a different node. " +
+	"A not-ready answer (HTTP 503) is a state to report, not a failure."
+
+// dataInstructions is the text for the data tools: what Arc is, and the
+// habits that make queries on it cheap and right. The pruning rule is Arc's
+// own (internal/pruning/time_bounds.go in the arc repo); keep it in step.
+func dataInstructions(maxRows int) string {
 	return "Arc is a time-series lakehouse: every reading kept at full resolution, years of history as Parquet, " +
 		"queried with one SQL (DuckDB dialect) through these read-only tools.\n\n" +
 		"How to query it well:\n" +

@@ -49,6 +49,8 @@ services:
       ARC_URL: ${ARC_URL:-http://arc:8000}
       ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required — set it in .env}
       ARC_MCP_MAX_ROWS: ${ARC_MCP_MAX_ROWS:-500}
+      # data (the default), or data,ops for Arc's health and metrics tools.
+      ARC_MCP_TOOLS: ${ARC_MCP_TOOLS:-data}
       # arc-mcp refuses by default to send a Bearer token over plaintext HTTP
       # to a non-loopback host. Inside this Compose file the `arc` service
       # lives on an isolated Docker bridge that never touches the host LAN,

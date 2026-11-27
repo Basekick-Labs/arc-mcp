@@ -22,12 +22,19 @@ func readOnly(title string) *mcp.ToolAnnotations {
 	}
 }
 
-// RegisterAll registers every arc-mcp tool. main and the tests both use it,
+// RegisterAll registers the tools of every group in groups, in a fixed order:
+// the data tools, then the operations tools. main and the tests both use it,
 // so a test over its tools covers every tool the server exposes.
-func RegisterAll(server *mcp.Server, client *arc.Client, maxRows, maxResponseChars int) {
-	RegisterListDatabases(server, client)
-	RegisterListMeasurements(server, client)
-	RegisterDescribeMeasurement(server, client, maxResponseChars)
-	RegisterQuery(server, client, maxRows, maxResponseChars)
-	RegisterGetSampleData(server, client, maxResponseChars)
+func RegisterAll(server *mcp.Server, client *arc.Client, groups Groups, maxRows, maxResponseChars int) {
+	if groups.Data {
+		RegisterListDatabases(server, client)
+		RegisterListMeasurements(server, client)
+		RegisterDescribeMeasurement(server, client, maxResponseChars)
+		RegisterQuery(server, client, maxRows, maxResponseChars)
+		RegisterGetSampleData(server, client, maxResponseChars)
+	}
+	if groups.Ops {
+		RegisterHealth(server, client, maxResponseChars)
+		RegisterMetrics(server, client, maxResponseChars)
+	}
 }

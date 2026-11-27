@@ -382,14 +382,14 @@ func TestQuery_ArcCapAndTruncationAreSaid(t *testing.T) {
 // clients can run it without asking the user each time.
 func TestEveryToolIsAnnotatedReadOnly(t *testing.T) {
 	cs := newSession(t, &fakeArc{reply: func(string) (int, string) { return 200, rowsBody(1) }}, func(server *mcp.Server, client *arc.Client) {
-		RegisterAll(server, client, 500, 50_000)
+		RegisterAll(server, client, Groups{Data: true, Ops: true}, 500, 50_000)
 	})
 	tools, err := cs.ListTools(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 5 {
-		t.Fatalf("%d tools registered, want 5", len(tools.Tools))
+	if len(tools.Tools) != 7 {
+		t.Fatalf("%d tools registered, want 7 (data and ops)", len(tools.Tools))
 	}
 	for _, tool := range tools.Tools {
 		a := tool.Annotations
