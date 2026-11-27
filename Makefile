@@ -40,7 +40,7 @@ check: ## goreleaser config check; exit 2 (valid, deprecated properties: brews) 
 	if [ $$rc -eq 2 ]; then echo "goreleaser check: valid, with deprecated properties (brews is kept until GoReleaser v3)"; \
 	elif [ $$rc -ne 0 ]; then exit $$rc; fi
 
-snapshot: ## goreleaser local snapshot build (no publish)
+snapshot: ## goreleaser local snapshot build (no publish; needs jq, zip and unzip for the .mcpb)
 	goreleaser release --clean --snapshot --skip=sign,publish
 
 docker-build: ## Build the arc-mcp Docker image locally

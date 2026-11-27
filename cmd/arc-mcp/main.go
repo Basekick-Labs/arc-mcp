@@ -84,9 +84,13 @@ func main() {
 		os.Exit(2)
 	}
 	if *transport == "stdio" {
+		// --auth-mode is not in this list: over stdio it still decides
+		// (passthrough is refused just below), and the desktop extension
+		// passes --auth-mode static to override an inherited
+		// ARC_MCP_AUTH_MODE, so "ignored" would be false.
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "listen", "insecure-listen", "tls-cert", "tls-key", "tls-upstream", "max-concurrent", "allow-any-host", "auth-mode":
+			case "listen", "insecure-listen", "tls-cert", "tls-key", "tls-upstream", "max-concurrent", "allow-any-host":
 				log.Printf("--%s applies to --transport http only; ignored over stdio", f.Name)
 			}
 		})

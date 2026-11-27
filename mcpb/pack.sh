@@ -6,13 +6,16 @@
 # GoReleaser runs it as the universal binary's post hook (.goreleaser.yml),
 # after every build and before archives, checksums and publishing, so a
 # failure here stops the release before anything is public, and the bundle
-# lands in checksums.txt. POSIX sh plus jq, zip and unzip; nothing else.
+# lands in checksums.txt. POSIX sh plus jq, zip, unzip and od; nothing else.
 #
 #   pack.sh <darwin-universal-binary> <version> <commit-epoch> [out-dir]
 #
 # <version> is GoReleaser's .Version: the file name keeps it as is
 # (arc-mcp-26.04.3.mcpb, like every other asset), the manifest gets it as
-# semver (26.4.3), which Claude Desktop expects. out-dir defaults to the
+# semver (26.4.3), as the MCPB spec requires for `version`. A version that
+# does not normalise to semver is refused, and since this runs inside the
+# release, a tag GoReleaser accepts but this refuses (v26.05, no patch)
+# fails the whole release before anything is published. out-dir defaults to the
 # dist directory the binary is in. The zip is reproducible: fixed mtimes
 # (the commit's), fixed modes, fixed entry order, no extra fields.
 set -eu
@@ -109,4 +112,6 @@ modes=$(unzip -Z "$tmp" | awk '$NF ~ /^(manifest\.json|LICENSE|server\/arc-mcp|s
 	die "unexpected entries or modes in $tmp: $modes"
 [ "$(unzip -p "$tmp" manifest.json | jq -r .version)" = "$semver" ] || die "the bundled manifest does not say $semver"
 mv "$tmp" "$out/$name"
+# The staging copy holds both binaries again; only the bundle is kept.
+rm -r -- "$stage"
 echo "mcpb/pack.sh: $out/$name (manifest version $semver)"

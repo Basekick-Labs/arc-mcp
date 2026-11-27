@@ -218,13 +218,16 @@ jobs:
           brew test local/arcmcp-ci/arc-mcp
 
   extension:
-    # The Claude Desktop extension as the app gets it: unpacked with the mcpb
-    # CLI, validated, then started through mcpb's own resolver for this
-    # platform (mcpb/smoke.mjs) against an unreachable Arc at a non-default
-    # URL, with a hostile inherited environment. macOS checks the universal
-    # binary (both slices; Go signs the arm64 one only) and runs it from mode
-    # 0755 and 0600 (the launcher's chmod, mcpb#294); Windows runs the win32
-    # override. npm runs in this job only: no secrets, read-only token.
+    # The Claude Desktop extension, unpacked with the mcpb CLI into a path
+    # shaped like the app's (".../Claude Extensions/local.arc-mcp", spaces
+    # included), validated, then started through mcpb's own resolver for
+    # this platform (mcpb/smoke.mjs) against an unreachable Arc at a
+    # non-default URL, with a hostile inherited environment. The CLI keeps
+    # the 0755 modes; the app extracts with its own reader and may write
+    # 0600 (mcpb#294), so the macOS 0600 leg is the one that models it. macOS
+    # also checks the universal binary (both slices; Go signs the arm64 one
+    # only); Windows runs the win32 override. npm runs in this job only: no
+    # secrets, read-only token.
     name: Extension (${{ matrix.os }})
     needs: release-dry-run
     strategy:
@@ -253,27 +256,28 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/mcpb" --ignore-scripts --no-audit --no-fund @anthropic-ai/mcpb@2.1.2
           echo "MCPB_PKG=$RUNNER_TEMP/mcpb/node_modules/@anthropic-ai/mcpb" >> "$GITHUB_ENV"
+          echo "EXT=$RUNNER_TEMP/Claude Extensions/local.arc-mcp" >> "$GITHUB_ENV"
       - name: Unpack and validate
         # tr: a native jq on Windows may end its output with CRLF.
         run: |
           v=$(jq -r .version dist/metadata.json | tr -d '\r')
-          node "$MCPB_PKG/dist/cli/cli.js" unpack "dist/arc-mcp-$v.mcpb" "$RUNNER_TEMP/ext"
-          node "$MCPB_PKG/dist/cli/cli.js" validate "$RUNNER_TEMP/ext/manifest.json"
+          node "$MCPB_PKG/dist/cli/cli.js" unpack "dist/arc-mcp-$v.mcpb" "$EXT"
+          node "$MCPB_PKG/dist/cli/cli.js" validate "$EXT/manifest.json"
           node "$MCPB_PKG/dist/cli/cli.js" info "dist/arc-mcp-$v.mcpb"
       - name: Check the universal binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          b="$RUNNER_TEMP/ext/server/arc-mcp"
+          b="$EXT/server/arc-mcp"
           test -x "$b"
           lipo "$b" -verify_arch x86_64 arm64
           codesign -v -a arm64 "$b"
       - name: Start it as Claude Desktop would
-        run: node mcpb/smoke.mjs "$RUNNER_TEMP/ext"
+        run: node mcpb/smoke.mjs "$EXT"
       - name: Start it from a non-executable file (macOS)
         if: runner.os == 'macOS'
         run: |
-          chmod 600 "$RUNNER_TEMP/ext/server/arc-mcp"
-          node mcpb/smoke.mjs "$RUNNER_TEMP/ext"
+          chmod 600 "$EXT/server/arc-mcp"
+          node mcpb/smoke.mjs "$EXT"
 
   helm-lint:
     runs-on: ubuntu-latest
