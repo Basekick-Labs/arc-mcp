@@ -200,10 +200,12 @@ func TestLoopbackHostsAreNeverProxied(t *testing.T) {
 		return
 	}
 	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestLoopbackHostsAreNeverProxied$")
+	// The lowercase names come first: on Windows, where names are
+	// case-insensitive, the last duplicate wins.
 	cmd.Env = append(os.Environ(),
 		"ARC_MCP_TEST_PROXY_CHILD=1",
-		"HTTP_PROXY=http://proxy.invalid:3128", "http_proxy=",
-		"NO_PROXY=", "no_proxy=",
+		"http_proxy=", "HTTP_PROXY=http://proxy.invalid:3128",
+		"no_proxy=", "NO_PROXY=",
 		"REQUEST_METHOD=", // not a CGI process, which would refuse HTTP_PROXY
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
