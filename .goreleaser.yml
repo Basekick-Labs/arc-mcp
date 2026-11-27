@@ -183,7 +183,7 @@ release:
     cosign verify-blob \
       --certificate checksums.txt.pem \
       --signature checksums.txt.sig \
-      --certificate-identity-regexp 'https://github\.com/basekick-labs/arc-mcp/' \
+      --certificate-identity-regexp '^https://github\.com/Basekick-Labs/arc-mcp/\.github/workflows/release\.yml@' \
       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
       checksums.txt
     ```
