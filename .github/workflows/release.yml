@@ -1,11 +1,13 @@
 name: Release
 
-# Fires on every v* tag, or by hand (workflow_dispatch) for an existing tag.
-# GoReleaser builds the archives, packages, images and the Homebrew formula,
-# and publishes images → GitHub release → formula (.goreleaser.yml). A formula
-# push that fails would leave a complete release with no tap entry, so the job
-# first refuses a tag that is not on main and a missing or dead tap token.
-# Rerunning a tag replaces the release's assets (replace_existing_artifacts).
+# Fires on every v* tag, or by hand (workflow_dispatch) for an existing tag:
+# the newest final tag, or a prerelease. GoReleaser builds the archives,
+# packages, images and the Homebrew formula, and publishes images → GitHub
+# release → formula (.goreleaser.yml). A formula push that fails would leave
+# a complete release with no tap entry, so the job first refuses a tag that
+# is not on main, an older final tag, and a missing or dead tap token.
+# Rerunning a tag replaces the release's assets (replace_existing_artifacts);
+# the archives rebuild byte-identical, so the formula's sha256s still hold.
 #
 # Actions are SHA-pinned here: this workflow holds contents:write,
 # packages:write, an OIDC identity that mints signing certificates in the
@@ -40,8 +42,11 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false # GoReleaser publishes through the API, not git
 
-      - name: Refuse a tag that is not on main
-        # A dispatched run checks out inputs.tag, so this covers it too.
+      - name: Refuse a tag that is not on main, or an older release
+        # A dispatched run checks out inputs.tag, so this covers it too. A
+        # final tag must be the newest final tag: GoReleaser rewrites the
+        # formula and :latest with no version check, so releasing an older
+        # tag again would move both back. Prereleases push no formula.
         run: |
           git fetch --no-tags origin main
           commit=$(git rev-parse "HEAD^{commit}")
@@ -50,9 +55,17 @@ jobs:
             exit 1
           fi
           if ! git merge-base --is-ancestor "$commit" origin/main; then
-            echo "::error::tag $TAG ($commit) is not reachable from main"
+            echo "::error::tag $TAG ($commit) is not reachable from main: push main first (or re-create the tag on a main commit), then re-run this workflow"
             exit 1
           fi
+          newest=$(git tag -l 'v*' --sort=-v:refname | grep -v -e '-' | head -n1)
+          case $TAG in
+            *-*) ;;
+            *) if [ "$TAG" != "$newest" ]; then
+                 echo "::error::$TAG is not the newest release ($newest): releasing it again would move the tap formula and :latest back"
+                 exit 1
+               fi ;;
+          esac
 
       - name: Refuse to run without a working Homebrew tap token
         # The formula push is GoReleaser's last publish step, so a missing,
@@ -119,6 +132,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # The tag checked above. Left to itself GoReleaser takes the first
+          # tag at HEAD in version order, which puts v26.05.1-rc.1 before
+          # v26.05.1: a final tagged on its rc's commit would re-release the rc.
+          GORELEASER_CURRENT_TAG: ${{ env.TAG }}
 
   helm-release:
     name: Helm Chart Release
