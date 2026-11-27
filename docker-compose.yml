@@ -2,19 +2,19 @@
 #
 # Two usage modes:
 #
-#   1. Everything — arc + arc-mcp-gateway (default):
+#   1. Everything — arc + arc-mcp:
 #        docker compose --profile with-arc up
-#      Arc API on  : http://localhost:8000
-#      MCP over SSE: http://localhost:8080/sse
+#      Arc API on : http://localhost:8000
+#      MCP on     : http://localhost:8080/mcp (Streamable HTTP)
 #
 #   2. MCP only — you already run Arc elsewhere:
 #        docker compose up arc-mcp
 #      Set ARC_URL + ARC_TOKEN in .env (see .env.example).
 #
-# The `gateway` service wraps arc-mcp (stdio) with supergateway so remote
-# LLM clients can connect over HTTP/SSE. For local Claude Desktop (stdio),
-# use the `arc-mcp-stdio` service definition at the bottom and wire it into
-# Claude Desktop's MCP config (see README).
+# arc-mcp serves MCP over Streamable HTTP itself (--transport http); every
+# request needs ARC_MCP_HTTP_TOKEN as a bearer token. For local Claude Desktop
+# (stdio), use the `arc-mcp-stdio` service definition at the bottom and wire
+# it into Claude Desktop's MCP config (see README).
 
 services:
   # Arc database — optional; enabled via the `with-arc` profile.
@@ -34,15 +34,15 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # arc-mcp wrapped by supergateway — exposes MCP over HTTP/SSE.
+  # arc-mcp over Streamable HTTP at /mcp.
   arc-mcp:
-    image: ghcr.io/basekick-labs/arc-mcp-gateway:${ARC_MCP_VERSION:-26.04.2}
+    image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-latest}
     container_name: arc-mcp
     command:
-      - "--stdio"
-      - "/usr/local/bin/arc-mcp"
-      - "--port"
-      - "8080"
+      - "--transport"
+      - "http"
+      - "--listen"
+      - "0.0.0.0:8080"
     environment:
       # When running alongside `arc` in this compose file, use the service name.
       # Otherwise point ARC_URL at your own Arc instance (see .env.example).
@@ -57,8 +57,15 @@ services:
       # so opting into insecure is acceptable. Override to 0 (or unset) if
       # you point ARC_URL at a remote HTTP host and want the guard back.
       ARC_MCP_INSECURE: ${ARC_MCP_INSECURE:-1}
+      # Required: the bearer token MCP clients send. Without it, any web page
+      # open in a browser on this machine could reach the endpoint through
+      # DNS rebinding, and query Arc with ARC_TOKEN. Generate one with
+      #   openssl rand -hex 32
+      ARC_MCP_HTTP_TOKEN: ${ARC_MCP_HTTP_TOKEN:?ARC_MCP_HTTP_TOKEN is required — set it in .env}
     ports:
-      - "${ARC_MCP_PORT:-8080}:8080"
+      # Published on the host's loopback only; change to "8080:8080" to
+      # reach it from other machines (use TLS in front of it, see README).
+      - "127.0.0.1:${ARC_MCP_PORT:-8080}:8080"
     depends_on:
       arc:
         condition: service_healthy
@@ -72,7 +79,7 @@ services:
   #   docker compose run --rm -T arc-mcp-stdio
   #
   # arc-mcp-stdio:
-  #   image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-26.04.2}
+  #   image: ghcr.io/basekick-labs/arc-mcp:${ARC_MCP_VERSION:-latest}
   #   environment:
   #     ARC_URL: ${ARC_URL:-http://host.docker.internal:8000}
   #     ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required}

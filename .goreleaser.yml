@@ -129,38 +129,6 @@ dockers:
       - "--label=org.opencontainers.image.created={{ .Date }}"
       - "--label=org.opencontainers.image.licenses=MIT"
 
-  # arc-mcp-gateway: arc-mcp bundled with supergateway for HTTP/SSE exposure.
-  # This is what the Helm chart consumes by default.
-  - id: gateway-amd64
-    image_templates:
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
-    use: buildx
-    dockerfile: Dockerfile.gateway
-    build_flag_templates:
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.title=arc-mcp-gateway"
-      - "--label=org.opencontainers.image.description=arc-mcp bundled with supergateway for HTTP/SSE"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.source={{ .GitURL }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.licenses=MIT"
-
-  - id: gateway-arm64
-    image_templates:
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
-    use: buildx
-    dockerfile: Dockerfile.gateway
-    goarch: arm64
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.title=arc-mcp-gateway"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.source={{ .GitURL }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.licenses=MIT"
-
 docker_manifests:
   - name_template: "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}"
     image_templates:
@@ -176,21 +144,6 @@ docker_manifests:
     image_templates:
       - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-amd64"
       - "ghcr.io/basekick-labs/arc-mcp:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Major }}.{{ .Minor }}"
-    image_templates:
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/basekick-labs/arc-mcp-gateway:latest"
-    image_templates:
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-amd64"
-      - "ghcr.io/basekick-labs/arc-mcp-gateway:{{ .Version }}-arm64"
 
 # Cosign keyless signing — uses GH OIDC, no keys to manage.
 # Verify with: cosign verify-blob --certificate ... --signature ...

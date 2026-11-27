@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -416,8 +417,12 @@ func TestDescribe_StatsTimeoutNamesTheDeadlineThatFired(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 	defer cancel()
 	got := measurementStats(ctx, client, "db", "cpu", 30)
+	// The budget is read a moment after the deadline was set: on a slow or
+	// coarse clock (Windows CI) that is 149ms, never more than 150ms, and
+	// far from --timeout's 5s.
+	want := regexp.MustCompile(`^not computed \(timed out after (1[34][0-9]|150)ms\)$`)
 	for i, v := range got {
-		if v.String() != "not computed (timed out after 150ms)" {
+		if !want.MatchString(v.String()) {
 			t.Errorf("line %d = %q", i, v)
 		}
 	}

@@ -1,22 +1,22 @@
 arc-mcp has been installed in namespace {{ .Release.Namespace }} as {{ include "arc-mcp.fullname" . }}.
 
-{{- if .Values.gateway.enabled }}
-
-The supergateway wrapper is exposing arc-mcp over SSE on port {{ .Values.service.port }}.
+arc-mcp serves MCP over Streamable HTTP on port {{ .Values.service.port }}, path /mcp.
 
 From inside the cluster:
 
-  curl http://{{ include "arc-mcp.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/sse
+  http{{ if .Values.http.tlsSecretName }}s{{ end }}://{{ include "arc-mcp.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/mcp
 
 Or port-forward locally:
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "arc-mcp.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
 
-Point your MCP-over-SSE client at http://localhost:{{ .Values.service.port }}/sse.
-{{- else }}
+and point your MCP client at http{{ if .Values.http.tlsSecretName }}s{{ end }}://localhost:{{ .Values.service.port }}/mcp
+{{- if .Values.http.tokenSecretRef.name }}, sending the token in Secret
+{{ .Values.http.tokenSecretRef.name }} as "Authorization: Bearer <token>".
+{{- else }}.
 
-Gateway is disabled — arc-mcp is running as a stdio-only process. Connect via
-`kubectl exec` or a sidecar in the same pod.
+WARNING: http.insecureListen is set: anyone who can reach the Service queries
+Arc with arc-mcp's Arc token, with no inbound token.
 {{- end }}
 
 {{- if and (not .Values.arc.tokenSecretRef.name) (not .Values.arc.token) }}

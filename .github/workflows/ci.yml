@@ -101,3 +101,15 @@ jobs:
           version: '3.14.0'
       - name: Lint Helm chart
         run: helm lint helm/arc-mcp
+      - name: Render Helm chart
+        run: |
+          helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok >/dev/null
+          helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok --set http.tlsSecretName=tls >/dev/null
+          helm template t helm/arc-mcp --set http.insecureListen=true >/dev/null
+          helm lint helm/arc-mcp --set http.insecureListen=true
+          # The guards must refuse, with their own message: no inbound token,
+          # and the removed gateway values.
+          if out=$(helm template t helm/arc-mcp 2>&1); then echo "token guard missing"; exit 1; fi
+          grep -q 'set http.tokenSecretRef.name' <<<"$out"
+          if out=$(helm template t helm/arc-mcp --set http.insecureListen=true --set gateway.enabled=true 2>&1); then echo "gateway guard missing"; exit 1; fi
+          grep -q 'gateway.\* values were removed' <<<"$out"
