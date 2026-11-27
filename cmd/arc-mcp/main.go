@@ -37,6 +37,7 @@ func main() {
 	maxRows := flag.Int("max-rows", envOrDefaultInt("ARC_MCP_MAX_ROWS", defaultMaxRows), "Maximum rows per query")
 	timeout := flag.Duration("timeout", defaultTimeout, "Query timeout")
 	maxResponseSize := flag.Int("max-response-size", defaultMaxResponseSize, "Maximum response size in characters")
+	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", "data"), "Comma-separated tool groups: data and ops (default: data)")
 	insecure := flag.Bool("insecure", envOrDefault("ARC_MCP_INSECURE", "") != "", "Allow token auth over plaintext HTTP to non-loopback hosts (credentials will be sent in cleartext)")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
@@ -44,6 +45,11 @@ func main() {
 	if *version {
 		fmt.Println(Version)
 		os.Exit(0)
+	}
+	dataTools, opsTools, err := parseToolGroups(*toolGroups)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+		os.Exit(2)
 	}
 
 	if c := tools.ClampRowLimit(*maxRows); c != *maxRows {
@@ -105,14 +111,18 @@ func main() {
 		Name:    "arc-mcp",
 		Version: Version,
 	}, &mcp.ServerOptions{
-		Instructions: serverInstructions(*maxRows),
+		Instructions: serverInstructions(*maxRows, dataTools, opsTools),
 	})
 
-	// Register tools
-	tools.RegisterAll(server, client, *maxRows, *maxResponseSize)
+	if dataTools {
+		tools.RegisterAll(server, client, *maxRows, *maxResponseSize)
+	}
+	if opsTools {
+		tools.RegisterOps(server, client, *maxResponseSize)
+	}
 
 	// Run on stdio
-	log.Printf("arc-mcp server starting (max-rows=%d, timeout=%s)", *maxRows, *timeout)
+	log.Printf("arc-mcp server starting (tools=%s, max-rows=%d, timeout=%s)", strings.Join(enabledToolGroups(dataTools, opsTools), ","), *maxRows, *timeout)
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
@@ -225,18 +235,59 @@ func resolveToken(flagValue string) (string, error) {
 // and the habits that make queries on it cheap and right. Per-tool detail
 // lives in the tool descriptions. The pruning rule is Arc's own
 // (internal/pruning/time_bounds.go in the arc repo); keep it in step.
-func serverInstructions(maxRows int) string {
-	return "Arc is a time-series lakehouse: every reading kept at full resolution, years of history as Parquet, " +
-		"queried with one SQL (DuckDB dialect) through these read-only tools.\n\n" +
-		"How to query it well:\n" +
-		"1. Discover first: list_databases, list_measurements, then describe_measurement for column names, types and the time range.\n" +
-		"2. Bound by time. Arc reads only the partitions in range when a single-table SELECT has a top-level condition on time " +
-		"against now() plus or minus one interval (seconds to months) or a literal without a UTC offset: " +
-		"WHERE time > now() - INTERVAL '1 hour', or time BETWEEN '2026-11-01' AND '2026-11-02'. " +
-		"A JOIN, CTE, UNION or subquery anywhere in the query, an OR, or a function of time reads all history.\n" +
-		"3. Aggregate before returning rows: time_bucket(INTERVAL '5 minutes', time) or date_trunc('hour', time) with GROUP BY. " +
-		"Results are capped at " + strconv.Itoa(maxRows) + " rows, and the answer says when more exist.\n" +
-		"4. Start with a recent window and widen it deliberately.\n" +
-		"5. Arc blocks some words anywhere in a query, even as column names (load, copy, set, ...): double-quote such a name, as in \"load\".\n" +
-		"6. When a query fails, the error says why (a misspelled column and its candidates, a bad cast): fix the SQL rather than retrying it as is."
+func serverInstructions(maxRows int, dataEnabled, opsEnabled bool) string {
+	instructions := "Arc is a time-series lakehouse."
+	if dataEnabled {
+		instructions += " Every reading is kept at full resolution, with years of history as Parquet.\n\n" +
+			"The data is queried with one SQL statement (DuckDB dialect) through these read-only tools.\n\n" +
+			"How to query it well:\n" +
+			"1. Discover first: list_databases, list_measurements, then describe_measurement for column names, types and the time range.\n" +
+			"2. Bound by time. Arc reads only the partitions in range when a single-table SELECT has a top-level condition on time " +
+			"against now() plus or minus one interval (seconds to months) or a literal without a UTC offset: " +
+			"WHERE time > now() - INTERVAL '1 hour', or time BETWEEN '2026-11-01' AND '2026-11-02'. " +
+			"A JOIN, CTE, UNION or subquery anywhere in the query, an OR, or a function of time reads all history.\n" +
+			"3. Aggregate before returning rows: time_bucket(INTERVAL '5 minutes', time) or date_trunc('hour', time) with GROUP BY. " +
+			"Results are capped at " + strconv.Itoa(maxRows) + " rows, and the answer says when more exist.\n" +
+			"4. Start with a recent window and widen it deliberately.\n" +
+			"5. Arc blocks some words anywhere in a query, even as column names (load, copy, set, ...): double-quote such a name, as in \"load\".\n" +
+			"6. When a query fails, the error says why (a misspelled column and its candidates, a bad cast): fix the SQL rather than retrying it as is."
+	}
+	if opsEnabled {
+		instructions += "\nOptional ops tools: arc_health returns liveness and readiness; arc_metrics reads one bounded metrics family for the Arc node at ARC_URL. These tools are read-only."
+	}
+	return instructions
+}
+
+func parseToolGroups(raw string) (data, ops bool, err error) {
+	seen := make(map[string]bool)
+	for _, group := range strings.Split(raw, ",") {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			return false, false, fmt.Errorf("tool groups must be data, ops, or both")
+		}
+		if seen[group] {
+			return false, false, fmt.Errorf("tool group %q is listed more than once", group)
+		}
+		seen[group] = true
+		switch group {
+		case "data":
+			data = true
+		case "ops":
+			ops = true
+		default:
+			return false, false, fmt.Errorf("unknown tool group %q; choose data and/or ops", group)
+		}
+	}
+	return data, ops, nil
+}
+
+func enabledToolGroups(data, ops bool) []string {
+	var groups []string
+	if data {
+		groups = append(groups, "data")
+	}
+	if ops {
+		groups = append(groups, "ops")
+	}
+	return groups
 }

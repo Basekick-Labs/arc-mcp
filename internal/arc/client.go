@@ -43,6 +43,8 @@ const (
 	// KindForbidden is HTTP 403 from Arc's coarse permission check — the
 	// token does not carry the permission the route requires at all.
 	KindForbidden = "forbidden"
+	// KindUnsupported is an observability endpoint absent from this Arc version.
+	KindUnsupported = "unsupported"
 	// KindScoped is HTTP 403 from Arc's per-database permission check —
 	// the token can read, but not the database it asked about. Arc
 	// answers the list-everything route this way rather than returning a
@@ -223,6 +225,8 @@ func UserMessage(err error) string {
 			return "Arc rejected the token — it is missing, invalid or expired. Ask the user to check the token configured for this Arc server."
 		case KindForbidden:
 			return "Arc refused the request: this token does not carry the permission the endpoint requires. A token with read permission is needed."
+		case KindUnsupported:
+			return "This Arc version does not expose the requested observability endpoint."
 		case KindScoped:
 			return "This Arc token can only read specific databases, and not the one asked for. Ask the user which database to use, then call the tool again with that database."
 		case KindUnavailable:

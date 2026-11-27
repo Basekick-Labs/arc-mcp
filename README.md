@@ -36,6 +36,7 @@ arc-mcp \
 | `ARC_TOKEN` | Arc API token | (none) |
 | `ARC_TOKEN_FILE` | File containing the Arc API token | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
+| `ARC_MCP_TOOLS` | Comma-separated tool groups (`data`, `ops`) | `data` |
 
 ### CLI Flags
 
@@ -46,6 +47,14 @@ arc-mcp \
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Max response characters | `50000` |
+| `--tools` | Comma-separated tool groups (`data`, `ops`) | `data` |
+
+The `ops` group is opt-in. Start with `--tools=data,ops` (or set
+`ARC_MCP_TOOLS=data,ops`) to expose `arc_health` and `arc_metrics` alongside
+the data tools. `arc_health` combines liveness and readiness; `arc_metrics`
+reads one bounded metrics family for the Arc node at `ARC_URL`. Both are
+read-only and return structured JSON as well as text. Application logs are
+not included because Arc requires an admin token for that endpoint.
 
 ### Token hygiene
 
@@ -229,6 +238,17 @@ Execute a read-only SQL query (DuckDB dialect). Supports SELECT, aggregations, J
 Get recent sample rows from a measurement, ordered by time descending.
 
 **Example prompt:** "Show me some recent data from the temperature measurement"
+
+### Optional ops tools
+
+Enable these with `--tools=ops` or `--tools=data,ops` (the default is
+`data`). `arc_health` returns Arc's `/health` and `/ready` snapshots together;
+a not-ready response is returned with its reason. `arc_metrics` accepts one
+family: `aggregate`, `memory`, `query-pool`, `endpoints`, or `timeseries`.
+For time-series metrics, set `type` to `system`, `application`, or `api` and
+optionally set `duration_minutes` from 1 to 1440 (default 30). Large
+time-series responses keep the newest points and report `truncated_points`.
+The metrics tools inspect only the Arc node configured by `ARC_URL`.
 
 ## Safety
 
