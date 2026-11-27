@@ -158,7 +158,12 @@ func metricsInputSchema() map[string]any {
 			},
 			"minutes": map[string]any{
 				"type":        "integer",
-				"description": "History families only: the look-back in minutes, 1 to 1440 (default " + strconv.Itoa(defaultHistoryMinutes) + ").",
+				"description": "History families only: the look-back in minutes, 1 to 1440 (default " + strconv.Itoa(defaultHistoryMinutes) + "; 0 or absent means the default).",
+				// The bounds in the schema itself, so a client can check them
+				// before calling (from #35). 0 stays allowed: it means "not
+				// given", as clients that send every field send it.
+				"minimum": 0,
+				"maximum": maxHistoryMinutes,
 			},
 		},
 		"required":             []string{"family"},

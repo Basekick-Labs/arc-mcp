@@ -368,6 +368,10 @@ func TestMetrics_InputSchema(t *testing.T) {
 	if _, ok := minutes["default"]; ok || minutes["type"] != "integer" {
 		t.Errorf("minutes schema = %v: an integer, with no default", minutes)
 	}
+	// The bounds a client can check before calling; 0 means "not given".
+	if fmt.Sprint(minutes["minimum"]) != "0" || fmt.Sprint(minutes["maximum"]) != "1440" {
+		t.Errorf("minutes bounds = %v..%v, want 0..1440", minutes["minimum"], minutes["maximum"])
+	}
 	if req, _ := json.Marshal(schema["required"]); string(req) != `["family"]` || schema["additionalProperties"] != false {
 		t.Errorf("schema = %v", schema)
 	}
@@ -415,9 +419,9 @@ func TestMetrics_ArgumentsRefusedBeforeArc(t *testing.T) {
 		want string
 	}{
 		{map[string]any{"family": "memory", "minutes": 5}, "Invalid argument: minutes applies only to system_history, application_history and api_history"},
-		{map[string]any{"family": "api_history", "minutes": -1}, "Invalid argument: minutes must be between 1 and 1440"},
-		{map[string]any{"family": "api_history", "minutes": 1441}, "Invalid argument: minutes must be between 1 and 1440"},
 		// The SDK's schema check, before the handler.
+		{map[string]any{"family": "api_history", "minutes": -1}, "validating /properties/minutes: minimum"},
+		{map[string]any{"family": "api_history", "minutes": 1441}, "validating /properties/minutes: maximum"},
 		{map[string]any{"family": "bogus"}, `enum: bogus does not equal any of: [endpoints query_pool memory counters system_history application_history api_history]`},
 		{map[string]any{"family": "COUNTERS"}, "enum: COUNTERS does not equal any of"},
 		{map[string]any{}, `missing properties: ["family"]`},
