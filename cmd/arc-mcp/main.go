@@ -29,6 +29,9 @@ const (
 	defaultMaxRows         = 500
 	defaultTimeout         = 30 * time.Second
 	defaultMaxResponseSize = 50000
+	// minResponseSize leaves room for a few rows next to the notes and the
+	// footer; below it, every answer would be notes only.
+	minResponseSize = 4000
 )
 
 func main() {
@@ -46,6 +49,10 @@ func main() {
 		os.Exit(0)
 	}
 
+	if *maxResponseSize < minResponseSize {
+		log.Printf("max-response-size %d is below %d; using %d", *maxResponseSize, minResponseSize, minResponseSize)
+		*maxResponseSize = minResponseSize
+	}
 	if c := tools.ClampRowLimit(*maxRows); c != *maxRows {
 		log.Printf("max-rows %d is outside %d..%d; using %d", *maxRows, tools.MinRowLimit, tools.MaxRowLimit, c)
 		*maxRows = c

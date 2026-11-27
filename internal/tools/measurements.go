@@ -165,8 +165,25 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
 		sb.WriteString("### Columns\n\n")
 		sb.WriteString("| Column | Type |\n|--------|------|\n")
+		structured := DescribeOutput{Database: args.Database, Measurement: args.Measurement, Columns: []ColumnInfo{}, Statistics: statsOutput(stats)}
+		// Columns while they fit the size limit, with room for the
+		// statistics; text and structured content list the same columns.
+		sizeBudget := maxResponseChars - min(1000, maxResponseChars/4)
 		for _, c := range columns {
-			fmt.Fprintf(&sb, "| %s | %s |\n", escapeMarkdownCell(c.name), escapeMarkdownCell(c.typ))
+			line := fmt.Sprintf("| %s | %s |\n", escapeMarkdownCell(c.name), escapeMarkdownCell(c.typ))
+			if maxResponseChars > 0 && sb.Len()+len(line) > sizeBudget {
+				structured.Truncated = true
+				break
+			}
+			sb.WriteString(line)
+			typ := c.typ
+			if typ == unknownType {
+				typ = ""
+			}
+			structured.Columns = append(structured.Columns, ColumnInfo{Name: c.name, Type: typ})
+		}
+		if structured.Truncated {
+			fmt.Fprintf(&sb, "\n**Showing the first %d of %d columns: the answer reached its size limit.**\n", len(structured.Columns), len(columns))
 		}
 
 		sb.WriteString("\n### Statistics\n\n")
@@ -179,14 +196,6 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			text = TruncateResponse(text, maxResponseChars)
 		}
 
-		structured := DescribeOutput{Database: args.Database, Measurement: args.Measurement, Columns: []ColumnInfo{}, Statistics: statsOutput(stats)}
-		for _, c := range columns {
-			typ := c.typ
-			if typ == unknownType {
-				typ = ""
-			}
-			structured.Columns = append(structured.Columns, ColumnInfo{Name: c.name, Type: typ})
-		}
 		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
@@ -223,8 +232,8 @@ const statsGateMs = 55
 // older Latest. DuckDB's own row-group statistics keep it cheap.
 const statsLatestWindow = "(SELECT now() - INTERVAL '30 days')"
 
-// measurementStats returns the values of the Row count, Earliest and Latest
-// lines: each as Arc rendered it, or "not computed" with the reason.
+// measurementStats returns the Row count, Earliest and Latest statistics:
+// each the value Arc returned, or why it was not computed.
 //
 // Below statsGateMs (and above 0) it sends one statement whose parts are each cheap on a
 // measurement with few files: count(*) (answered from file metadata), the
@@ -234,8 +243,8 @@ const statsLatestWindow = "(SELECT now() - INTERVAL '30 days')"
 // max(time) over everything, the scan today's statement pays. At or above
 // the gate, or with no time, it sends the single full statement. Every
 // value is exact either
-// way and rendered as Arc sent it, so a computed block reads as it always
-// has.
+// way and kept as Arc sent it (a SQL null reads "none" in the text and is
+// null in the structured output).
 //
 // All statements share one deadline, arc-mcp's --timeout from the start of
 // the statistics (or the caller's, if sooner): a describe takes at most one
@@ -286,8 +295,6 @@ func statsRow(ctx context.Context, client *arc.Client, database, sql string, n i
 	return r.Data[0], nil
 }
 
-// statValue renders value i of row, or, when err is set, why it is missing
-// (see failureReason).
 // statResult is one statistic: its value as Arc returned it (nil for a
 // SQL null), or, when it could not be computed, why.
 type statResult struct {
@@ -307,6 +314,8 @@ func (s statResult) String() string {
 	}
 }
 
+// statValue is value i of row, or, when err is set, why it is missing (see
+// failureReason).
 func statValue(budget time.Duration, row []any, i int, err error) statResult {
 	switch reason := failureReason(budget, err); {
 	case err == nil:
@@ -339,7 +348,10 @@ func statsOutput(stats [3]statResult) StatsOutput {
 			if n, err := strconv.ParseInt(str, 10, 64); err == nil {
 				out.RowCount = &n
 			} else {
-				out.Errors = map[string]string{names[0]: "Arc returned a row count that is not an integer: " + str}
+				if out.Errors == nil {
+					out.Errors = map[string]string{}
+				}
+				out.Errors[names[0]] = "Arc returned a row count that is not an integer: " + str
 			}
 		case 1:
 			out.Earliest = &str

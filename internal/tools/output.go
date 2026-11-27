@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
@@ -25,29 +26,22 @@ import (
 // (a SHOULD): models read a table better than JSON, and clients that want
 // the data read structuredContent.
 
+// Truncation is one reason a result is incomplete.
+type Truncation struct {
+	Reason  string `json:"reason" jsonschema:"row_limit: arc-mcp's row cap; arc_row_cap: Arc's own row cap; size_budget: the answer's size limit; stream_incomplete: Arc stopped partway. The first three leave a valid prefix of the result."`
+	Message string `json:"message" jsonschema:"What happened and what to change, in plain text."`
+}
+
 // QueryOutput is the structured result of query and get_sample_data.
 type QueryOutput struct {
-	// Columns are the result's column names, in order.
-	Columns []string `json:"columns"`
-	// Rows are the rows shown, each with one value per column. Numbers are
-	// exactly as Arc sent them; strings longer than 512 characters are cut
-	// with an ellipsis, as in the text.
-	Rows [][]any `json:"rows"`
+	Columns []string `json:"columns" jsonschema:"The result's column names, in order."`
+	Rows    [][]any  `json:"rows" jsonschema:"The rows shown, one value per column. Numbers are exactly as Arc sent them (a JavaScript client parsing them as doubles loses integers above 2^53; the text is exact). Strings and nested values longer than 512 characters are cut with an ellipsis, as in the text."`
 	// RowCount is len(Rows).
-	RowCount int `json:"row_count"`
-	// Truncated is true when the result is incomplete; Truncation says why:
-	// row_limit (arc-mcp's row cap), arc_row_cap (Arc's own cap),
-	// size_budget (the answer's size limit), stream_incomplete (Arc stopped
-	// partway). The first three leave a valid prefix of the result;
-	// stream_incomplete may need the query fixed (see Notes).
-	Truncated  bool     `json:"truncated"`
-	Truncation []string `json:"truncation,omitempty"`
-	// Notes say, in plain text, why the result is incomplete and what to do.
-	Notes []string `json:"notes,omitempty"`
-	// NoData is true when Arc found nothing to read: a measurement that does
-	// not exist or has no data.
-	NoData          bool    `json:"no_data,omitempty"`
-	ExecutionTimeMs float64 `json:"execution_time_ms"`
+	RowCount        int          `json:"row_count" jsonschema:"The number of rows in rows."`
+	Truncated       bool         `json:"truncated" jsonschema:"True when the result is incomplete; truncation says why."`
+	Truncation      []Truncation `json:"truncation" jsonschema:"Why the result is incomplete, empty when it is complete."`
+	NoData          bool         `json:"no_data" jsonschema:"True when Arc found nothing to read: a measurement that does not exist or has no data."`
+	ExecutionTimeMs float64      `json:"execution_time_ms" jsonschema:"Arc's execution time for the query, in milliseconds."`
 }
 
 // DatabaseInfo is one database in list_databases.
@@ -58,50 +52,55 @@ type DatabaseInfo struct {
 
 // DatabasesOutput is the structured result of list_databases.
 type DatabasesOutput struct {
-	Databases []DatabaseInfo `json:"databases"`
+	Databases []DatabaseInfo `json:"databases" jsonschema:"The databases this token can see."`
 	Count     int            `json:"count"`
 }
 
 // MeasurementsOutput is the structured result of list_measurements.
 type MeasurementsOutput struct {
 	Database     string   `json:"database"`
-	Measurements []string `json:"measurements"`
+	Measurements []string `json:"measurements" jsonschema:"The measurement (table) names in the database."`
 	Count        int      `json:"count"`
 }
 
-// ColumnInfo is one column in describe_measurement; Type is "" when Arc did
-// not report it.
+// ColumnInfo is one column in describe_measurement.
 type ColumnInfo struct {
 	Name string `json:"name"`
-	Type string `json:"type"`
+	Type string `json:"type" jsonschema:"The column's type, or empty when Arc did not report it."`
 }
 
-// StatsOutput is describe_measurement's statistics. A statistic that could
-// not be computed is null, with the reason in Errors under its name.
+// StatsOutput is describe_measurement's statistics.
 type StatsOutput struct {
-	RowCount *int64            `json:"row_count"`
-	Earliest *string           `json:"earliest"`
-	Latest   *string           `json:"latest"`
-	Errors   map[string]string `json:"errors,omitempty"`
+	RowCount *int64            `json:"row_count" jsonschema:"Rows in the measurement, or null when not computed (see errors)."`
+	Earliest *string           `json:"earliest" jsonschema:"Time of the earliest row, or null."`
+	Latest   *string           `json:"latest" jsonschema:"Time of the latest row, or null."`
+	Errors   map[string]string `json:"errors,omitempty" jsonschema:"Why a statistic is null, keyed by its name."`
 }
 
 // DescribeOutput is the structured result of describe_measurement.
 type DescribeOutput struct {
 	Database    string       `json:"database"`
 	Measurement string       `json:"measurement"`
-	Columns     []ColumnInfo `json:"columns"`
+	Columns     []ColumnInfo `json:"columns" jsonschema:"The columns shown, in order."`
+	Truncated   bool         `json:"truncated" jsonschema:"True when not every column fits the answer's size limit."`
 	Statistics  StatsOutput  `json:"statistics"`
 }
 
 // Output schemas. The listing tools can also answer with the scoped outcome
-// of #8 (ScopedResult), unchanged, so their schema is the union of both
-// shapes with nothing required.
+// of #8 (ScopedResult), unchanged, so their schema is either shape: anyOf,
+// each branch with its own required fields.
 var (
-	queryOutputSchema        = mustSchema[QueryOutput]()
-	describeOutputSchema     = mustSchema[DescribeOutput]()
-	databasesOutputSchema    = unionSchema(mustSchema[DatabasesOutput](), mustSchema[ScopedOutcome]())
-	measurementsOutputSchema = unionSchema(mustSchema[MeasurementsOutput](), mustSchema[ScopedOutcome]())
+	queryOutputSchema        = queryOutputSchemaFor()
+	describeOutputSchema     = nonNullArrays(mustSchema[DescribeOutput](), "columns")
+	databasesOutputSchema    = eitherSchema(nonNullArrays(mustSchema[DatabasesOutput](), "databases"), mustSchema[ScopedOutcome]())
+	measurementsOutputSchema = eitherSchema(nonNullArrays(mustSchema[MeasurementsOutput](), "measurements"), mustSchema[ScopedOutcome]())
 )
+
+func queryOutputSchemaFor() *jsonschema.Schema {
+	s := nonNullArrays(mustSchema[QueryOutput](), "columns", "rows", "truncation")
+	s.Properties["truncation"].Items.Properties["reason"].Enum = []any{"row_limit", "arc_row_cap", "size_budget", "stream_incomplete"}
+	return s
+}
 
 func mustSchema[T any]() *jsonschema.Schema {
 	s, err := jsonschema.For[T](nil)
@@ -111,25 +110,34 @@ func mustSchema[T any]() *jsonschema.Schema {
 	return s
 }
 
-// unionSchema is an object schema accepting the properties of a and b, with
-// none required.
-func unionSchema(a, b *jsonschema.Schema) *jsonschema.Schema {
-	u := &jsonschema.Schema{Type: "object", Properties: map[string]*jsonschema.Schema{}, AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}}}
-	for _, s := range []*jsonschema.Schema{a, b} {
-		for name, p := range s.Properties {
-			u.Properties[name] = p
+// nonNullArrays marks array properties the handlers always send (as [] when
+// empty) as plain arrays rather than the nullable arrays a Go slice infers.
+func nonNullArrays(s *jsonschema.Schema, names ...string) *jsonschema.Schema {
+	for _, n := range names {
+		if p := s.Properties[n]; p != nil {
+			p.Type, p.Types = "array", nil
 		}
 	}
-	return u
+	return s
+}
+
+// eitherSchema is an object schema matching a or b.
+func eitherSchema(a, b *jsonschema.Schema) *jsonschema.Schema {
+	return &jsonschema.Schema{Type: "object", AnyOf: []*jsonschema.Schema{a, b}}
 }
 
 // withStructured adds v as the result's structured content, marshalled here
-// so numbers stay exact (see the package comment above).
+// so numbers stay exact (see the package comment above). A value that does
+// not marshal (unreachable for Arc's decoded JSON) becomes an error result:
+// a success without structured content would break clients that check it.
 func withStructured(res *mcp.CallToolResult, v any) *mcp.CallToolResult {
 	b, err := json.Marshal(v)
 	if err != nil {
-		// Unreachable for these types; the text still carries the answer.
-		return res
+		log.Printf("structured output: %v", err)
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "Internal error: the result could not be encoded. See server logs."}},
+			IsError: true,
+		}
 	}
 	res.StructuredContent = json.RawMessage(b)
 	return res
@@ -148,37 +156,45 @@ func (n note) plain() string    { return strings.TrimSpace(n.headline + " " + n.
 // structured rows alike.
 const maxCellRunes = 512
 
-// renderResult renders a query result as markdown and as QueryOutput. When
-// maxChars > 0 the table stops at the last row that fits, and the structured
-// rows are the same rows, so text and structured content always describe
-// the same prefix of the result. noData is the text when Arc read nothing.
+// renderResult renders a query result as markdown and as QueryOutput.
+// When maxChars > 0, rows are added while both the table text and the
+// structured rows' JSON stay within the budget, so text and structured
+// content always describe the same prefix of the result and neither passes
+// the limit; a row too large to fit alone is not shown, and a note says so.
+// noData is the text when Arc read nothing.
 func renderResult(result *arc.QueryResponse, notes []note, noData string, maxChars int) (string, QueryOutput) {
-	out := QueryOutput{Columns: []string{}, Rows: [][]any{}, ExecutionTimeMs: result.ExecutionTimeMs}
-	if len(result.Columns) == 0 {
+	notes = append([]note(nil), notes...)
+	out := QueryOutput{Columns: []string{}, Rows: [][]any{}, Truncation: []Truncation{}, ExecutionTimeMs: result.ExecutionTimeMs}
+	if len(result.Columns) == 0 && len(notes) == 0 {
 		out.NoData = true
 		return noData, out
 	}
-	out.Columns = result.Columns
+	if result.Columns != nil {
+		out.Columns = result.Columns
+	}
 
 	var table strings.Builder
-	table.WriteString("| ")
-	for i, col := range result.Columns {
-		if i > 0 {
-			table.WriteString(" | ")
+	if len(out.Columns) > 0 {
+		table.WriteString("| ")
+		for i, col := range out.Columns {
+			if i > 0 {
+				table.WriteString(" | ")
+			}
+			table.WriteString(escapeMarkdownCell(col))
 		}
-		table.WriteString(escapeMarkdownCell(col))
+		table.WriteString(" |\n|")
+		for range out.Columns {
+			table.WriteString("---|")
+		}
+		table.WriteString("\n")
 	}
-	table.WriteString(" |\n|")
-	for range result.Columns {
-		table.WriteString("---|")
-	}
-	table.WriteString("\n")
 
 	// Room for the notes, the footer and a size note.
-	budget := maxChars - 600
+	budget := maxChars - min(600, maxChars/4)
 	for _, n := range notes {
 		budget -= len(n.markdown()) + 2
 	}
+	jsonSize := 0
 	shown := 0
 	for _, row := range result.Data {
 		var line strings.Builder
@@ -190,19 +206,21 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 			line.WriteString(escapeMarkdownCell(val))
 		}
 		line.WriteString(" |\n")
-		if maxChars > 0 && table.Len()+line.Len() > budget && shown > 0 {
+		srow := structuredRow(row)
+		b, _ := json.Marshal(srow)
+		if maxChars > 0 && (table.Len()+line.Len() > budget || jsonSize+len(b)+1 > budget) {
 			break
 		}
 		table.WriteString(line.String())
-		out.Rows = append(out.Rows, structuredRow(row))
+		out.Rows = append(out.Rows, srow)
+		jsonSize += len(b) + 1
 		shown++
 	}
-	if shown < len(result.Data) {
-		notes = append(notes, note{
-			reason:   "size_budget",
-			headline: fmt.Sprintf("Showing the first %s of %d: the answer reached its size limit.", plural(shown, "row"), len(result.Data)),
-			hint:     "Select fewer columns, or aggregate.",
-		})
+	switch {
+	case shown == 0 && len(result.Data) > 0:
+		notes = append(notes, note{"size_budget", "No rows shown: a single row is larger than the answer's size limit.", "Select fewer columns."})
+	case shown < len(result.Data):
+		notes = append(notes, note{"size_budget", fmt.Sprintf("Showing the first %s: the answer reached its size limit.", plural(shown, "row")), "Select fewer columns, or aggregate."})
 	}
 	out.RowCount = shown
 
@@ -210,8 +228,7 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 	for _, n := range notes {
 		sb.WriteString(n.markdown())
 		sb.WriteString("\n\n")
-		out.Notes = append(out.Notes, n.plain())
-		out.Truncation = append(out.Truncation, n.reason)
+		out.Truncation = append(out.Truncation, Truncation{Reason: n.reason, Message: n.plain()})
 	}
 	out.Truncated = len(notes) > 0
 	sb.WriteString(table.String())
@@ -223,17 +240,46 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 	return sb.String(), out
 }
 
-// structuredRow is a row for QueryOutput: values as Arc sent them, strings
-// cut at maxCellRunes like the text's cells.
+// structuredRow is a row for QueryOutput: values as Arc sent them, with a
+// string, or a nested value's JSON, longer than maxCellRunes cut with an
+// ellipsis, as the text's cells are.
 func structuredRow(row []any) []any {
 	out := make([]any, len(row))
 	for i, v := range row {
-		if s, ok := v.(string); ok {
-			if r := []rune(s); len(r) > maxCellRunes {
+		switch x := v.(type) {
+		case string:
+			if r := []rune(x); len(r) > maxCellRunes {
 				v = string(r[:maxCellRunes]) + "…"
+			}
+		case map[string]any, []any:
+			if b, err := json.Marshal(x); err == nil {
+				if r := []rune(string(b)); len(r) > maxCellRunes {
+					v = string(r[:maxCellRunes]) + "…"
+				}
 			}
 		}
 		out[i] = v
 	}
 	return out
+}
+
+// arcNotes are the notes for what Arc itself reported about a result: its
+// own row cap, and a stream it cut short. Both query and get_sample_data
+// add them.
+func arcNotes(result *arc.QueryResponse) []note {
+	var notes []note
+	if result.RowsCapped {
+		notes = append(notes, note{"arc_row_cap", fmt.Sprintf("Arc's row cap (%d) cut this result; more rows exist.", result.RowCap), "Aggregate or narrow the time range."})
+	}
+	if result.Truncated {
+		log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
+		if why := result.FixableTruncation(); why != "" {
+			// A failure the query itself causes (a bad cast on a later row,
+			// say) happens again on every retry: say what it is.
+			notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete:", why + " Fix the query; running it again fails the same way."})
+		} else {
+			notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete.", "Try again, or narrow the query."})
+		}
+	}
+	return notes
 }

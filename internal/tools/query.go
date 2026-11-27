@@ -87,19 +87,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 			}
 			notes = append(notes, note{"row_limit", fmt.Sprintf("Showing the first %s; the query returned more.", plural(maxRows, "row")), hint})
 		}
-		if result.RowsCapped {
-			notes = append(notes, note{"arc_row_cap", fmt.Sprintf("Arc's row cap (%d) cut this result; more rows exist.", result.RowCap), "Aggregate or narrow the time range."})
-		}
-		if result.Truncated {
-			log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
-			if why := result.FixableTruncation(); why != "" {
-				// A failure the query itself causes (a bad cast on a later
-				// row, say) happens again on every retry: say what it is.
-				notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete:", why + " Fix the query; running it again fails the same way."})
-			} else {
-				notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete.", "Try again, or narrow the query."})
-			}
-		}
+		notes = append(notes, arcNotes(result)...)
 		noData := fmt.Sprintf("No data: Arc found nothing to read for this query. A measurement that does not exist in database '%s', "+
 			"or has no data written yet, reads as empty (an aggregate over it returns nothing, not 0). Check the name with list_measurements.", args.Database)
 		text, structured := renderResult(result, notes, noData, maxResponseChars)
@@ -182,7 +170,7 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 		}
 
 		noData := fmt.Sprintf("No data: measurement '%s' does not exist in database '%s', or has no data written yet. Check the name with list_measurements.", args.Measurement, args.Database)
-		text, structured := renderResult(result, nil, noData, maxResponseChars)
+		text, structured := renderResult(result, arcNotes(result), noData, maxResponseChars)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
