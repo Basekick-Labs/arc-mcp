@@ -31,7 +31,7 @@ ARC_URL=http://localhost:8000 ARC_TOKEN_FILE=/path/to/token \
 |----------|-------------|---------|
 | `ARC_URL` | Arc instance URL | `http://localhost:8000` |
 | `ARC_TOKEN` | Arc API token | (none) |
-| `ARC_TOKEN_FILE` | File containing the Arc API token | (none) |
+| `ARC_TOKEN_FILE` | File containing the Arc API token (an empty file is refused) | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
 | `ARC_MCP_TOOLS` | Tool groups to serve: `data`, `ops` or `data,ops` (see [Operations tools](#operations-tools-opt-in)) | `data` |
 | `ARC_MCP_TIMEOUT` | Query timeout (`30s`, `2m`) | `30s` |
@@ -53,7 +53,7 @@ Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused a
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--arc-url` | Arc instance URL | `$ARC_URL` or `http://localhost:8000` |
-| `--arc-token` | Arc API token. Visible in the process list: prefer `ARC_TOKEN_FILE` | `$ARC_TOKEN` |
+| `--arc-token` | Arc API token. Visible in the process list: prefer `ARC_TOKEN_FILE`. Ignored when `ARC_TOKEN_FILE` or `ARC_TOKEN` is set | (none) |
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Size limit of an answer, in characters (minimum 4000). Applies to the text and to the structured rows alike, each stopping at a row boundary | `50000` |
@@ -113,17 +113,19 @@ arc-mcp --transport http --listen 0.0.0.0:8080
 Clients connect with the URL and the header. For Claude Code:
 
 ```bash
-claude mcp add --transport http arc http://host:8080/mcp --header "Authorization: Bearer $ARC_MCP_HTTP_TOKEN"
+claude mcp add --transport http arc http://host:8080/mcp --header 'Authorization: Bearer ${ARC_MCP_HTTP_TOKEN}'
 ```
 
-Clients configured with JSON that support remote servers take the URL and the header; Cursor's form is below (field names vary: Windsurf, for one, calls the URL `serverUrl`, so check your client's documentation):
+The single quotes keep the token out of Claude Code's config: it stores `${ARC_MCP_HTTP_TOKEN}` and reads the variable from its environment when it connects.
+
+Clients configured with JSON that support remote servers take the URL and the header. Cursor's form is below; it reads `${env:NAME}` from its environment. Field names vary (Windsurf calls the URL `serverUrl`), so check your client's documentation:
 
 ```json
 {
   "mcpServers": {
     "arc": {
       "url": "https://arc-mcp.example.com/mcp",
-      "headers": { "Authorization": "Bearer your-http-token" }
+      "headers": { "Authorization": "Bearer ${env:ARC_MCP_HTTP_TOKEN}" }
     }
   }
 }
@@ -172,25 +174,25 @@ See [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example
 
 The examples below run arc-mcp locally over **stdio**: the client starts it as a subprocess. For a shared, remote arc-mcp, see [Remote access over HTTP](#remote-access-over-http).
 
-Every example passes the Arc URL and the token **in the environment, not as arguments**: arguments show in the process list, and `ARC_TOKEN_FILE` keeps the token out of the client's config file too. Put a read-only token (see [Token hygiene](#token-hygiene)) in a file only you can read:
+Every example passes the Arc URL and the token **in the environment, not as arguments**: arguments show in the process list, and `ARC_TOKEN_FILE` keeps the token out of the client's config file too. Put a read-only token (see [Token hygiene](#token-hygiene)) in a file only you can read, without it passing through your shell history:
 
 ```bash
 mkdir -p ~/.config/arc-mcp
-printf '%s' 'your-read-token' > ~/.config/arc-mcp/token
-chmod 600 ~/.config/arc-mcp/token
+(umask 077; cat > ~/.config/arc-mcp/token)
+# paste the token, press Enter, then Ctrl-D
 ```
 
-Use absolute paths in the configs below (`/Users/you/...`, not `~`): clients start arc-mcp without a shell, so `~` is not expanded, and desktop apps may not see your shell's `PATH` either. `which arc-mcp` prints the path to put in `command`.
+Use absolute paths in the configs below (`/Users/you/...`, not `~`): clients start arc-mcp without a shell, so `~` is not expanded, and desktop apps may not see your shell's `PATH` either. `which arc-mcp` (`where arc-mcp` on Windows) prints the path to put in `command`; `go install` puts it in `$(go env GOPATH)/bin`, usually `~/go/bin`.
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows), then restart Claude Desktop:
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/.config/Claude/claude_desktop_config.json` (Linux), then restart Claude Desktop. On Windows, `command` ends in `arc-mcp.exe`, and each backslash in a path is written `\\` in JSON:
 
 ```json
 {
   "mcpServers": {
     "arc": {
-      "command": "/usr/local/bin/arc-mcp",
+      "command": "/Users/you/go/bin/arc-mcp",
       "env": {
         "ARC_URL": "http://localhost:8000",
         "ARC_TOKEN_FILE": "/Users/you/.config/arc-mcp/token"
@@ -207,24 +209,25 @@ Register it with `claude mcp add`:
 ```bash
 claude mcp add arc \
   -e ARC_URL=http://localhost:8000 \
-  -e ARC_TOKEN_FILE=$HOME/.config/arc-mcp/token \
-  -- arc-mcp
+  -e 'ARC_TOKEN_FILE=${HOME}/.config/arc-mcp/token' \
+  -- "$(which arc-mcp)"
 ```
 
-The default scope is local (this project, only you). `--scope user` makes it available in every project; `--scope project` writes it to the project's `.mcp.json`, to share with your team: commit that file with `ARC_TOKEN_FILE`, never a token. `claude mcp list` shows what is registered.
+The single quotes keep `${HOME}` unexpanded: Claude Code expands it when it starts arc-mcp, so the config holds no home directory of yours. The default scope is local (this project, only you). `--scope user` makes it available in every project; `--scope project` writes it to the project's `.mcp.json`, to share with your team: commit that file with `ARC_TOKEN_FILE`, never a token (and each teammate needs arc-mcp at the same path, or use plain `arc-mcp` if it is on everyone's `PATH`). `claude mcp list` shows what is registered.
 
 ### Cursor
 
-Add to `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for every project):
+Add to `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for every project). `${userHome}` keeps your home directory out of a file you may commit:
 
 ```json
 {
   "mcpServers": {
     "arc": {
-      "command": "/usr/local/bin/arc-mcp",
+      "type": "stdio",
+      "command": "${userHome}/go/bin/arc-mcp",
       "env": {
         "ARC_URL": "http://localhost:8000",
-        "ARC_TOKEN_FILE": "/Users/you/.config/arc-mcp/token"
+        "ARC_TOKEN_FILE": "${userHome}/.config/arc-mcp/token"
       }
     }
   }
@@ -233,13 +236,13 @@ Add to `.cursor/mcp.json` in your project root (or `~/.cursor/mcp.json` for ever
 
 ### Windsurf
 
-Add to `~/.codeium/windsurf/mcp_config.json`:
+Open the MCP config file from Cascade's MCP settings ("Open MCP config file"; `~/.codeium/windsurf/mcp_config.json` in many versions) and add:
 
 ```json
 {
   "mcpServers": {
     "arc": {
-      "command": "/usr/local/bin/arc-mcp",
+      "command": "/Users/you/go/bin/arc-mcp",
       "env": {
         "ARC_URL": "http://localhost:8000",
         "ARC_TOKEN_FILE": "/Users/you/.config/arc-mcp/token"
@@ -253,7 +256,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 
 A client on another machine connects to an arc-mcp running with `--transport http`, with the endpoint URL and an `Authorization` header: see [Remote access over HTTP](#remote-access-over-http) for the server and for Claude Code's and Cursor's remote configs.
 
-ChatGPT connects only to remote MCP servers (custom connectors), which it reaches from OpenAI's side over HTTPS, and authenticates them with OAuth or not at all. arc-mcp's endpoint takes a bearer token, which ChatGPT does not send, so ChatGPT is not supported yet (OAuth is tracked in [#2](https://github.com/basekick-labs/arc-mcp/issues/2)). Do not expose arc-mcp without authentication to make it work: anyone who finds the URL could query Arc.
+ChatGPT authenticates custom MCP servers (added under Plugins) with OAuth or not at all, never with a static bearer token, so it cannot use arc-mcp's HTTP endpoint; OAuth is tracked in [#2](https://github.com/basekick-labs/arc-mcp/issues/2). Do not expose arc-mcp without authentication to make it work: anyone who finds the URL could query Arc. OpenAI's Secure MCP Tunnel can instead run a stdio server inside your network; we have not tested it with arc-mcp.
 
 ### Any MCP-compatible client
 
