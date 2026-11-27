@@ -12,6 +12,9 @@ const (
 	GroupData = "data"
 	// GroupOps is the operations tools, arc_health and arc_metrics. Opt-in.
 	GroupOps = "ops"
+	// GroupEnterprise is arc_enterprise: Arc's licence, clustering and
+	// schedulers, all Enterprise features, read with any valid token. Opt-in.
+	GroupEnterprise = "enterprise"
 )
 
 // DefaultGroups is the value --tools has when nothing sets it.
@@ -19,12 +22,13 @@ const DefaultGroups = GroupData
 
 // Groups says which tool groups the server registers.
 type Groups struct {
-	Data bool
-	Ops  bool
+	Data       bool
+	Ops        bool
+	Enterprise bool
 }
 
 // String lists the enabled groups in registration order, as --tools takes
-// them: "data", "ops" or "data,ops".
+// them: "data", "ops", "data,ops", "data,ops,enterprise" and so on.
 func (g Groups) String() string {
 	var names []string
 	if g.Data {
@@ -32,6 +36,9 @@ func (g Groups) String() string {
 	}
 	if g.Ops {
 		names = append(names, GroupOps)
+	}
+	if g.Enterprise {
+		names = append(names, GroupEnterprise)
 	}
 	return strings.Join(names, ",")
 }
@@ -54,8 +61,10 @@ func ParseGroups(value string) (g Groups, blank bool, err error) {
 			g.Data = true
 		case GroupOps:
 			g.Ops = true
+		case GroupEnterprise:
+			g.Enterprise = true
 		default:
-			return Groups{}, false, fmt.Errorf("unknown tool group %q in --tools/ARC_MCP_TOOLS; the groups are %s and %s", strings.TrimSpace(item), GroupData, GroupOps)
+			return Groups{}, false, fmt.Errorf("unknown tool group %q in --tools/ARC_MCP_TOOLS; the groups are %s, %s and %s", strings.TrimSpace(item), GroupData, GroupOps, GroupEnterprise)
 		}
 		names++
 	}

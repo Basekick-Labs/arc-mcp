@@ -34,8 +34,9 @@ arc:
   maxRows: 500
   timeout: "30s"
   maxResponseSize: 50000
-  # Tool groups arc-mcp serves (ARC_MCP_TOOLS): data, and ops for Arc's
-  # health and metrics tools. A list: --set 'arc.tools={data,ops}'.
+  # Tool groups arc-mcp serves (ARC_MCP_TOOLS): data, ops for Arc's health
+  # and metrics tools, and enterprise for its licence, clustering and
+  # schedulers. A list: --set 'arc.tools={data,ops}'.
   tools:
     - data
 
