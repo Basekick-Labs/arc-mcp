@@ -76,9 +76,9 @@ func opsError(err error) error {
 	if errors.As(err, &apiErr) {
 		switch apiErr.Kind {
 		case arc.KindTimeout:
-			return errors.New("The Arc observability request timed out.")
+			return errors.New("arc observability request timed out")
 		case arc.KindForbidden:
-			return errors.New("Arc denied this observability request. Check the token permissions and server configuration.")
+			return errors.New("arc denied this observability request; check token permissions and server configuration")
 		}
 	}
 	return errors.New(arc.UserMessage(err))
@@ -137,7 +137,7 @@ func opsResult(body json.RawMessage, maxResponseChars int, timeseries bool) (*mc
 		body = compact.Bytes()
 		if len(body) > maxResponseChars {
 			if !timeseries {
-				return nil, nil, errors.New("Arc metrics response exceeds --max-response-size")
+				return nil, nil, errors.New("arc metrics response exceeds --max-response-size")
 			}
 			bounded, err := trimTimeSeries(body, maxResponseChars)
 			if err != nil {
@@ -157,11 +157,11 @@ func trimTimeSeries(body []byte, maxChars int) ([]byte, error) {
 	dec.UseNumber()
 	var payload map[string]any
 	if err := dec.Decode(&payload); err != nil {
-		return nil, errors.New("Arc returned a timeseries response that could not be bounded")
+		return nil, errors.New("arc returned a timeseries response that could not be bounded")
 	}
 	points, ok := payload["data"].([]any)
 	if !ok {
-		return nil, errors.New("Arc timeseries response exceeds --max-response-size and has no data array to trim")
+		return nil, errors.New("arc timeseries response exceeds --max-response-size and has no data array to trim")
 	}
 	lo, hi := 0, len(points)
 	for lo < hi {
@@ -185,7 +185,7 @@ func trimTimeSeries(body []byte, maxChars int) ([]byte, error) {
 		return nil, fmt.Errorf("encoding bounded Arc timeseries response: %w", err)
 	}
 	if len(encoded) > maxChars {
-		return nil, errors.New("Arc timeseries metadata exceeds --max-response-size")
+		return nil, errors.New("arc timeseries metadata exceeds --max-response-size")
 	}
 	return encoded, nil
 }

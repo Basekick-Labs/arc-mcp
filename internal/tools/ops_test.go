@@ -164,7 +164,7 @@ func TestRegisterOpsRejectsInvalidMetricsArgs(t *testing.T) {
 }
 
 func TestOpsTimeoutHonoursRequestContext(t *testing.T) {
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}))
 	defer slow.Close()
@@ -176,7 +176,7 @@ func TestOpsTimeoutHonoursRequestContext(t *testing.T) {
 	if !ok || apiErr.Kind != arc.KindTimeout {
 		t.Fatalf("error = %#v, want a timeout", err)
 	}
-	if got := opsError(err).Error(); got != "The Arc observability request timed out." {
+	if got := opsError(err).Error(); got != "arc observability request timed out" {
 		t.Errorf("timeout message = %q", got)
 	}
 }
