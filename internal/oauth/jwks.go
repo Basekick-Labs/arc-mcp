@@ -85,6 +85,9 @@ type keySet struct {
 	loaded    time.Time // last successful fetch; zero before the first
 	attempted time.Time // start of the last fetch; zero before the first
 	flight    *fetch    // the fetch in progress, if any
+	// withdrawn: kids a fetched set dropped (at most maxKeys). They are
+	// known to be gone, not unpublished yet: UnknownKey at once, no fetch.
+	withdrawn map[string]bool
 }
 
 type fetch struct {
@@ -107,6 +110,10 @@ func (s *keySet) lookup(ctx context.Context, kid string) (key, error) {
 		}
 		s.mu.Unlock()
 		return k, nil
+	}
+	if s.withdrawn[kid] && current {
+		s.mu.Unlock()
+		return key{}, refuse(ReasonUnknownKey)
 	}
 	joined := s.flight != nil
 	if (!joined && cooling) || (joined && s.flight.waiters >= maxWaiters) {
@@ -136,7 +143,7 @@ func (s *keySet) lookup(ctx context.Context, kid string) (key, error) {
 	if k, ok := s.keys[kid]; ok {
 		return k, nil
 	}
-	if joined { // the fetch began before this lookup, maybe before its key existed
+	if joined && !s.withdrawn[kid] { // the fetch began before this lookup, maybe before its key existed
 		return key{}, s.unavailableLocked(s.now(), true)
 	}
 	return key{}, refuse(ReasonUnknownKey)
@@ -184,6 +191,7 @@ func (s *keySet) startLocked() {
 		keys, err := s.get()
 		s.mu.Lock()
 		if err == nil {
+			s.withdrawn = withdrawnKids(s.withdrawn, s.keys, keys)
 			s.keys, s.loaded = keys, s.now()
 		}
 		f.err = err
@@ -191,6 +199,24 @@ func (s *keySet) startLocked() {
 		s.mu.Unlock()
 		close(f.done)
 	}()
+}
+
+// withdrawnKids is what next lacks of the old set and of the kids already
+// withdrawn, at most maxKeys.
+func withdrawnKids(prev map[string]bool, old, next map[string]key) map[string]bool {
+	w := map[string]bool{}
+	add := func(kid string) {
+		if _, ok := next[kid]; !ok && len(w) < maxKeys {
+			w[kid] = true
+		}
+	}
+	for kid := range old {
+		add(kid)
+	}
+	for kid := range prev {
+		add(kid)
+	}
+	return w
 }
 
 // fetchError is a key set fetch failure with a fixed cause.
@@ -268,23 +294,24 @@ func (r *rawKey) private() bool {
 // parseKeySet keeps the keys that can verify a signature: kty RSA (at least
 // 2048 bits), EC or OKP Ed25519, with use absent or "sig", key_ops absent or
 // holding "verify", a kid, and an alg (if any) on the allowlist. Every other
-// key is ignored, as are both keys of a duplicated kid. A set that parses is
-// authoritative even with no usable key: it replaces the old one, so
-// publishing {"keys":[]} withdraws every key. A failure keeps the old set
-// (until maxKeyAge).
+// key is ignored, as are both keys of a duplicated kid. A JWK set (an object
+// with a keys array, RFC 7517 §5) is authoritative even with no usable key:
+// it replaces the old one, so {"keys":[]} withdraws every key. Anything else
+// ({}, null, {"keys":null}, an error object) is a failure, which keeps the
+// old set until maxKeyAge.
 func parseKeySet(body []byte) (map[string]key, error) {
 	var set struct {
-		Keys []josejson.RawMessage `json:"keys"`
+		Keys *[]josejson.RawMessage `json:"keys"`
 	}
-	if josejson.Unmarshal(body, &set) != nil {
+	if josejson.Unmarshal(body, &set) != nil || set.Keys == nil {
 		return nil, fetchError("response is not a JWK set")
 	}
-	if len(set.Keys) > maxKeys {
+	if len(*set.Keys) > maxKeys {
 		return nil, fetchError("more than 64 keys")
 	}
 	keys := map[string]key{}
 	dup := map[string]bool{}
-	for _, raw := range set.Keys {
+	for _, raw := range *set.Keys {
 		k, kid, ok := parseKey(raw)
 		if !ok {
 			continue

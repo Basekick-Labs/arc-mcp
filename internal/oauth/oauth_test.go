@@ -172,6 +172,34 @@ func (r *rig) waiters() int {
 	return r.v.keys.flight.waiters
 }
 
+// waitUntil polls cond, failing the test after 5 s.
+func (r *rig) waitUntil(t testing.TB, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no %s after 5 s (fetches: %d)", what, r.idp.hits.Load())
+		}
+	}
+}
+
+// checkWithdrawn: a withdrawn kid gets 401 at once, again and again, without
+// a fetch, also after a later fetch of a set that still lacks it.
+func (r *rig) checkWithdrawn(t *testing.T, tok string) {
+	t.Helper()
+	for i := range 4 {
+		if i == 2 {
+			r.clk.add(refetchCooldown)
+			_ = r.v.Refresh(context.Background())
+		}
+		hits := r.idp.hits.Load()
+		_, err := r.verify(tok)
+		checkRefusal(t, err, ReasonUnknownKey)
+		if r.idp.hits.Load() != hits {
+			t.Fatal("a withdrawn kid fetched the key set")
+		}
+	}
+}
+
 // waitFlight waits for a background fetch to finish.
 func (r *rig) waitFlight() {
 	r.v.keys.mu.Lock()
@@ -430,30 +458,22 @@ func TestLookupsShareOneFetch(t *testing.T) {
 	absent := sign(t, ecKey, jose.ES256, "absent", "at+jwt", payload(start))
 	done, late := make(chan error, 1), make(chan error, 1)
 	go func() { _, err := r.verify(tok); done <- err }()
-	for r.idp.hits.Load() == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	r.waitUntil(t, "fetch", func() bool { return r.idp.hits.Load() > 0 })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := r.v.Verify(ctx, tok)
 	checkRefusal(t, err, ReasonKeyFetchFailed)
 	go func() { _, err := r.verify(absent); late <- err }()
-	for r.waiters() < 2 {
-		time.Sleep(time.Millisecond)
+	r.waitUntil(t, "second waiter or second fetch", func() bool { return r.waiters() >= 2 || r.idp.hits.Load() > 1 })
+	if n := r.idp.hits.Load(); n != 1 {
+		t.Fatalf("fetches before release = %d, want 1", n)
 	}
-	r.v.keys.mu.Lock()
-	f := r.v.keys.flight
-	r.v.keys.mu.Unlock()
 	release()
 	if err := <-done; err != nil {
 		t.Fatalf("the waiting lookup: %v", err)
 	}
 	// It joined a fetch begun before it, so the set may predate its key: 503.
 	checkRefusal(t, <-late, ReasonKeyCooldown)
-	<-f.done
-	if n := r.idp.hits.Load(); n != 1 {
-		t.Fatalf("fetches = %d, want 1", n)
-	}
 }
 
 // Past maxWaiters, a lookup that would wait on a stalled fetch is refused at
@@ -466,9 +486,7 @@ func TestWaitersCapped(t *testing.T) {
 	for range maxWaiters {
 		go func() { _, err := r.verify(tok); errs <- err }()
 	}
-	for r.waiters() < maxWaiters {
-		time.Sleep(time.Millisecond)
-	}
+	r.waitUntil(t, "64 waiters", func() bool { return r.waiters() >= maxWaiters })
 	over := make(chan error, 1)
 	go func() { _, err := r.verify(tok); over <- err }()
 	select {
@@ -533,14 +551,32 @@ func TestUnusableSetWithdrawsKeys(t *testing.T) {
 			}
 			r.idp.serve(t, keys...)
 			r.clk.add(refetchCooldown)
-			if err := r.v.Refresh(context.Background()); err == nil {
-				t.Fatal("Refresh did not report a set with no usable key")
+			if err := r.v.Refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "no usable signing key") {
+				t.Fatalf("Refresh = %v", err)
 			}
-			_, err := r.verify(tok)
-			checkRefusal(t, err, ReasonKeyCooldown)
+			r.checkWithdrawn(t, tok)
+		})
+	}
+}
+
+// Only a JWK set is authoritative: a 200 without a keys array is a failed
+// fetch, and the last set stays.
+func TestNotAJWKSetKeepsKeys(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"keys":null}`, `{"error":"temporarily unavailable"}`} {
+		t.Run(body, func(t *testing.T) {
+			r := newRig(t, Config{})
+			tok := sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(start))
+			if _, err := r.verify(tok); err != nil {
+				t.Fatal(err)
+			}
+			r.idp.body.Store([]byte(body))
 			r.clk.add(refetchCooldown)
-			_, err = r.verify(tok)
-			checkRefusal(t, err, ReasonUnknownKey)
+			if err := r.v.Refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "not a JWK set") {
+				t.Fatalf("Refresh = %v", err)
+			}
+			if _, err := r.verify(tok); err != nil {
+				t.Fatalf("the last set was dropped: %v", err)
+			}
 		})
 	}
 }
@@ -593,11 +629,7 @@ func TestRefreshDropsWithdrawnKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.waitFlight()
-	_, err := r.verify(ec)
-	checkRefusal(t, err, ReasonKeyCooldown)
-	r.clk.add(refetchCooldown)
-	_, err = r.verify(ec)
-	checkRefusal(t, err, ReasonUnknownKey)
+	r.checkWithdrawn(t, ec)
 }
 
 func TestKeySetFetchFailures(t *testing.T) {
