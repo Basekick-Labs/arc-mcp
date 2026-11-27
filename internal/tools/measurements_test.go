@@ -116,6 +116,22 @@ func TestDescribe_StaleLatestFallsBack(t *testing.T) {
 	}
 }
 
+// At or above the gate the full statement is the only one: its max(time) is
+// already unbounded, so a null Latest there is final, not stale.
+func TestDescribe_FullStatementHasNoFallback(t *testing.T) {
+	fake := &fakeArc{reply: func(sql string) (int, string) {
+		if strings.HasPrefix(sql, "DESCRIBE") {
+			return 200, describeBodyMs(400)
+		}
+		return 200, statsRowBody(`5`, `null`, `null`)
+	}}
+	text := describeCPU(t, fake, 5*time.Second)
+	wantSent(t, fake, "DESCRIBE SELECT * FROM cpu", fullStatsSQL)
+	if want := statsBlock("5", "<nil>", "<nil>"); !strings.HasSuffix(text, want) {
+		t.Errorf("want suffix %q\ngot:\n%s", want, text)
+	}
+}
+
 // Files with no rows: count 0 and null times, as the full statement gives,
 // and no second statement.
 func TestDescribe_ZeroRowsNoFallback(t *testing.T) {
