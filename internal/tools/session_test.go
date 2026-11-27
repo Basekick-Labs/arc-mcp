@@ -23,8 +23,13 @@ func newSessionTimeout(t *testing.T, arcHandler http.Handler, timeout time.Durat
 	t.Helper()
 	arcSrv := httptest.NewServer(arcHandler)
 	t.Cleanup(arcSrv.Close)
+	return newSessionClient(t, arc.NewClient(arcSrv.URL, "tok", timeout), register)
+}
 
-	client := arc.NewClient(arcSrv.URL, "tok", timeout)
+// newSessionClient registers tools against client and returns a client
+// session over a real in-memory MCP transport.
+func newSessionClient(t *testing.T, client *arc.Client, register func(*mcp.Server, *arc.Client)) *mcp.ClientSession {
+	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp-test", Version: "test"}, nil)
 	register(server, client)
 

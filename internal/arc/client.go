@@ -26,8 +26,9 @@ type Error struct {
 	// Message is text safe to show the model, set where it can act on it:
 	// Arc's fixed validation message for a refused request (HTTP 400), its
 	// governance reason for a refused query (HTTP 429), the fixable part of
-	// a failed query (redacted, see queryErrorText), or a fixed hint for a
-	// query that ran out of memory, timed out or lost data mid-run. Empty
+	// a failed query (redacted, see queryErrorText), a fixed hint for a
+	// query that ran out of memory, timed out or lost data mid-run, or the
+	// whole answer for a listing request that timed out (KindTimeout). Empty
 	// otherwise; UserMessage then gives the generic text.
 	Message string
 }
@@ -214,10 +215,11 @@ func Scoped(err error) bool {
 }
 
 // UserMessage returns a short, safe error message suitable for the LLM.
-// It never leaks internal detail (stack traces, paths, Arc query context).
+// It never leaks internal detail (stack traces, paths, Arc query context,
+// Arc's URL).
 func UserMessage(err error) string {
 	var ae *Error
-	if ae, _ = err.(*Error); ae != nil { //nolint:errorlint
+	if errors.As(err, &ae) && ae != nil {
 		switch ae.Kind {
 		case KindAuth:
 			return "Arc rejected the token — it is missing, invalid or expired. Ask the user to check the token configured for this Arc server."
@@ -239,6 +241,9 @@ func UserMessage(err error) string {
 			}
 			return "Arc rejected the query — check the SQL syntax."
 		case KindTimeout:
+			if ae.Message != "" {
+				return ae.Message
+			}
 			return "The query failed: " + timedOutHint
 		case KindNetwork:
 			return "Arc could not be reached. Ask the user to check that the Arc server is running at the configured URL."
@@ -255,7 +260,10 @@ func UserMessage(err error) string {
 			return "Arc returned an error — see server logs for details."
 		}
 	}
-	return fmt.Sprintf("Arc error: %v", err)
+	// Not classified by the client. Its text is never shown: a Go HTTP
+	// error carries the request URL, and so Arc's address.
+	log.Printf("arc error: %v", err)
+	return "Arc returned an error — see server logs for details."
 }
 
 // maxArcResponseBytes caps how much we read from Arc in a single response to
@@ -396,13 +404,13 @@ func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/databases", nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: creating the request: %v", err))
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("listing databases: %w", err)
+		return nil, listingTransportError("list databases", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -414,7 +422,7 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 
 	var result DatabaseListResponse
 	if err := json.NewDecoder(body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		return nil, loggedError(KindParse, fmt.Sprintf("list databases: decoding response: %v", err))
 	}
 	return &result, nil
 }
@@ -423,17 +431,17 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 func (c *Client) ListMeasurements(ctx context.Context, database string) (*MeasurementListResponse, error) {
 	measurementsURL, err := c.buildURL("api", "v1", "databases", database, "measurements")
 	if err != nil {
-		return nil, fmt.Errorf("building measurements URL: %w", err)
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: building the URL: %v", err))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, measurementsURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: creating the request: %v", err))
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("listing measurements: %w", err)
+		return nil, listingTransportError("list measurements", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -445,9 +453,32 @@ func (c *Client) ListMeasurements(ctx context.Context, database string) (*Measur
 
 	var result MeasurementListResponse
 	if err := json.NewDecoder(body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		return nil, loggedError(KindParse, fmt.Sprintf("list measurements: decoding response: %v", err))
 	}
 	return &result, nil
+}
+
+// listingTimedOutText is the answer for a listing request arc-mcp gave up on.
+// The query's own timeout text advises changing the SQL, which does not
+// apply to a listing.
+const listingTimedOutText = "Arc did not answer within arc-mcp's --timeout. Ask the user to check that the Arc server is running and not overloaded, then try again."
+
+// listingTransportError is transportError for the database and measurement
+// listings, with their own timeout text.
+func listingTransportError(op string, err error) *Error {
+	e := transportError(op, err)
+	if e.Kind == KindTimeout {
+		e.Message = listingTimedOutText
+	}
+	return e
+}
+
+// loggedError logs detail, as every other client error is logged, and
+// returns it as an *Error of kind, so that its text (which can carry Arc's
+// URL) reaches the model only through UserMessage.
+func loggedError(kind, detail string) *Error {
+	log.Printf("arc error: %s", detail)
+	return &Error{Kind: kind, Detail: detail}
 }
 
 // buildURL safely composes the request URL by appending escaped path segments
@@ -486,7 +517,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/query", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, loggedError(KindNetwork, fmt.Sprintf("query: creating the request: %v", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-arc-database", database)
@@ -494,14 +525,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		// Never the raw error to the model: it carries Arc's URL.
-		detail := fmt.Sprintf("query: %v", err)
-		log.Printf("arc error: %s", detail)
-		var ue *url.Error
-		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ue) && ue.Timeout() {
-			return nil, &Error{Kind: KindTimeout, Detail: detail}
-		}
-		return nil, &Error{Kind: KindNetwork, Detail: detail}
+		return nil, transportError("query", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -530,6 +554,20 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 		return nil, &Error{Kind: KindQuery, Detail: detail, Message: queryErrorText(result.Error)}
 	}
 	return &result, nil
+}
+
+// transportError classifies a request that got no answer from Arc: arc-mcp's
+// own --timeout, or anything else that kept the request from reaching Arc.
+// The raw error carries Arc's URL, so it goes to the log only, never to the
+// model.
+func transportError(op string, err error) *Error {
+	detail := fmt.Sprintf("%s: %v", op, err)
+	log.Printf("arc error: %s", detail)
+	var ue *url.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ue) && ue.Timeout() {
+		return &Error{Kind: KindTimeout, Detail: detail}
+	}
+	return &Error{Kind: KindNetwork, Detail: detail}
 }
 
 func (c *Client) setAuth(req *http.Request) {
