@@ -114,6 +114,40 @@ func TestHTTPSession(t *testing.T) {
 	}
 }
 
+// The Enterprise group over HTTP: its tool is listed next to the data
+// tools and answers through the session.
+func TestHTTPSessionEnterprise(t *testing.T) {
+	arcSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/v1/cluster/health" || r.Header.Get("Authorization") != "Bearer arc-token" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"healthy":3,"unhealthy":0,"total":3,"health_checker":{"running":true}}`)
+	}))
+	t.Cleanup(arcSrv.Close)
+	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp", Version: "test"}, nil)
+	tools.RegisterAll(server, arc.NewClient(arcSrv.URL, "arc-token", 5*time.Second), tools.Groups{Data: true, Enterprise: true}, 500, 50_000)
+	srv := httptest.NewServer(Handler(server, Options{Verify: StaticToken(secret)}))
+	t.Cleanup(srv.Close)
+	cs, err := connect(t, srv, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := cs.ListTools(t.Context(), nil)
+	if err != nil || len(list.Tools) != 6 || list.Tools[0].Name != "arc_enterprise" {
+		t.Fatalf("tools over HTTP: %v %v", list, err)
+	}
+	res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{Name: "arc_enterprise", Arguments: map[string]any{"view": "cluster_health"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if res.IsError || !strings.HasPrefix(text, `{"view":"cluster_health","state":"active","data":{`) || res.StructuredContent == nil {
+		t.Errorf("isError=%v text=%q", res.IsError, text)
+	}
+}
+
 func TestBearerRequired(t *testing.T) {
 	srv := endpoint(t, Options{Verify: StaticToken(secret)})
 	for name, token := range map[string]string{"none": "", "wrong": "nope", "prefix": secret[:5], "longer": secret + "x"} {

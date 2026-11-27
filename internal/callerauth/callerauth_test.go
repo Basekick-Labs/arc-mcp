@@ -26,11 +26,12 @@ import (
 // a query answers with the token it was sent, as its one value, so a test
 // can see which token reached Arc for which caller.
 type fakeArc struct {
-	mu       sync.Mutex
-	tokens   map[string]int64
-	perms    map[string][]string
-	verifies atomic.Int32
-	queries  atomic.Int32
+	mu         sync.Mutex
+	tokens     map[string]int64
+	perms      map[string][]string
+	verifies   atomic.Int32
+	queries    atomic.Int32
+	enterprise atomic.Int32
 	// verifyStatus, when set, is every verify call's answer.
 	verifyStatus int
 	verifyGate   chan struct{}
@@ -64,6 +65,14 @@ func (f *fakeArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(b)
 		return
 	}
+	if r.URL.Path == "/api/v1/cluster" {
+		// arc_enterprise: a standalone Arc's answer, its reason naming the
+		// token that reached it.
+		f.enterprise.Add(1)
+		b, _ := json.Marshal(map[string]any{"enabled": false, "mode": "standalone", "reason": "seen:" + token})
+		_, _ = w.Write(b)
+		return
+	}
 	f.queries.Add(1)
 	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -90,7 +99,7 @@ func setup(t *testing.T, fake *fakeArc) (*Verifier, *httptest.Server) {
 	v := New(client)
 	client.EnablePassthrough(v.Forget)
 	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp", Version: "test"}, nil)
-	tools.RegisterAll(server, client, tools.Groups{Data: true}, 500, 50_000)
+	tools.RegisterAll(server, client, tools.Groups{Data: true, Enterprise: true}, 500, 50_000)
 	server.AddReceivingMiddleware(Middleware)
 	srv := httptest.NewServer(httpserve.Handler(server, httpserve.Options{Verify: v.Verify, MaxConcurrent: 8}))
 	t.Cleanup(srv.Close)
@@ -101,7 +110,13 @@ func setup(t *testing.T, fake *fakeArc) (*Verifier, *httptest.Server) {
 // the body.
 func call(t *testing.T, srv *httptest.Server, token string) (int, string) {
 	t.Helper()
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"database":"db","sql":"SELECT token FROM t"}}}`
+	return callTool(t, srv, token, `{"name":"query","arguments":{"database":"db","sql":"SELECT token FROM t"}}`)
+}
+
+// callTool posts one tools/call with params and token.
+func callTool(t *testing.T, srv *httptest.Server, token, params string) (int, string) {
+	t.Helper()
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":` + params + `}`
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+httpserve.Path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +162,33 @@ func TestEachCallerQueriesWithItsOwnToken(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+// arc_enterprise in passthrough: each caller's read reaches Arc with that
+// caller's token, and a caller without a valid one never reaches it.
+func TestEnterpriseReadsWithEachCallersToken(t *testing.T) {
+	fake := &fakeArc{tokens: map[string]int64{}}
+	for i := 0; i < 4; i++ {
+		fake.tokens[fmt.Sprintf("tok-%d", i)] = int64(i + 1)
+	}
+	_, srv := setup(t, fake)
+	params := `{"name":"arc_enterprise","arguments":{"view":"cluster"}}`
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(tok string) {
+			defer wg.Done()
+			status, body := callTool(t, srv, tok, params)
+			if status != 200 || !strings.Contains(body, `seen:`+tok+`\"`) || !strings.Contains(body, `not_enabled`) {
+				t.Errorf("%s: %d %s", tok, status, body)
+			}
+		}(fmt.Sprintf("tok-%d", i))
+	}
+	wg.Wait()
+	before := fake.enterprise.Load()
+	if status, _ := callTool(t, srv, "bad", params); status != http.StatusUnauthorized || fake.enterprise.Load() != before {
+		t.Errorf("a bad token: status %d, %d reads reached Arc", status, fake.enterprise.Load()-before)
+	}
 }
 
 func TestNoOrBadTokenNeverReachesArc(t *testing.T) {
