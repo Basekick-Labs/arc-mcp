@@ -94,7 +94,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		Name:        "describe_measurement",
 		Title:       "Describe a measurement",
 		Annotations: readOnly("Describe a measurement"),
-		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics scan the whole measurement.",
+		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics read every file's metadata and may scan the time column; a statistic that cannot be computed in time says so.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
@@ -124,7 +124,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			}, nil, nil
 		}
 
-		columns, err := describeColumns(ctx, client, args.Database, args.Measurement)
+		columns, describeMs, err := describeColumns(ctx, client, args.Database, args.Measurement)
 		if err != nil {
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
@@ -146,9 +146,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			}, nil, nil
 		}
 
-		// Safe to interpolate: ValidateIdentifier ensured args.Measurement is [A-Za-z_][A-Za-z0-9_]*.
-		statsSQL := fmt.Sprintf("SELECT count(*) as row_count, min(time) as earliest, max(time) as latest FROM %s", args.Measurement)
-		statsResult, err := client.Query(ctx, args.Database, statsSQL)
+		stats := measurementStats(ctx, client, args.Database, args.Measurement, describeMs)
 
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "## Measurement: %s.%s\n\n", args.Database, args.Measurement)
@@ -158,13 +156,9 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			fmt.Fprintf(&sb, "| %s | %s |\n", escapeMarkdownCell(c.name), escapeMarkdownCell(c.typ))
 		}
 
-		// Stats
-		if err == nil && len(statsResult.Data) > 0 && len(statsResult.Data[0]) >= 3 {
-			row := statsResult.Data[0]
-			sb.WriteString("\n### Statistics\n\n")
-			fmt.Fprintf(&sb, "- **Row count:** %v\n", row[0])
-			fmt.Fprintf(&sb, "- **Earliest:** %v\n", row[1])
-			fmt.Fprintf(&sb, "- **Latest:** %v\n", row[2])
+		sb.WriteString("\n### Statistics\n\n")
+		for i, label := range statLabels {
+			fmt.Fprintf(&sb, "- **%s:** %s\n", label, stats[i])
 		}
 
 		text := sb.String()
@@ -178,6 +172,106 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			},
 		}, nil, nil
 	})
+}
+
+// statLabels are the lines of the Statistics block, in the order of the
+// values measurementStats returns.
+var statLabels = [3]string{"Row count", "Earliest", "Latest"}
+
+// statsGateMs is the DESCRIBE time, as Arc reports it (execution_time_ms),
+// at or above which measurementStats sends the single full statement rather
+// than the three-part one. DESCRIBE reads every file's footer, and each part
+// of the three-part statement reads them again, so the gate sorts by file
+// count, not by rows per file. On measurements of large compacted files the
+// parts skip most of the data and win (150M rows in 876 files: DESCRIBE
+// 37-49 ms, 0.18 s against 0.49-0.53 s for the full scan); from about 1.4k
+// files of up to 50k rows (DESCRIBE 59 ms and up) three footer passes cost
+// more than one scan. 55 sits in that measured gap, on Arc main and v26.09.4,
+// local storage (arc-mcp#28). Below it the three-part statement can still
+// lose on many small files, by at most about three DESCRIBE times.
+const statsGateMs = 55
+
+// statsLatestWindow bounds the Latest part of the three-part statement. The
+// bound is a subquery on purpose, not get_sample_data's top-level
+// "time > now() - INTERVAL" (sampleWindows): Arc does not prune partitions by
+// a subquery, so rows stamped in the future still count. Released Arc
+// (v26.09.4) prunes the plain form up to now+24h only and would report an
+// older Latest. DuckDB's own row-group statistics keep it cheap.
+const statsLatestWindow = "(SELECT now() - INTERVAL '30 days')"
+
+// measurementStats returns the values of the Row count, Earliest and Latest
+// lines: each as Arc rendered it, or "not computed" with the reason.
+//
+// Below statsGateMs it sends one statement whose parts are each cheap on a
+// measurement with few files: count(*) (answered from file metadata), the
+// first row by time (DuckDB skips row groups that cannot hold an earlier one)
+// and the newest row of the last 30 days. Only when that window is empty and
+// the measurement has rows does it send a second statement for the Latest:
+// max(time) over everything, the scan today's statement pays. At or above
+// the gate it sends the single full statement. Every value is exact either
+// way and rendered as Arc sent it, so a computed block reads as it always
+// has.
+//
+// All statements share one deadline, arc-mcp's --timeout from the start of
+// the statistics: a describe takes at most one --timeout more than its
+// DESCRIBE. A statement that fails (timed out, refused by Arc's governance,
+// a query error) marks its lines "not computed" with the reason, and nothing
+// further is sent.
+func measurementStats(ctx context.Context, client *arc.Client, database, measurement string, describeMs float64) [3]string {
+	if t := client.Timeout(); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+	}
+	var out [3]string
+	// Safe to interpolate: the caller validated measurement with ValidateIdentifier.
+	sql := fmt.Sprintf("SELECT count(*) as row_count, min(time) as earliest, max(time) as latest FROM %s", measurement)
+	if describeMs < statsGateMs {
+		sql = fmt.Sprintf("SELECT (SELECT count(*) FROM %[1]s) AS row_count, (SELECT time FROM %[1]s ORDER BY time LIMIT 1) AS earliest, "+
+			"(SELECT max(time) FROM %[1]s WHERE time > %[2]s) AS latest", measurement, statsLatestWindow)
+	}
+	row, err := statsRow(ctx, client, database, sql, 3)
+	for i := range out {
+		out[i] = statValue(client, row, i, err)
+	}
+	// An aggregate over an empty window still returns its row, with a null:
+	// test the value. A count of 0 leaves the Latest null, as the full
+	// statement does.
+	if err != nil || describeMs >= statsGateMs || row[2] != nil || fmt.Sprintf("%v", row[0]) == "0" {
+		return out
+	}
+	row, err = statsRow(ctx, client, database, fmt.Sprintf("SELECT max(time) AS latest FROM %s", measurement), 1)
+	out[2] = statValue(client, row, 0, err)
+	return out
+}
+
+// statsRow runs one statistics statement and returns its first row, which
+// must have at least n values.
+func statsRow(ctx context.Context, client *arc.Client, database, sql string, n int) ([]any, error) {
+	r, err := client.Query(ctx, database, sql)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.Data) == 0 || len(r.Data[0]) < n {
+		return nil, &arc.Error{Kind: arc.KindParse, Detail: fmt.Sprintf("statistics: %d rows, want one with %d values", len(r.Data), n)}
+	}
+	return r.Data[0], nil
+}
+
+// statValue renders value i of row, or, when err is set, why it is missing.
+// A timeout gets its own text: the query tool's hint (aggregate, narrow the
+// time range) is advice the model cannot apply to describe.
+func statValue(client *arc.Client, row []any, i int, err error) string {
+	var ae *arc.Error
+	switch {
+	case errors.As(err, &ae) && ae.Kind == arc.KindTimeout:
+		return fmt.Sprintf("not computed (timed out after %s)", client.Timeout())
+	case ae != nil && ae.Status == http.StatusGatewayTimeout:
+		return "not computed (Arc timed out)"
+	case err != nil:
+		return "not computed: " + arc.UserMessage(err)
+	}
+	return fmt.Sprintf("%v", row[i])
 }
 
 // unknownType stands in for a column type Arc did not report.
@@ -198,8 +292,11 @@ type column struct {
 // failure (auth, a timeout, a broken file, Arc unreachable) is returned as
 // is: a second query would fail the same way and double the wait.
 //
-// No columns and no error means Arc found no data for the measurement.
-func describeColumns(ctx context.Context, client *arc.Client, database, measurement string) ([]column, error) {
+// No columns and no error means Arc found no data for the measurement. The
+// float is the time Arc reports for the statement that answered
+// (execution_time_ms; whole milliseconds, 0 when absent), which
+// measurementStats gates on.
+func describeColumns(ctx context.Context, client *arc.Client, database, measurement string) ([]column, float64, error) {
 	// Safe to interpolate: the caller validated measurement with ValidateIdentifier.
 	desc, err := client.Query(ctx, database, fmt.Sprintf("DESCRIBE SELECT * FROM %s", measurement))
 	if err == nil {
@@ -215,22 +312,22 @@ func describeColumns(ctx context.Context, client *arc.Client, database, measurem
 			}
 			cols = append(cols, c)
 		}
-		return cols, nil
+		return cols, desc.ExecutionTimeMs, nil
 	}
 	if !describeRefused(err) {
-		return nil, err
+		return nil, 0, err
 	}
 	log.Printf("describe_measurement: DESCRIBE SELECT refused (%v); falling back to column names only", err)
 
 	names, err := client.Query(ctx, database, fmt.Sprintf("SELECT * FROM %s LIMIT 0", measurement))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	cols := make([]column, len(names.Columns))
 	for i, n := range names.Columns {
 		cols[i] = column{name: n, typ: unknownType}
 	}
-	return cols, nil
+	return cols, names.ExecutionTimeMs, nil
 }
 
 // describeRefused reports whether Arc refused the DESCRIBE statement itself,

@@ -208,7 +208,10 @@ scoped result, naming the database it was refused for.
 
 ### describe_measurement
 
-Get column names, types, row count, and time range for a measurement.
+Get column names, types, row count, and time range for a measurement. The
+statistics are exact; together they get one `--timeout`, and one that runs out
+of time or that Arc refuses (a rate limit or quota) is shown as not computed,
+with the reason.
 
 **Example prompt:** "Describe the schema of the cpu measurement in the telemetry database"
 
