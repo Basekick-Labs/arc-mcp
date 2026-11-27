@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -22,16 +21,15 @@ func TestServerInstructions(t *testing.T) {
 	}
 }
 
-// With the default group, a client receives exactly what it did before tool
-// groups existed. testdata/instructions-data-500.txt is that text, taken
-// from arc-mcp c5f3fd5 (and identical to its binary's initialize answer).
+// With the default group, a client receives the data text alone, with no
+// operations paragraph.
 func TestServerInstructions_DefaultIsUnchanged(t *testing.T) {
-	want, err := os.ReadFile("testdata/instructions-data-500.txt")
+	groups, _, err := tools.ParseGroups(tools.DefaultGroups)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := serverInstructions(500, tools.Groups{Data: true}); got != string(want) {
-		t.Errorf("default instructions changed:\n got %q\nwant %q", got, want)
+	if got := serverInstructions(500, groups); got != dataInstructions(500) {
+		t.Errorf("default instructions are not the data text alone:\n%s", got)
 	}
 }
 

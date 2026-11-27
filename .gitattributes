@@ -1,3 +1,0 @@
-# Golden files are compared byte for byte: keep them as committed on every OS
-# (a Windows checkout would otherwise turn their LF into CRLF).
-**/testdata/** -text

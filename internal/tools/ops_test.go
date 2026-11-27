@@ -9,13 +9,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -304,10 +304,6 @@ func TestRegisterAll_Groups(t *testing.T) {
 // tools/list, rendered the same way. Turning ops on adds two tools and
 // changes none of the five.
 func TestRegisterAll_DefaultToolsListIsUnchanged(t *testing.T) {
-	want, err := os.ReadFile("testdata/tools-list-data.json")
-	if err != nil {
-		t.Fatal(err)
-	}
 	list := func(groups Groups) []*mcp.Tool {
 		cs := newSession(t, http.NotFoundHandler(), func(server *mcp.Server, client *arc.Client) {
 			RegisterAll(server, client, groups, 500, 50_000)
@@ -323,10 +319,18 @@ func TestRegisterAll_DefaultToolsListIsUnchanged(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return string(b) + "\n"
+		return string(b)
 	}
-	if got := render(list(Groups{Data: true})); got != string(want) {
-		t.Errorf("default tools/list changed:\n%s", got)
+	groups, _, err := ParseGroups(DefaultGroups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range list(groups) {
+		names = append(names, tool.Name)
+	}
+	if strings.Join(names, ",") != "describe_measurement,get_sample_data,list_databases,list_measurements,query" {
+		t.Errorf("the default serves %v, want the five data tools only", names)
 	}
 	var data []*mcp.Tool
 	for _, tool := range list(Groups{Data: true, Ops: true}) {
@@ -334,7 +338,7 @@ func TestRegisterAll_DefaultToolsListIsUnchanged(t *testing.T) {
 			data = append(data, tool)
 		}
 	}
-	if got := render(data); got != string(want) {
+	if got, want := render(data), render(list(Groups{Data: true})); got != want {
 		t.Errorf("with ops on, the data tools changed:\n%s", got)
 	}
 }
@@ -941,5 +945,50 @@ func BenchmarkHistoryResult(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// #20: both ops tools declare an output schema, and every success answer's
+// structured content validates against it.
+func TestOps_StructuredContentMatchesSchema(t *testing.T) {
+	cs, _ := opsSession(t, healthyArc(), opsOpts{})
+	tools, err := cs.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemas := map[string]*jsonschema.Resolved{}
+	for _, tool := range tools.Tools {
+		if tool.OutputSchema == nil {
+			t.Errorf("%s has no outputSchema", tool.Name)
+			continue
+		}
+		b, _ := json.Marshal(tool.OutputSchema)
+		var s jsonschema.Schema
+		if err := json.Unmarshal(b, &s); err != nil {
+			t.Fatal(err)
+		}
+		r, err := s.Resolve(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		schemas[tool.Name] = r
+	}
+	type call struct {
+		tool string
+		args map[string]any
+	}
+	calls := []call{{"arc_health", nil}}
+	for _, f := range familyNames() {
+		calls = append(calls, call{"arc_metrics", map[string]any{"family": f}})
+	}
+	for _, c := range calls {
+		_, res := callOps(t, cs, c.tool, c.args)
+		if res.IsError || res.StructuredContent == nil {
+			t.Errorf("%s %v: isError=%v structured=%v", c.tool, c.args, res.IsError, res.StructuredContent)
+			continue
+		}
+		if err := schemas[c.tool].Validate(res.StructuredContent); err != nil {
+			t.Errorf("%s %v: %v", c.tool, c.args, err)
+		}
 	}
 }

@@ -19,9 +19,9 @@ import (
 // The operations tools (group ops, opt-in through --tools): arc_health and
 // arc_metrics. They report on the Arc server itself, never on data stored in
 // it, through Arc's fixed read-only routes. Every answer is compact JSON,
-// attached as structured content too, with no output schema yet (#20 adds
-// one for every tool). Their error texts are their own: the data tools'
-// texts talk about SQL, databases and measurements.
+// attached as structured content too, under the tool's output schema. Their
+// error texts are their own: the data tools' texts talk about SQL,
+// databases and measurements.
 
 // ProbeResult is one arc_health probe: the HTTP status Arc answered with and
 // Arc's answer, or why there is none.
@@ -65,6 +65,14 @@ type HistoryResult struct {
 	// Points are the points kept, oldest first, numbers exact.
 	Points []any `json:"points"`
 }
+
+// The ops tools' output schemas (#20: every tool declares one). Their
+// structured content is the same value as their text, so it already fits
+// --max-response-size; Arc's own bodies are open objects.
+var (
+	healthOutputSchema  = mustSchema[HealthResult]()
+	metricsOutputSchema = mustSchema[MetricsResult]()
+)
 
 // metricsFamily is one arc_metrics family and the fixed Arc route behind it.
 type metricsFamily struct {
@@ -164,9 +172,10 @@ type HealthArgs struct{}
 // RegisterHealth registers arc_health.
 func RegisterHealth(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "arc_health",
-		Title:       "Check Arc health",
-		Annotations: readOnly("Check Arc health"),
+		Name:         "arc_health",
+		Title:        "Check Arc health",
+		OutputSchema: healthOutputSchema,
+		Annotations:  readOnly("Check Arc health"),
 		Description: "Check whether the Arc server is alive (/health) and ready for traffic (/ready). " +
 			"Returns each probe's HTTP status and Arc's answer; a not-ready answer (HTTP 503, with Arc's reason) is a result to report, not a failure. " +
 			"Arc answers these probes without checking the token, so a healthy answer says nothing about whether the token works. " +
@@ -247,9 +256,10 @@ func statusText(status int) string {
 // RegisterMetrics registers arc_metrics.
 func RegisterMetrics(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "arc_metrics",
-		Title:       "Read Arc metrics",
-		Annotations: readOnly("Read Arc metrics"),
+		Name:         "arc_metrics",
+		Title:        "Read Arc metrics",
+		OutputSchema: metricsOutputSchema,
+		Annotations:  readOnly("Read Arc metrics"),
 		Description: "Read the Arc server's own metrics (about Arc itself, not data stored in it). family: " +
 			"endpoints (HTTP, ingest, query, buffer, storage, compaction and auth activity; start here), " +
 			"query_pool (the DuckDB connection pool), memory (Go runtime and garbage collector), counters (every counter Arc keeps; the largest answer), " +
