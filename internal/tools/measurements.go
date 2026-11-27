@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -94,7 +95,7 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 		Name:        "describe_measurement",
 		Title:       "Describe a measurement",
 		Annotations: readOnly("Describe a measurement"),
-		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics read every file's metadata and may scan the time column; a statistic that cannot be computed in time says so.",
+		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics read every file's metadata and may scan the time column; a statistic that cannot be computed says why.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
@@ -124,11 +125,16 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			}, nil, nil
 		}
 
+		budget := deadlineBudget(ctx, client)
 		columns, describeMs, err := describeColumns(ctx, client, args.Database, args.Measurement)
 		if err != nil {
+			text := arc.UserMessage(err)
+			if reason := failureReason(budget, err); reason != "" {
+				text = "Could not describe the measurement: " + reason + "."
+			}
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
-					&mcp.TextContent{Text: arc.UserMessage(err)},
+					&mcp.TextContent{Text: text},
 				},
 				IsError: true,
 			}, nil, nil
@@ -188,7 +194,10 @@ var statLabels = [3]string{"Row count", "Earliest", "Latest"}
 // files of up to 50k rows (DESCRIBE 59 ms and up) three footer passes cost
 // more than one scan. 55 sits in that measured gap, on Arc main and v26.09.4,
 // local storage (arc-mcp#28). Below it the three-part statement can still
-// lose on many small files, by at most about three DESCRIBE times.
+// lose on many small files, by three to four DESCRIBE times (four when the
+// measurement is stale and the Latest needs its own statement). A time of 0
+// (absent, or not Arc) is unknown, and takes the full statement: it is the
+// one whose cost is known.
 const statsGateMs = 55
 
 // statsLatestWindow bounds the Latest part of the three-part statement. The
@@ -202,46 +211,50 @@ const statsLatestWindow = "(SELECT now() - INTERVAL '30 days')"
 // measurementStats returns the values of the Row count, Earliest and Latest
 // lines: each as Arc rendered it, or "not computed" with the reason.
 //
-// Below statsGateMs it sends one statement whose parts are each cheap on a
+// Below statsGateMs (and above 0) it sends one statement whose parts are each cheap on a
 // measurement with few files: count(*) (answered from file metadata), the
 // first row by time (DuckDB skips row groups that cannot hold an earlier one)
 // and the newest row of the last 30 days. Only when that window is empty and
 // the measurement has rows does it send a second statement for the Latest:
 // max(time) over everything, the scan today's statement pays. At or above
-// the gate it sends the single full statement. Every value is exact either
+// the gate, or with no time, it sends the single full statement. Every
+// value is exact either
 // way and rendered as Arc sent it, so a computed block reads as it always
 // has.
 //
 // All statements share one deadline, arc-mcp's --timeout from the start of
-// the statistics: a describe takes at most one --timeout more than its
-// DESCRIBE. A statement that fails (timed out, refused by Arc's governance,
+// the statistics (or the caller's, if sooner): a describe takes at most one
+// --timeout more than its DESCRIBE. A statement that fails (timed out, refused by Arc's governance,
 // a query error) marks its lines "not computed" with the reason, and nothing
 // further is sent.
 func measurementStats(ctx context.Context, client *arc.Client, database, measurement string, describeMs float64) [3]string {
+	budget := deadlineBudget(ctx, client)
 	if t := client.Timeout(); t > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, t)
 		defer cancel()
 	}
+	folded := describeMs > 0 && describeMs < statsGateMs
 	var out [3]string
 	// Safe to interpolate: the caller validated measurement with ValidateIdentifier.
 	sql := fmt.Sprintf("SELECT count(*) as row_count, min(time) as earliest, max(time) as latest FROM %s", measurement)
-	if describeMs < statsGateMs {
+	if folded {
 		sql = fmt.Sprintf("SELECT (SELECT count(*) FROM %[1]s) AS row_count, (SELECT time FROM %[1]s ORDER BY time LIMIT 1) AS earliest, "+
 			"(SELECT max(time) FROM %[1]s WHERE time > %[2]s) AS latest", measurement, statsLatestWindow)
 	}
 	row, err := statsRow(ctx, client, database, sql, 3)
 	for i := range out {
-		out[i] = statValue(client, row, i, err)
+		out[i] = statValue(budget, row, i, err)
 	}
 	// An aggregate over an empty window still returns its row, with a null:
 	// test the value. A count of 0 leaves the Latest null, as the full
-	// statement does.
-	if err != nil || describeMs >= statsGateMs || row[2] != nil || fmt.Sprintf("%v", row[0]) == "0" {
+	// statement does. The full statement's max(time) is already unbounded:
+	// a null there is final (only rows whose times are all null give one).
+	if err != nil || !folded || row[2] != nil || fmt.Sprintf("%v", row[0]) == "0" {
 		return out
 	}
 	row, err = statsRow(ctx, client, database, fmt.Sprintf("SELECT max(time) AS latest FROM %s", measurement), 1)
-	out[2] = statValue(client, row, 0, err)
+	out[2] = statValue(budget, row, 0, err)
 	return out
 }
 
@@ -258,20 +271,52 @@ func statsRow(ctx context.Context, client *arc.Client, database, sql string, n i
 	return r.Data[0], nil
 }
 
-// statValue renders value i of row, or, when err is set, why it is missing.
-// A timeout gets its own text: the query tool's hint (aggregate, narrow the
-// time range) is advice the model cannot apply to describe.
-func statValue(client *arc.Client, row []any, i int, err error) string {
-	var ae *arc.Error
-	switch {
-	case errors.As(err, &ae) && ae.Kind == arc.KindTimeout:
-		return fmt.Sprintf("not computed (timed out after %s)", client.Timeout())
-	case ae != nil && ae.Status == http.StatusGatewayTimeout:
-		return "not computed (Arc timed out)"
-	case err != nil:
+// statValue renders value i of row, or, when err is set, why it is missing
+// (see failureReason).
+func statValue(budget time.Duration, row []any, i int, err error) string {
+	switch reason := failureReason(budget, err); {
+	case err == nil:
+		return fmt.Sprintf("%v", row[i])
+	case reason != "":
+		return "not computed (" + reason + ")"
+	default:
 		return "not computed: " + arc.UserMessage(err)
 	}
-	return fmt.Sprintf("%v", row[i])
+}
+
+// failureReason is a short reason for a describe statement that ran out of
+// time or memory, or "" for any other failure (UserMessage then says it).
+// The query tool's text for those advises aggregating or narrowing the time
+// range: advice for SQL the model wrote, which it cannot apply to describe's
+// own statements. budget is the time the statement had, 0 when unknown.
+func failureReason(budget time.Duration, err error) string {
+	var ae *arc.Error
+	switch {
+	case !errors.As(err, &ae):
+		return ""
+	case ae.Kind == arc.KindTimeout && budget > 0:
+		return "timed out after " + budget.String()
+	case ae.Kind == arc.KindTimeout:
+		return "timed out"
+	case ae.Status == http.StatusGatewayTimeout:
+		return "Arc timed out"
+	case arc.OutOfMemory(err):
+		return "Arc ran out of memory"
+	}
+	return ""
+}
+
+// deadlineBudget is the time a describe statement starting now has: the
+// client's --timeout, or less when ctx's own deadline comes sooner; 0 when
+// neither is set.
+func deadlineBudget(ctx context.Context, client *arc.Client) time.Duration {
+	budget := client.Timeout()
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl).Round(time.Millisecond); budget <= 0 || left < budget {
+			budget = left
+		}
+	}
+	return budget
 }
 
 // unknownType stands in for a column type Arc did not report.

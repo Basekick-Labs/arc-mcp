@@ -25,9 +25,10 @@ type Error struct {
 	Detail string // full detail — log to stderr, never send to LLM
 	// Message is text safe to show the model, set where it can act on it:
 	// Arc's fixed validation message for a refused request (HTTP 400), its
-	// governance reason for a refused query (HTTP 429), the fixable part of a failed query (redacted, see queryErrorText), or a
-	// fixed hint for a query that ran out of memory, timed out or lost data
-	// mid-run. Empty otherwise; UserMessage then gives the generic text.
+	// governance reason for a refused query (HTTP 429), the fixable part of
+	// a failed query (redacted, see queryErrorText), or a fixed hint for a
+	// query that ran out of memory, timed out or lost data mid-run. Empty
+	// otherwise; UserMessage then gives the generic text.
 	Message string
 }
 
@@ -105,7 +106,7 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 		e.Message = refusalText(snippet)
 	case op == "query" && statusCode == http.StatusInternalServerError:
 		if isOutOfMemory(snippet) {
-			e.Message = "Arc ran out of memory running it. Aggregate (time_bucket, GROUP BY), narrow the time range, or select fewer columns."
+			e.Message = outOfMemoryHint
 		} else {
 			e.Message = queryErrorFromBody(snippet)
 		}
@@ -117,6 +118,17 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 		e.Message = "data it read was removed while it ran (retention, compaction or a delete). Run it again once."
 	}
 	return e
+}
+
+// outOfMemoryHint is the hint for a query that ran out of memory in Arc.
+const outOfMemoryHint = "Arc ran out of memory running it. Aggregate (time_bucket, GROUP BY), narrow the time range, or select fewer columns."
+
+// OutOfMemory reports whether err is a query Arc ran out of memory running.
+// Tools whose SQL the model does not write use it to drop the hint, which
+// is advice for the model's own query.
+func OutOfMemory(err error) bool {
+	var ae *Error
+	return errors.As(err, &ae) && ae.Kind == KindServer && ae.Status == http.StatusInternalServerError && ae.Message == outOfMemoryHint
 }
 
 // timedOutHint is the hint for a query that ran out of time, in Arc or in

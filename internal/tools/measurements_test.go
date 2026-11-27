@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,8 @@ func TestDescribe_StatsGate(t *testing.T) {
 		describeMs int
 		wantSQL    string
 	}{
-		{"absent or sub-millisecond", 0, foldedStatsSQL},
+		{"absent (unknown)", 0, fullStatsSQL},
+		{"one millisecond", 1, foldedStatsSQL},
 		{"just under the gate", statsGateMs - 1, foldedStatsSQL},
 		{"at the gate", statsGateMs, fullStatsSQL},
 		{"many files", 460, fullStatsSQL},
@@ -117,7 +119,9 @@ func TestDescribe_StaleLatestFallsBack(t *testing.T) {
 }
 
 // At or above the gate the full statement is the only one: its max(time) is
-// already unbounded, so a null Latest there is final, not stale.
+// already unbounded, so a null Latest there is final, not stale. The fixture
+// (rows, but a null Latest) is not a state Arc produces unless every time is
+// null: the guard it pins is defensive, against a wasted second scan.
 func TestDescribe_FullStatementHasNoFallback(t *testing.T) {
 	fake := &fakeArc{reply: func(sql string) (int, string) {
 		if strings.HasPrefix(sql, "DESCRIBE") {
@@ -300,5 +304,121 @@ func TestQuery_GovernanceRefusalReason(t *testing.T) {
 	text, isErr := call(t, cs, "query", map[string]any{"database": "db", "sql": "SELECT 1"})
 	if !isErr || text != "Arc refused the request: Daily query quota exceeded" {
 		t.Errorf("isErr=%v text=%q", isErr, text)
+	}
+}
+
+// DESCRIBE refused: the LIMIT 0 fallback's time gates the statistics the
+// same way.
+func TestDescribe_FallbackColumnsTimeGates(t *testing.T) {
+	tests := []struct {
+		ms      int
+		wantSQL string
+	}{
+		{30, foldedStatsSQL},
+		{400, fullStatsSQL},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprint(tt.ms, "ms"), func(t *testing.T) {
+			fake := &fakeArc{reply: func(sql string) (int, string) {
+				switch {
+				case strings.HasPrefix(sql, "DESCRIBE"):
+					return 400, `{"success":false,"error":"Dangerous SQL operation not allowed"}`
+				case strings.HasSuffix(sql, "LIMIT 0"):
+					return 200, fmt.Sprintf(`{"success":true,"columns":["time"],"data":[],"row_count":0,"execution_time_ms":%d}`, tt.ms)
+				}
+				return 200, statsRowBody(`7`, `"2026-11-01T00:00:00Z"`, `"2026-11-26T00:00:00Z"`)
+			}}
+			describeCPU(t, fake, 5*time.Second)
+			wantSent(t, fake, "DESCRIBE SELECT * FROM cpu", "SELECT * FROM cpu LIMIT 0", tt.wantSQL)
+		})
+	}
+}
+
+// Out of memory on a statistics statement: said as such, without the query
+// tool's advice to aggregate, which is for SQL the model wrote. Any other
+// 500 keeps the query path's text.
+func TestDescribe_StatsOutOfMemory(t *testing.T) {
+	tests := []struct {
+		name, body, want string
+	}{
+		{"out of memory", `{"success":false,"error":"arrow query failed: Out of Memory Error: failed to allocate data of size 64.0 MiB (3.7 GiB/3.7 GiB used)"}`,
+			"not computed (Arc ran out of memory)"},
+		{"other DuckDB error", `{"success":false,"error":"Binder Error: Referenced column \"time\" not found"}`,
+			`not computed: The query failed: Binder Error: Referenced column "time" not found`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeArc{reply: func(sql string) (int, string) {
+				if strings.HasPrefix(sql, "DESCRIBE") {
+					return 200, describeBodyMs(30)
+				}
+				return 500, tt.body
+			}}
+			text := describeCPU(t, fake, 5*time.Second)
+			if want := statsBlock(tt.want, tt.want, tt.want); !strings.HasSuffix(text, want) {
+				t.Errorf("want suffix %q\ngot:\n%s", want, text)
+			}
+		})
+	}
+}
+
+// A timeout with no known deadline (--timeout 0 and no caller deadline; a
+// transport timeout) names no duration.
+func TestFailureReason_TimeoutWithoutBudget(t *testing.T) {
+	err := &arc.Error{Kind: arc.KindTimeout, Detail: "query: dial tcp: i/o timeout"}
+	if got := failureReason(0, err); got != "timed out" {
+		t.Errorf("failureReason(0) = %q, want %q", got, "timed out")
+	}
+	if got := failureReason(2*time.Second, err); got != "timed out after 2s" {
+		t.Errorf("failureReason(2s) = %q", got)
+	}
+}
+
+// The DESCRIBE itself running out of time or memory: the same short reason,
+// not the query tool's advice.
+func TestDescribe_DescribeFailureReason(t *testing.T) {
+	tests := []struct {
+		name  string
+		reply func(ctx context.Context) (int, string)
+		want  string
+	}{
+		{"arc-mcp timeout", waitForCancel, "Could not describe the measurement: timed out after 200ms."},
+		{"Arc timeout", func(context.Context) (int, string) { return 504, `{"success":false,"error":"query timeout"}` },
+			"Could not describe the measurement: Arc timed out."},
+		{"out of memory", func(context.Context) (int, string) {
+			return 500, `{"success":false,"error":"Out of Memory Error: failed to allocate"}`
+		}, "Could not describe the measurement: Arc ran out of memory."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeArc{replyCtx: func(ctx context.Context, sql string) (int, string) { return tt.reply(ctx) }}
+			cs := newSessionTimeout(t, fake, 200*time.Millisecond, func(server *mcp.Server, client *arc.Client) {
+				RegisterDescribeMeasurement(server, client, 50_000)
+			})
+			text, isErr := call(t, cs, "describe_measurement", map[string]any{"database": "db", "measurement": "cpu"})
+			if !isErr || text != tt.want {
+				t.Errorf("isErr=%v text=%q, want %q", isErr, text, tt.want)
+			}
+			if n := len(fake.received()); n != 1 {
+				t.Errorf("%d statements sent, want 1", n)
+			}
+		})
+	}
+}
+
+// A caller deadline sooner than --timeout: the text names the time the
+// statistics actually had.
+func TestDescribe_StatsTimeoutNamesTheDeadlineThatFired(t *testing.T) {
+	fake := &fakeArc{replyCtx: func(ctx context.Context, sql string) (int, string) { return waitForCancel(ctx) }}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	client := arc.NewClient(srv.URL, "tok", 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	got := measurementStats(ctx, client, "db", "cpu", 30)
+	for i, v := range got {
+		if v != "not computed (timed out after 150ms)" {
+			t.Errorf("line %d = %q", i, v)
+		}
 	}
 }
