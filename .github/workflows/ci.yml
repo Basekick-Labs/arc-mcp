@@ -84,7 +84,8 @@ jobs:
 
   release-dry-run:
     # Runs .goreleaser.yml as a snapshot: builds every target, renders the
-    # archives, packages and the Homebrew formula, publishes nothing. Docker,
+    # archives, packages, the Claude Desktop extension and the Homebrew
+    # formula, publishes nothing. Docker,
     # signing and SBOMs are left to the tag build. No secrets are read, so a
     # PR from a fork runs it the same way (the tap token is evaluated only
     # when a release pushes the formula).
@@ -142,10 +143,27 @@ jobs:
           grep -qF 'assert_match version.to_s, shell_output("#{bin}/arc-mcp --version")' "$f"
           tar -xzf "dist/arc-mcp_${v}_linux_amd64.tar.gz" -C "$RUNNER_TEMP" arc-mcp
           test "$("$RUNNER_TEMP/arc-mcp" --version)" = "$v"
+      - name: Check the extension bundle
+        # The bundle the universal binary's hook packed (mcpb/pack.sh): named
+        # with GoReleaser's version, listed in checksums.txt, its manifest
+        # version semver. A snapshot version has no leading zeros, so the
+        # script also packs the same binaries as 26.04.3, a real tag's shape.
+        # The universal binary must not ship as an archive of its own.
+        run: |
+          v=$(jq -r .version dist/metadata.json)
+          b="dist/arc-mcp-$v.mcpb"
+          unzip -Z "$b"
+          test "$(unzip -p "$b" manifest.json | jq -r .version)" = "$v"
+          grep -q "  arc-mcp-$v.mcpb\$" dist/checksums.txt
+          test "$(find dist -maxdepth 1 -type f -name '*darwin_all*' | wc -l)" -eq 0
+          mkdir "$RUNNER_TEMP/tag"
+          sh mcpb/pack.sh dist/arc-mcp-universal_darwin_all/arc-mcp 26.04.3 "$(git log -1 --format=%ct)" "$RUNNER_TEMP/tag"
+          test "$(unzip -p "$RUNNER_TEMP/tag/arc-mcp-26.04.3.mcpb" manifest.json | jq -r .version)" = 26.4.3
       - uses: actions/upload-artifact@v4
         with:
           name: release-dry-run
           path: |
+            dist/*.mcpb
             dist/*.tar.gz
             dist/checksums.txt
             dist/metadata.json
@@ -158,7 +176,7 @@ jobs:
     # from the local archives: Homebrew refuses a formula file outside a tap,
     # so it goes into a throwaway local tap, its URLs rewritten to file://
     # (the sha256s stay valid). Then the formula's own test. The macOS leg
-    # is the only place CI runs the darwin binary GoReleaser builds.
+    # runs the darwin archive's binary.
     name: Formula (${{ matrix.os }})
     needs: release-dry-run
     strategy:
@@ -198,6 +216,64 @@ jobs:
           brew install local/arcmcp-ci/arc-mcp
           test "$(arc-mcp --version)" = "$v"
           brew test local/arcmcp-ci/arc-mcp
+
+  extension:
+    # The Claude Desktop extension as the app gets it: unpacked with the mcpb
+    # CLI, validated, then started through mcpb's own resolver for this
+    # platform (mcpb/smoke.mjs) against an unreachable Arc at a non-default
+    # URL, with a hostile inherited environment. macOS checks the universal
+    # binary (both slices; Go signs the arm64 one only) and runs it from mode
+    # 0755 and 0600 (the launcher's chmod, mcpb#294); Windows runs the win32
+    # override. npm runs in this job only: no secrets, read-only token.
+    name: Extension (${{ matrix.os }})
+    needs: release-dry-run
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      SMOKE_ARC_URL: http://127.0.0.1:9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: mcpb
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dry-run
+          path: dist
+      - name: Install the mcpb CLI
+        # An exact version and no install scripts; its own dependencies float.
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mcpb" --ignore-scripts --no-audit --no-fund @anthropic-ai/mcpb@2.1.2
+          echo "MCPB_PKG=$RUNNER_TEMP/mcpb/node_modules/@anthropic-ai/mcpb" >> "$GITHUB_ENV"
+      - name: Unpack and validate
+        # tr: a native jq on Windows may end its output with CRLF.
+        run: |
+          v=$(jq -r .version dist/metadata.json | tr -d '\r')
+          node "$MCPB_PKG/dist/cli/cli.js" unpack "dist/arc-mcp-$v.mcpb" "$RUNNER_TEMP/ext"
+          node "$MCPB_PKG/dist/cli/cli.js" validate "$RUNNER_TEMP/ext/manifest.json"
+          node "$MCPB_PKG/dist/cli/cli.js" info "dist/arc-mcp-$v.mcpb"
+      - name: Check the universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          b="$RUNNER_TEMP/ext/server/arc-mcp"
+          test -x "$b"
+          lipo "$b" -verify_arch x86_64 arm64
+          codesign -v -a arm64 "$b"
+      - name: Start it as Claude Desktop would
+        run: node mcpb/smoke.mjs "$RUNNER_TEMP/ext"
+      - name: Start it from a non-executable file (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          chmod 600 "$RUNNER_TEMP/ext/server/arc-mcp"
+          node mcpb/smoke.mjs "$RUNNER_TEMP/ext"
 
   helm-lint:
     runs-on: ubuntu-latest
