@@ -40,6 +40,10 @@ func TestStructuredOutputMatchesItsSchema(t *testing.T) {
 			return 200, stats
 		case strings.Contains(sql, "nosuch"):
 			return 200, `{"success":true,"columns":[],"data":[],"row_count":0}`
+		case strings.Contains(sql, "emptytyped"):
+			return 200, `{"success":true,"columns":[],"types":[],"data":[],"row_count":0}`
+		case strings.Contains(sql, "typed"):
+			return 200, `{"success":true,"columns":["time","host","usage"],"types":["timestamp[us]","utf8","float64"],"data":[["2026-11-27T00:00:00Z","a",1.5]],"row_count":1}`
 		case strings.Contains(sql, "many"):
 			return 200, rowsBody(501)
 		case strings.Contains(sql, "capped"):
@@ -58,6 +62,9 @@ func TestStructuredOutputMatchesItsSchema(t *testing.T) {
 		{"describe", "", "", "describe_measurement", map[string]any{"database": "db", "measurement": "cpu"}},
 		{"query", "", "", "query", map[string]any{"database": "db", "sql": "SELECT n FROM t"}},
 		{"query, no data", "", "", "query", map[string]any{"database": "db", "sql": "SELECT n FROM nosuch"}},
+		{"query, column types", "", "", "query", map[string]any{"database": "db", "sql": "SELECT * FROM typed"}},
+		{"query, no data, empty types", "", "", "query", map[string]any{"database": "db", "sql": "SELECT n FROM emptytyped"}},
+		{"sample, column types", "", "", "get_sample_data", map[string]any{"database": "db", "measurement": "typed"}},
 		{"sample", "", "", "get_sample_data", map[string]any{"database": "db", "measurement": "cpu"}},
 		{"databases, scoped token", "403:" + scopedAllBody, "", "list_databases", nil},
 		{"measurements, scoped token", "", "403:" + scoped403Body, "list_measurements", map[string]any{"database": "metrics"}},

@@ -34,8 +34,9 @@ type Truncation struct {
 
 // QueryOutput is the structured result of query and get_sample_data.
 type QueryOutput struct {
-	Columns []string `json:"columns" jsonschema:"The result's column names, in order."`
-	Rows    [][]any  `json:"rows" jsonschema:"The rows shown, one value per column. Numbers are exactly as Arc sent them (a JavaScript client parsing them as doubles loses integers above 2^53; the text is exact). Strings and nested values longer than 512 characters are cut with an ellipsis, as in the text."`
+	Columns     []string `json:"columns" jsonschema:"The result's column names, in order."`
+	ColumnTypes []string `json:"column_types" jsonschema:"Arc's type name for each column, parallel to columns: int64, float64, utf8, bool, timestamp[us], date32, decimal(18, 2) and so on. Use it only when its length equals columns'; it is empty when Arc did not report types (an Arc before 27.01.1, the node that answered in a cluster being upgraded, or Arc's fallback path). The names describe the column, not the JSON value: timestamps and dates arrive as RFC 3339 strings in UTC, binary as base64, string_encoded, list, struct, map and unknown: columns as strings, and a float NaN or infinity as null."`
+	Rows        [][]any  `json:"rows" jsonschema:"The rows shown, one value per column. Numbers are exactly as Arc sent them (a JavaScript client parsing them as doubles loses integers above 2^53; the text is exact). Strings and nested values longer than 512 characters are cut with an ellipsis, as in the text."`
 	// RowCount is len(Rows).
 	RowCount        int          `json:"row_count" jsonschema:"The number of rows in rows."`
 	Truncated       bool         `json:"truncated" jsonschema:"True when the result is incomplete; truncation says why."`
@@ -97,7 +98,7 @@ var (
 )
 
 func queryOutputSchemaFor() *jsonschema.Schema {
-	s := nonNullArrays(mustSchema[QueryOutput](), "columns", "rows", "truncation")
+	s := nonNullArrays(mustSchema[QueryOutput](), "columns", "column_types", "rows", "truncation")
 	s.Properties["truncation"].Items.Properties["reason"].Enum = []any{"row_limit", "arc_row_cap", "size_budget", "stream_incomplete"}
 	return s
 }
@@ -164,7 +165,7 @@ const maxCellRunes = 512
 // noData is the text when Arc read nothing.
 func renderResult(result *arc.QueryResponse, notes []note, noData string, maxChars int) (string, QueryOutput) {
 	notes = append([]note(nil), notes...)
-	out := QueryOutput{Columns: []string{}, Rows: [][]any{}, Truncation: []Truncation{}, ExecutionTimeMs: result.ExecutionTimeMs}
+	out := QueryOutput{Columns: []string{}, ColumnTypes: []string{}, Rows: [][]any{}, Truncation: []Truncation{}, ExecutionTimeMs: result.ExecutionTimeMs}
 	if len(result.Columns) == 0 && len(notes) == 0 {
 		out.NoData = true
 		return noData, out
@@ -172,6 +173,7 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 	if result.Columns != nil {
 		out.Columns = result.Columns
 	}
+	out.ColumnTypes = columnTypes(result)
 
 	var table strings.Builder
 	if len(out.Columns) > 0 {
@@ -194,7 +196,14 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 	for _, n := range notes {
 		budget -= len(n.markdown()) + 2
 	}
-	jsonSize := 0
+	// The structured header (columns and their types) is sent whole; it
+	// counts against the same budget as the rows, so rows are added only
+	// while header and rows together fit.
+	header, _ := json.Marshal(struct {
+		C []string `json:"columns"`
+		T []string `json:"column_types"`
+	}{out.Columns, out.ColumnTypes})
+	jsonSize := len(header)
 	shown := 0
 	for _, row := range result.Data {
 		var line strings.Builder
@@ -217,6 +226,8 @@ func renderResult(result *arc.QueryResponse, notes []note, noData string, maxCha
 		shown++
 	}
 	switch {
+	case shown == 0 && len(result.Data) > 0 && maxChars > 0 && jsonSize > budget:
+		notes = append(notes, note{"size_budget", "No rows shown: the column names and types alone fill the answer's size limit.", "Select fewer columns."})
 	case shown == 0 && len(result.Data) > 0:
 		notes = append(notes, note{"size_budget", "No rows shown: a single row is larger than the answer's size limit.", "Select fewer columns."})
 	case shown < len(result.Data):
@@ -282,4 +293,29 @@ func arcNotes(result *arc.QueryResponse) []note {
 		}
 	}
 	return notes
+}
+
+// maxTypeRunes is where a type name is cut: an unknown: name carries Arrow's
+// own description of the type, of any length.
+const maxTypeRunes = 128
+
+// columnTypes is QueryOutput.ColumnTypes: Arc's types when it sent one per
+// column, each cut at maxTypeRunes; empty otherwise. A count that does not
+// match the columns is Arc's bug, logged, and the types are dropped rather
+// than misaligned.
+func columnTypes(result *arc.QueryResponse) []string {
+	if len(result.Types) != len(result.Columns) {
+		if result.Types != nil {
+			log.Printf("query: Arc sent %d column types for %d columns; leaving column_types empty", len(result.Types), len(result.Columns))
+		}
+		return []string{}
+	}
+	types := make([]string, len(result.Types))
+	for i, t := range result.Types {
+		if r := []rune(t); len(r) > maxTypeRunes {
+			t = string(r[:maxTypeRunes]) + "…"
+		}
+		types[i] = t
+	}
+	return types
 }

@@ -316,8 +316,11 @@ type QueryRequest struct {
 
 // QueryResponse matches Arc's POST /api/v1/query response.
 type QueryResponse struct {
-	Success         bool            `json:"success"`
-	Columns         []string        `json:"columns"`
+	Success bool     `json:"success"`
+	Columns []string `json:"columns"`
+	// Types is Arc's type name per column, parallel to Columns (Arc
+	// 27.01.1, #1967); nil when Arc did not send them.
+	Types           []string        `json:"types"`
 	Data            [][]interface{} `json:"data"` // numbers are json.Number, see Query
 	RowCount        int             `json:"row_count"`
 	ExecutionTimeMs float64         `json:"execution_time_ms"`
