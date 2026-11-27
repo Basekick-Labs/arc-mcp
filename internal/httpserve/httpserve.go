@@ -49,6 +49,10 @@ type Options struct {
 	AllowAnyHost bool
 	// MaxConcurrent caps the /mcp requests served at once; 0 means no cap.
 	MaxConcurrent int
+	// RequireTLS refuses a non-loopback listener without TLS files: in
+	// passthrough the bearer token is a caller's Arc credential. Leave it
+	// false when TLS terminates in front of arc-mcp.
+	RequireTLS bool
 	// QueryTimeout is arc-mcp's --timeout, which sizes the write timeout and
 	// the shutdown grace period; 0 means queries have no deadline.
 	QueryTimeout time.Duration
@@ -142,6 +146,9 @@ func checkListener(addr net.Addr, opts Options) error {
 			"Set ARC_MCP_HTTP_TOKEN_FILE (or ARC_MCP_HTTP_TOKEN), or pass --insecure-listen")
 	case loopback:
 		return nil
+	case opts.RequireTLS && opts.TLSCertFile == "":
+		return fmt.Errorf("refusing to listen on %s without TLS: every request carries a caller's Arc token. "+
+			"Set --tls-cert and --tls-key, or pass --tls-upstream when TLS terminates in front of arc-mcp", addr)
 	case opts.Verify == nil && !opts.InsecureListen:
 		return fmt.Errorf("refusing to listen on %s without an inbound token: anyone who can reach it could query Arc with arc-mcp's token. "+
 			"Set ARC_MCP_HTTP_TOKEN_FILE (or ARC_MCP_HTTP_TOKEN), listen on 127.0.0.1, or pass --insecure-listen", addr)

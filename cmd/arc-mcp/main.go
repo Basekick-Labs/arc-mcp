@@ -54,6 +54,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", envOrDefault("ARC_MCP_TLS_CERT_FILE", ""), "HTTP transport: TLS certificate file (with --tls-key) to serve HTTPS")
 	tlsKey := flag.String("tls-key", envOrDefault("ARC_MCP_TLS_KEY_FILE", ""), "HTTP transport: TLS key file (with --tls-cert)")
 	maxConcurrent := flag.Int("max-concurrent", envOrDefaultInt("ARC_MCP_MAX_CONCURRENT", defaultMaxConcurrent), "HTTP transport: requests served at once (0 for no limit)")
+	tlsUpstream := flag.Bool("tls-upstream", envBool("ARC_MCP_TLS_UPSTREAM"), "HTTP transport: TLS terminates in front of arc-mcp (a proxy or ingress), so passthrough may listen without --tls-cert")
 	authMode := flag.String("auth-mode", envOrDefault("ARC_MCP_AUTH_MODE", "static"), "HTTP transport: static (arc-mcp's own Arc token, the default) or passthrough (each caller's bearer token is its Arc token)")
 	allowAnyHost := flag.Bool("allow-any-host", envBool("ARC_MCP_ALLOW_ANY_HOST"), "HTTP transport: accept any Host header on a loopback listener (for a TLS proxy on the same host); turns off DNS-rebinding protection")
 	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics)")
@@ -85,7 +86,7 @@ func main() {
 	if *transport == "stdio" {
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "listen", "insecure-listen", "tls-cert", "tls-key", "max-concurrent", "allow-any-host":
+			case "listen", "insecure-listen", "tls-cert", "tls-key", "tls-upstream", "max-concurrent", "allow-any-host", "auth-mode":
 				log.Printf("--%s applies to --transport http only; ignored over stdio", f.Name)
 			}
 		})
@@ -186,6 +187,7 @@ func main() {
 			AllowAnyHost:   *allowAnyHost,
 			MaxConcurrent:  *maxConcurrent,
 			QueryTimeout:   *timeout,
+			RequireTLS:     passthrough && !*tlsUpstream,
 		}
 		if httpToken != "" {
 			httpOpts.Verify = httpserve.StaticToken(httpToken)
@@ -412,16 +414,27 @@ func resolveHTTPToken() (string, error) {
 		if t == "" {
 			return "", fmt.Errorf("ARC_MCP_HTTP_TOKEN_FILE %q is empty", path)
 		}
-		return t, nil
+		return t, checkHTTPToken("ARC_MCP_HTTP_TOKEN_FILE", t)
 	}
 	if v, set := os.LookupEnv("ARC_MCP_HTTP_TOKEN"); set && v != "" {
 		t := strings.TrimSpace(v)
 		if t == "" {
 			return "", errors.New("ARC_MCP_HTTP_TOKEN is set but blank")
 		}
-		return t, nil
+		return t, checkHTTPToken("ARC_MCP_HTTP_TOKEN", t)
 	}
 	return "", nil
+}
+
+// checkHTTPToken refuses an inbound token clients could not send: a bearer
+// token is visible ASCII with no spaces (httpserve.BearerToken).
+func checkHTTPToken(name, t string) error {
+	for i := 0; i < len(t); i++ {
+		if c := t[i]; c <= ' ' || c >= 0x7f {
+			return fmt.Errorf("%s holds a space, control or non-ASCII character; a bearer token is visible ASCII only (for example openssl rand -hex 32)", name)
+		}
+	}
+	return nil
 }
 
 // envOrDefaultInt reads an integer environment variable; unset is fallback,

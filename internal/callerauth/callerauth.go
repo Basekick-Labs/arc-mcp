@@ -32,7 +32,17 @@ const (
 	// callers is served, a flood of made-up tokens cannot pile up on Arc.
 	maxVerifying = 4
 	slotWait     = 2 * time.Second
-	// maxWarned bounds the set of token ids already warned about.
+	// maxWaiting bounds verifications waiting for a slot; past it, 503 at
+	// once, so a flood holds no more than this many requests open.
+	maxWaiting = 64
+	// rejectTTL and maxRejected: a token Arc refused is refused again
+	// without asking Arc for this long. Bounded; when full, nothing more
+	// is remembered (each such token is asked about again).
+	rejectTTL   = 10 * time.Second
+	maxRejected = 4096
+	// maxWarned bounds the set of token ids already warned about; past it,
+	// over-scoped tokens are no longer warned about rather than warned
+	// about on every verification.
 	maxWarned = 1024
 )
 
@@ -40,12 +50,20 @@ const (
 type Verifier struct {
 	client *arc.Client
 	now    func() time.Time
-	slots  chan struct{}
+	// verifyCaller is client.VerifyCaller; tests replace it.
+	verifyCaller func(context.Context, string) (arc.Caller, error)
+	slots        chan struct{}
+	waiting      chan struct{}
 
-	mu      sync.Mutex
-	cache   map[[32]byte]entry
-	warned  map[int64]bool
-	flights map[[32]byte]*flight
+	mu       sync.Mutex
+	cache    map[[32]byte]entry
+	rejected map[[32]byte]time.Time
+	warned   map[int64]bool
+	flights  map[[32]byte]*flight
+	// forgets counts Forget calls; a verification that started before one
+	// does not cache its result, so a token Arc rejected mid-verification
+	// is not re-admitted.
+	forgets uint64
 }
 
 // flight is one verification in progress: requests with the same token
@@ -65,12 +83,15 @@ type entry struct {
 // Forget is the client's onRejected hook.
 func New(client *arc.Client) *Verifier {
 	return &Verifier{
-		client:  client,
-		now:     time.Now,
-		slots:   make(chan struct{}, maxVerifying),
-		cache:   make(map[[32]byte]entry),
-		warned:  make(map[int64]bool),
-		flights: make(map[[32]byte]*flight),
+		verifyCaller: client.VerifyCaller,
+		client:       client,
+		now:          time.Now,
+		slots:        make(chan struct{}, maxVerifying),
+		waiting:      make(chan struct{}, maxWaiting),
+		cache:        make(map[[32]byte]entry),
+		rejected:     make(map[[32]byte]time.Time),
+		warned:       make(map[int64]bool),
+		flights:      make(map[[32]byte]*flight),
 	}
 }
 
@@ -80,7 +101,7 @@ func key(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 // Verify is an httpserve.Verifier: a valid token is accepted with its Arc
 // token id as the identity; one Arc refuses is refused; when Arc cannot
 // tell, or too many verifications are in flight, httpserve.ErrUnavailable.
-func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
+func (v *Verifier) Verify(ctx context.Context, token string) (identity string, err error) {
 	k := key(token)
 	now := v.now()
 	v.mu.Lock()
@@ -90,6 +111,13 @@ func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
 			return e.identity, nil
 		}
 		delete(v.cache, k)
+	}
+	if until, ok := v.rejected[k]; ok {
+		if now.Before(until) {
+			v.mu.Unlock()
+			return "", arc.ErrCallerRejected
+		}
+		delete(v.rejected, k)
 	}
 	if f, ok := v.flights[k]; ok {
 		v.mu.Unlock()
@@ -102,55 +130,92 @@ func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
 	}
 	f := &flight{done: make(chan struct{})}
 	v.flights[k] = f
+	gen := v.forgets
 	v.mu.Unlock()
 
-	f.identity, f.err = v.verify(ctx, k, token, now)
-	v.mu.Lock()
-	delete(v.flights, k)
-	v.mu.Unlock()
-	close(f.done)
-	return f.identity, f.err
+	// Whatever happens in verify, even a panic, the flight is removed and
+	// its waiters released, and a panic is a refusal (ErrUnavailable) for
+	// this request and its waiters alike: the results are named so the
+	// deferred function sets what Verify returns.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("callerauth: verification panicked: %v", r)
+			identity, err = "", httpserve.ErrUnavailable
+		}
+		f.identity, f.err = identity, err
+		v.mu.Lock()
+		delete(v.flights, k)
+		v.mu.Unlock()
+		close(f.done)
+	}()
+	return v.verify(ctx, k, token, now, gen)
 }
 
-// verify asks Arc, in one of the slots.
-func (v *Verifier) verify(ctx context.Context, k [32]byte, token string, now time.Time) (string, error) {
+// verify asks Arc, in one of the slots. The wait and the call run detached
+// from the request's cancellation: the result decides for every request
+// waiting on the same flight, not only the one that started it.
+func (v *Verifier) verify(ctx context.Context, k [32]byte, token string, now time.Time, gen uint64) (string, error) {
+	select {
+	case v.waiting <- struct{}{}:
+	default:
+		return "", httpserve.ErrUnavailable
+	}
 	wait := time.NewTimer(slotWait)
 	defer wait.Stop()
 	select {
 	case v.slots <- struct{}{}:
+		<-v.waiting
 		defer func() { <-v.slots }()
 	case <-wait.C:
-		return "", httpserve.ErrUnavailable
-	case <-ctx.Done():
+		<-v.waiting
 		return "", httpserve.ErrUnavailable
 	}
-	// A request cancelled mid-verification must not decide for the others
-	// waiting on the same flight: Arc is asked under its own deadline.
 	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	caller, err := v.client.VerifyCaller(vctx, token)
+	caller, err := v.verifyCaller(vctx, token)
 	switch {
 	case errors.Is(err, arc.ErrCallerRejected):
+		v.rememberRejected(k, now)
 		return "", err
 	case err != nil:
 		return "", httpserve.ErrUnavailable
 	}
 	identity := fmt.Sprintf("arc-token:%d", caller.ID)
-	v.remember(k, identity, caller, now)
+	v.remember(k, identity, caller, now, gen)
 	v.warnOverScoped(caller)
 	return identity, nil
+}
+
+// rememberRejected refuses k without asking Arc for rejectTTL.
+func (v *Verifier) rememberRejected(k [32]byte, now time.Time) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.rejected) >= maxRejected {
+		for rk, until := range v.rejected {
+			if !now.Before(until) {
+				delete(v.rejected, rk)
+			}
+		}
+		if len(v.rejected) >= maxRejected {
+			return
+		}
+	}
+	v.rejected[k] = now.Add(rejectTTL)
 }
 
 // remember caches a valid token until cacheTTL from now, or its expiry if
 // sooner. A full cache drops expired entries; if it is still full, the
 // token is not cached (it is verified again next time).
-func (v *Verifier) remember(k [32]byte, identity string, caller arc.Caller, now time.Time) {
+func (v *Verifier) remember(k [32]byte, identity string, caller arc.Caller, now time.Time, gen uint64) {
 	until := now.Add(cacheTTL)
 	if !caller.ExpiresAt.IsZero() && caller.ExpiresAt.Before(until) {
 		until = caller.ExpiresAt
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	if v.forgets != gen {
+		return
+	}
 	if len(v.cache) >= maxCached {
 		for ck, e := range v.cache {
 			if !now.Before(e.until) {
@@ -169,6 +234,7 @@ func (v *Verifier) remember(k [32]byte, identity string, caller arc.Caller, now 
 func (v *Verifier) Forget(token string) {
 	v.mu.Lock()
 	delete(v.cache, key(token))
+	v.forgets++
 	v.mu.Unlock()
 }
 
@@ -187,11 +253,12 @@ func (v *Verifier) warnOverScoped(caller arc.Caller) {
 	}
 	v.mu.Lock()
 	seen := v.warned[caller.ID]
-	if !seen && len(v.warned) < maxWarned {
+	full := len(v.warned) >= maxWarned
+	if !seen && !full {
 		v.warned[caller.ID] = true
 	}
 	v.mu.Unlock()
-	if !seen {
+	if !seen && !full {
 		log.Printf("WARNING: caller arc-token:%d carries %s; arc-mcp only reads, so a read token is enough", caller.ID, strings.Join(over, ", "))
 	}
 }

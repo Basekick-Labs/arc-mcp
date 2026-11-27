@@ -552,3 +552,41 @@ func get(t *testing.T, url string) *http.Request {
 	}
 	return req
 }
+
+func TestBearerToken(t *testing.T) {
+	for header, want := range map[string]string{
+		"Bearer abc":       "abc",
+		"bearer abc":       "abc",
+		"BEARER  abc  ":    "abc",
+		"Bearer a\tb":      "",
+		"Bearer a b":       "",
+		"Bearer p\u00e4ss": "",
+		"Bearer a\x00":     "",
+		"Basic abc":        "",
+		"Bearer":           "",
+		"Bearer ":          "",
+		"abc":              "",
+	} {
+		h := http.Header{}
+		h.Set("Authorization", header)
+		got, ok := BearerToken(h)
+		if got != want || ok != (want != "") {
+			t.Errorf("%q: %q %v, want %q", header, got, ok, want)
+		}
+	}
+}
+
+func TestRequireTLS(t *testing.T) {
+	lan := &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8080}
+	lo := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
+	v := StaticToken(secret)
+	if checkListener(lan, Options{Verify: v, RequireTLS: true}) == nil {
+		t.Error("plain HTTP on a LAN address accepted with RequireTLS")
+	}
+	if err := checkListener(lan, Options{Verify: v, RequireTLS: true, TLSCertFile: "c", TLSKeyFile: "k"}); err != nil {
+		t.Errorf("TLS refused: %v", err)
+	}
+	if err := checkListener(lo, Options{Verify: v, RequireTLS: true}); err != nil {
+		t.Errorf("loopback refused: %v", err)
+	}
+}

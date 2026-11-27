@@ -68,6 +68,9 @@ http:
   # Serve HTTPS from a kubernetes.io/tls Secret (tls.crt, tls.key). Otherwise
   # terminate TLS at your ingress: the bearer token travels in every request.
   tlsSecretName: ""
+  # TLS terminates in front of arc-mcp (your ingress). Passthrough needs this
+  # or tlsSecretName: its bearer tokens are callers' Arc credentials.
+  tlsUpstream: false
 
 # Room for queries in flight to finish on shutdown: arc-mcp waits up to
 # 4 x arc.timeout + 5s (125s at the default 30s). Raise it with arc.timeout.

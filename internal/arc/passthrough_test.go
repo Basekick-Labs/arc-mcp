@@ -98,6 +98,7 @@ func TestVerifyCaller(t *testing.T) {
 	}{
 		{"valid", 200, `{"valid":true,"token_info":{"id":7,"name":"alice","permissions":["read"]},"permissions":["read"]}`, nil},
 		{"200 but not valid", 200, `{"valid":false}`, ErrVerifyUnavailable},
+		{"valid without a token id", 200, `{"valid":true,"permissions":["read"]}`, ErrVerifyUnavailable},
 		{"200 not Arc's answer", 200, `<html>login</html>`, ErrVerifyUnavailable},
 		{"invalid", 401, `{"valid":false,"error":"Invalid or expired token"}`, ErrCallerRejected},
 		{"forbidden", 403, `{}`, ErrCallerRejected},
@@ -111,12 +112,13 @@ func TestVerifyCaller(t *testing.T) {
 				if r.Header.Get("Authorization") != "Bearer tok" {
 					t.Errorf("verify sent %q", r.Header.Get("Authorization"))
 				}
-				if tt.status == 302 {
+				if tt.status == 302 && r.URL.Path != "/login" {
 					http.Redirect(w, r, "/login", http.StatusFound)
 					return
 				}
 				if r.URL.Path == "/login" {
-					_, _ = io.WriteString(w, `{"valid":true}`)
+					// What following the redirect would accept.
+					_, _ = io.WriteString(w, `{"valid":true,"token_info":{"id":7,"name":"alice","permissions":["read"]}}`)
 					return
 				}
 				w.WriteHeader(tt.status)

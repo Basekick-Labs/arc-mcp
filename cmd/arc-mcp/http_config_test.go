@@ -128,3 +128,13 @@ func TestCheckPassthrough(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPTokenMustBeSendable(t *testing.T) {
+	t.Setenv("ARC_MCP_HTTP_TOKEN_FILE", "")
+	for v, ok := range map[string]bool{"abc123-_.~+/=": true, "two words": false, "p\u00e4ss": false, "a\tb": false} {
+		t.Setenv("ARC_MCP_HTTP_TOKEN", v)
+		if _, err := resolveHTTPToken(); (err == nil) != ok {
+			t.Errorf("%q: err %v", v, err)
+		}
+	}
+}

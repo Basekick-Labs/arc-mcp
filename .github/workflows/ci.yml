@@ -106,8 +106,9 @@ jobs:
           helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok >/dev/null
           helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok --set http.tlsSecretName=tls >/dev/null
           helm template t helm/arc-mcp --set http.insecureListen=true >/dev/null
-          helm template t helm/arc-mcp --set auth.mode=passthrough >/dev/null
-          if helm template t helm/arc-mcp --set auth.mode=passthrough --set arc.token=x >/dev/null 2>&1; then echo "passthrough guard missing"; exit 1; fi
+          helm template t helm/arc-mcp --set auth.mode=passthrough --set http.tlsUpstream=true --set arc.insecure=true >/dev/null
+          if helm template t helm/arc-mcp --set auth.mode=passthrough --set arc.insecure=true >/dev/null 2>&1; then echo "passthrough TLS guard missing"; exit 1; fi
+          if helm template t helm/arc-mcp --set auth.mode=passthrough --set http.tlsUpstream=true --set arc.insecure=true --set arc.token=x >/dev/null 2>&1; then echo "passthrough guard missing"; exit 1; fi
           helm lint helm/arc-mcp --set http.insecureListen=true
           # The guards must refuse, with their own message: no inbound token,
           # and the removed gateway values.

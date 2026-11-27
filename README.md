@@ -49,6 +49,7 @@ arc-mcp \
 | `ARC_MCP_TLS_CERT_FILE`, `ARC_MCP_TLS_KEY_FILE` | HTTP: serve HTTPS with this certificate and key | (none) |
 | `ARC_MCP_ALLOW_ANY_HOST` | HTTP: accept any `Host` header on a loopback listener (see below) | `false` |
 | `ARC_MCP_AUTH_MODE` | HTTP: `static` or `passthrough` (see [Authentication modes](#authentication-modes)) | `static` |
+| `ARC_MCP_TLS_UPSTREAM` | HTTP: `true` when TLS terminates in front of arc-mcp (lets passthrough listen without `--tls-cert`) | `false` |
 
 Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused at startup.
 
@@ -69,6 +70,7 @@ Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused a
 | `--tls-cert`, `--tls-key` | HTTP: serve HTTPS | (none) |
 | `--allow-any-host` | HTTP: turn off DNS-rebinding protection on a loopback listener | `false` |
 | `--auth-mode` | HTTP: `static` or `passthrough` | `static` |
+| `--tls-upstream` | HTTP: TLS terminates in front of arc-mcp | `false` |
 
 Every flag also has the environment variable in the table above. The inbound HTTP token has no flag, so it never shows in the process list.
 
@@ -155,7 +157,8 @@ claude mcp add --transport http arc https://arc-mcp.example.com/mcp --header 'Au
 - A missing or invalid token gets 401; when Arc cannot answer the check, 503 with `Retry-After`. A valid token is remembered for up to 60 seconds (never past its expiry), so a token revoked in Arc still passes arc-mcp's check for up to a minute, but every query it sends is refused by Arc at once, and arc-mcp then forgets it.
 - arc-mcp's read-only checks, row cap and size limit apply whatever the caller's token allows: an admin token reads no more than a read token. A token carrying write, delete or admin is logged once with a warning; callers should use read tokens.
 - **Who did what.** The access log names each caller by Arc's token id (`caller=arc-token:42`), and Arc's own audit log, when enabled (an Arc Enterprise feature; reads are recorded only with `audit_log.include_reads`), records the token's name for each query. Arc sees every request coming from arc-mcp's address, so the access log's `peer=` is the only record of the caller's address.
-- **Helm:** `--set auth.mode=passthrough`, with no `arc.token`, `arc.tokenSecretRef` or `http.tokenSecretRef`.
+- **TLS is required** on a non-loopback address: the bearer token is a caller's Arc credential. Use `--tls-cert`/`--tls-key`, or `--tls-upstream` (`ARC_MCP_TLS_UPSTREAM`) when a proxy or ingress terminates TLS in front of arc-mcp. The Arc URL follows the same rule as a static token: `https://`, a loopback address, or `--insecure`.
+- **Helm:** `--set auth.mode=passthrough`, with no `arc.token`, `arc.tokenSecretRef` or `http.tokenSecretRef`; with `http.tlsSecretName` or `http.tlsUpstream=true`; and an `https://` `arc.url` or `arc.insecure=true` (the default `arc.url` is plain HTTP inside the cluster).
 
 **Upgrading from the `arc-mcp-gateway` image.** Earlier releases exposed HTTP through a separate image that wrapped arc-mcp with supergateway, serving the older HTTP+SSE transport at `/sse`. That image is no longer published. Run the `arc-mcp` image with `--transport http` instead, and point clients at `/mcp`. With Docker Compose, set `ARC_MCP_VERSION` in your `.env` to a release that has the HTTP transport (an `.env` copied from an older example pins one that does not) and add `ARC_MCP_HTTP_TOKEN`.
 

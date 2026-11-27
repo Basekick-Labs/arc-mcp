@@ -187,17 +187,19 @@ func TestCache(t *testing.T) {
 	if n := fake.verifies.Load(); n != 1 {
 		t.Errorf("%d verifications for three calls, want 1", n)
 	}
-	// Invalid tokens are not cached: each is asked again.
+	// A rejected token is refused again without asking Arc, for rejectTTL.
 	call(t, srv, "bad")
-	call(t, srv, "bad")
-	if n := fake.verifies.Load(); n != 3 {
-		t.Errorf("%d verifications, want 3", n)
+	if status, _ := call(t, srv, "bad"); status != http.StatusUnauthorized {
+		t.Errorf("rejected token: status %d", status)
+	}
+	if n := fake.verifies.Load(); n != 2 {
+		t.Errorf("%d verifications, want 2", n)
 	}
 	// After the TTL, Arc is asked again.
 	now = now.Add(cacheTTL + time.Second)
 	call(t, srv, "good")
-	if n := fake.verifies.Load(); n != 4 {
-		t.Errorf("%d verifications after the TTL, want 4", n)
+	if n := fake.verifies.Load(); n != 3 {
+		t.Errorf("%d verifications after the TTL, want 3", n)
 	}
 	// A token Arc rejects on a query is dropped from the cache at once.
 	fake.revoke("good")
@@ -212,7 +214,7 @@ func TestCache(t *testing.T) {
 func TestCacheHoldsNoTokenAndHonoursExpiry(t *testing.T) {
 	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
 	now := time.Now()
-	v.remember(key("secret-token"), "arc-token:1", arc.Caller{ID: 1, ExpiresAt: now.Add(10 * time.Second)}, now)
+	v.remember(key("secret-token"), "arc-token:1", arc.Caller{ID: 1, ExpiresAt: now.Add(10 * time.Second)}, now, 0)
 	for k, e := range v.cache {
 		if bytes.Contains(k[:], []byte("secret-token")) {
 			t.Error("the cache key holds the token")
@@ -230,14 +232,12 @@ func TestVerifySlots(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < maxVerifying; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			_, _ = v.Verify(context.Background(), fmt.Sprintf("t%d", time.Now().UnixNano()))
-		}()
+			_, _ = v.Verify(context.Background(), fmt.Sprintf("t%d", i))
+		}(i)
 	}
-	for fake.verifies.Load() < maxVerifying {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, func() bool { return fake.verifies.Load() >= maxVerifying })
 	start := time.Now()
 	if _, err := v.Verify(context.Background(), "one-more"); !errors.Is(err, httpserve.ErrUnavailable) {
 		t.Errorf("verification past the slots: %v, want ErrUnavailable", err)
@@ -326,5 +326,171 @@ func TestMiddlewareWithoutHeader(t *testing.T) {
 	}
 	if got != ctx {
 		t.Error("the context changed")
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Past maxWaiting verifications waiting for a slot, 503 at once.
+func TestWaitingIsBounded(t *testing.T) {
+	gate := make(chan struct{})
+	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
+	var calls atomic.Int32
+	v.verifyCaller = func(context.Context, string) (arc.Caller, error) {
+		calls.Add(1)
+		<-gate
+		return arc.Caller{ID: 1}, nil
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < maxVerifying+maxWaiting; i++ {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); _, _ = v.Verify(context.Background(), fmt.Sprintf("w%d", i)) }(i)
+	}
+	waitFor(t, func() bool { return int(calls.Load()) == maxVerifying && len(v.waiting) == maxWaiting })
+	start := time.Now()
+	if _, err := v.Verify(context.Background(), "one-too-many"); !errors.Is(err, httpserve.ErrUnavailable) || time.Since(start) > 100*time.Millisecond {
+		t.Errorf("past the waiting bound: %v after %s, want ErrUnavailable at once", err, time.Since(start))
+	}
+	close(gate)
+	wg.Wait()
+}
+
+// Tokens that differ only late are separate: the cache and the shared
+// verification are keyed by the whole token.
+func TestTokensAreKeyedWhole(t *testing.T) {
+	gate := make(chan struct{})
+	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
+	v.verifyCaller = func(_ context.Context, token string) (arc.Caller, error) {
+		<-gate
+		switch token {
+		case "token-aaaaaaaa-1":
+			return arc.Caller{ID: 1}, nil
+		case "token-aaaaaaaa-2":
+			return arc.Caller{ID: 2}, nil
+		}
+		return arc.Caller{}, arc.ErrCallerRejected
+	}
+	toks := []string{"token-aaaaaaaa-1", "token-aaaaaaaa-2", "token-aaaaaaaa-3"}
+	got := make([]string, 3)
+	errs := make([]error, 3)
+	var wg sync.WaitGroup
+	for i, tok := range toks {
+		wg.Add(1)
+		go func(i int, tok string) { defer wg.Done(); got[i], errs[i] = v.Verify(context.Background(), tok) }(i, tok)
+	}
+	waitFor(t, func() bool { v.mu.Lock(); defer v.mu.Unlock(); return len(v.flights) == 3 })
+	close(gate)
+	wg.Wait()
+	if got[0] != "arc-token:1" || got[1] != "arc-token:2" || errs[2] == nil {
+		t.Errorf("identities %q, errors %v", got, errs)
+	}
+	if id, _ := v.Verify(context.Background(), toks[1]); id != "arc-token:2" {
+		t.Errorf("cached identity %q", id)
+	}
+	if _, err := v.Verify(context.Background(), toks[2]); err == nil {
+		t.Error("the rejected token was accepted from the cache")
+	}
+}
+
+// Requests waiting on a verification Arc rejects are all rejected.
+func TestFollowersOfARejectionAreRejected(t *testing.T) {
+	gate := make(chan struct{})
+	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
+	var calls atomic.Int32
+	v.verifyCaller = func(context.Context, string) (arc.Caller, error) {
+		calls.Add(1)
+		<-gate
+		return arc.Caller{}, arc.ErrCallerRejected
+	}
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := v.Verify(context.Background(), "bad"); err == nil {
+				accepted.Add(1)
+			}
+		}()
+	}
+	waitFor(t, func() bool { return calls.Load() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+	if accepted.Load() != 0 || calls.Load() != 1 {
+		t.Errorf("%d accepted, %d calls", accepted.Load(), calls.Load())
+	}
+}
+
+// A panic while verifying releases the flight: the next request is not
+// stuck behind it.
+func TestPanicReleasesTheFlight(t *testing.T) {
+	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
+	v.verifyCaller = func(context.Context, string) (arc.Caller, error) { panic("boom") }
+	if _, err := v.Verify(context.Background(), "tok"); !errors.Is(err, httpserve.ErrUnavailable) {
+		t.Errorf("err %v", err)
+	}
+	v.verifyCaller = func(context.Context, string) (arc.Caller, error) { return arc.Caller{ID: 3}, nil }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if id, err := v.Verify(ctx, "tok"); id != "arc-token:3" || err != nil {
+		t.Errorf("after the panic: %q %v", id, err)
+	}
+}
+
+// A Forget that arrives while the token is being verified wins: the result
+// is not cached.
+func TestForgetDuringVerification(t *testing.T) {
+	gate := make(chan struct{})
+	v := New(arc.NewClient("http://127.0.0.1:1", "", time.Second))
+	var calls atomic.Int32
+	v.verifyCaller = func(context.Context, string) (arc.Caller, error) {
+		if calls.Add(1) == 1 {
+			<-gate
+		}
+		return arc.Caller{ID: 1}, nil
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = v.Verify(context.Background(), "tok") }()
+	waitFor(t, func() bool { return calls.Load() == 1 })
+	v.Forget("tok")
+	close(gate)
+	<-done
+	_, _ = v.Verify(context.Background(), "tok")
+	if calls.Load() != 2 {
+		t.Errorf("%d verifications, want 2 (the first result must not be cached)", calls.Load())
+	}
+}
+
+// The token sent to Arc is the one the endpoint verified, however the
+// header spelled the scheme and spaces.
+func TestHeaderSpellingReachesArcNormalized(t *testing.T) {
+	fake := &fakeArc{tokens: map[string]int64{"good": 1}}
+	_, srv := setup(t, fake)
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"database":"db","sql":"SELECT token FROM t"}}}`
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+httpserve.Path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "bearer   good  ")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(b), "seen:good") {
+		t.Errorf("%d %s", resp.StatusCode, b)
 	}
 }

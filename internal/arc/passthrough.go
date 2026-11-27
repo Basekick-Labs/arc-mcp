@@ -152,7 +152,7 @@ func (c *Client) VerifyCaller(ctx context.Context, token string) (Caller, error)
 	case err != nil:
 		logVerifyTrouble("Arc's verify endpoint is unreachable: %v", err)
 		return Caller{}, ErrVerifyUnavailable
-	case status == http.StatusOK && ans != nil && *ans.Valid:
+	case status == http.StatusOK && ans != nil && *ans.Valid && ans.TokenInfo != nil && ans.TokenInfo.ID > 0:
 		caller := Caller{Permissions: ans.Permissions}
 		if ti := ans.TokenInfo; ti != nil {
 			caller.ID, caller.Name = ti.ID, ti.Name
@@ -166,6 +166,9 @@ func (c *Client) VerifyCaller(ctx context.Context, token string) (Caller, error)
 		return caller, nil
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return Caller{}, ErrCallerRejected
+	case status == http.StatusNotFound:
+		logVerifyTrouble("Arc's verify endpoint is gone (HTTP 404): Arc's authentication looks turned off; refusing callers until it is back on")
+		return Caller{}, ErrVerifyUnavailable
 	default:
 		logVerifyTrouble("Arc's verify endpoint answered HTTP %d (Arc's verify response: %v); refusing callers until it answers as Arc does", status, ans != nil)
 		return Caller{}, ErrVerifyUnavailable
