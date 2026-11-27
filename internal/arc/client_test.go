@@ -144,3 +144,23 @@ func TestClient_Query_NumbersKeepArcText(t *testing.T) {
 		t.Errorf("ExecutionTimeMs = %v, want 1.5", res.ExecutionTimeMs)
 	}
 }
+
+// #38: types decoded when Arc sends them, nil when it does not.
+func TestClient_Query_Types(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"success":true,"columns":["n"],"types":["int64"],"data":[[1]],"row_count":1}`: "int64",
+		`{"success":true,"columns":["n"],"data":[[1]],"row_count":1}`:                   "",
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		r, err := NewClient(srv.URL, "", 0).Query(context.Background(), "db", "SELECT 1")
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(r.Types, ","); got != want || (want == "" && r.Types != nil) {
+			t.Errorf("types %q (nil %v), want %q", r.Types, r.Types == nil, want)
+		}
+	}
+}
