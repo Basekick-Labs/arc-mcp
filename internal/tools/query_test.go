@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,9 @@ type fakeArc struct {
 	mu    sync.Mutex
 	sqls  []string
 	reply func(sql string) (status int, body string)
+	// replyCtx, when set, is used instead of reply: it sees the request's
+	// context, so it can wait for the client to give up.
+	replyCtx func(ctx context.Context, sql string) (status int, body string)
 }
 
 func (f *fakeArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +35,13 @@ func (f *fakeArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.sqls = append(f.sqls, req.SQL)
 	f.mu.Unlock()
-	status, body := f.reply(req.SQL)
+	var status int
+	var body string
+	if f.replyCtx != nil {
+		status, body = f.replyCtx(r.Context(), req.SQL)
+	} else {
+		status, body = f.reply(req.SQL)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)

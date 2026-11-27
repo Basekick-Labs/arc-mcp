@@ -24,10 +24,11 @@ type Error struct {
 	Status int    // HTTP status when the error came from a response, 0 otherwise
 	Detail string // full detail — log to stderr, never send to LLM
 	// Message is text safe to show the model, set where it can act on it:
-	// Arc's fixed validation message for a refused request (HTTP 400), the
-	// fixable part of a failed query (redacted, see queryErrorText), or a
-	// fixed hint for a query that ran out of memory, timed out or lost data
-	// mid-run. Empty otherwise; UserMessage then gives the generic text.
+	// Arc's fixed validation message for a refused request (HTTP 400), its
+	// governance reason for a refused query (HTTP 429), the fixable part of
+	// a failed query (redacted, see queryErrorText), or a fixed hint for a
+	// query that ran out of memory, timed out or lost data mid-run. Empty
+	// otherwise; UserMessage then gives the generic text.
 	Message string
 }
 
@@ -99,9 +100,13 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	switch {
 	case statusCode == http.StatusBadRequest:
 		e.Message = refusalText(snippet)
+	case statusCode == http.StatusTooManyRequests:
+		// Arc's governance refusal: a fixed reason such as "Rate limit
+		// exceeded: 10 queries per minute" or "Daily query quota exceeded".
+		e.Message = refusalText(snippet)
 	case op == "query" && statusCode == http.StatusInternalServerError:
 		if isOutOfMemory(snippet) {
-			e.Message = "Arc ran out of memory running it. Aggregate (time_bucket, GROUP BY), narrow the time range, or select fewer columns."
+			e.Message = outOfMemoryHint
 		} else {
 			e.Message = queryErrorFromBody(snippet)
 		}
@@ -113,6 +118,17 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 		e.Message = "data it read was removed while it ran (retention, compaction or a delete). Run it again once."
 	}
 	return e
+}
+
+// outOfMemoryHint is the hint for a query that ran out of memory in Arc.
+const outOfMemoryHint = "Arc ran out of memory running it. Aggregate (time_bucket, GROUP BY), narrow the time range, or select fewer columns."
+
+// OutOfMemory reports whether err is a query Arc ran out of memory running.
+// Tools whose SQL the model does not write use it to drop the hint, which
+// is advice for the model's own query.
+func OutOfMemory(err error) bool {
+	var ae *Error
+	return errors.As(err, &ae) && ae.Kind == KindServer && ae.Status == http.StatusInternalServerError && ae.Message == outOfMemoryHint
 }
 
 // timedOutHint is the hint for a query that ran out of time, in Arc or in
@@ -228,7 +244,7 @@ func UserMessage(err error) string {
 			return "Arc could not be reached. Ask the user to check that the Arc server is running at the configured URL."
 		case KindServer:
 			switch {
-			case ae.Message != "" && ae.Status == http.StatusBadRequest:
+			case ae.Message != "" && (ae.Status == http.StatusBadRequest || ae.Status == http.StatusTooManyRequests):
 				return "Arc refused the request: " + ae.Message
 			case ae.Message != "":
 				// Only the query path sets Message on other statuses.
@@ -323,6 +339,9 @@ func NewClient(baseURL, token string, timeout time.Duration) *Client {
 		},
 	}
 }
+
+// Timeout is the limit on each request to Arc (arc-mcp's --timeout).
+func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
 // Health checks if the Arc instance is reachable.
 func (c *Client) Health(ctx context.Context) error {

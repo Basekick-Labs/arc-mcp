@@ -164,7 +164,8 @@ func TestListingRoutes_OtherStatusesAreNotScoped(t *testing.T) {
 }
 
 // A 400 is Arc refusing the request as invalid, with a fixed validation
-// message the model can act on. Other statuses keep the generic text.
+// message the model can act on; a 429 is its governance refusing a query,
+// with a fixed reason. Other statuses keep the generic text.
 func TestUserMessage_ValidationRefusalCarriesArcsWords(t *testing.T) {
 	long := strings.Repeat("x", 400)
 	tests := []struct {
@@ -177,6 +178,10 @@ func TestUserMessage_ValidationRefusalCarriesArcsWords(t *testing.T) {
 		{400, `{"success":false,"error":"` + long + `"}`, "Arc refused the request: " + long[:300] + "…"},
 		{500, `{"success":false,"error":"IO Error: /data/arc/x.parquet"}`, "Arc returned an error — see server logs for details."},
 		{400, `<html><body>400 Bad Request from proxy</body></html>`, "Arc returned an error — see server logs for details."},
+		// Arc's governance refusals (internal/governance in the arc repo).
+		{429, `{"success":false,"error":"Rate limit exceeded: 10 queries per minute","execution_time_ms":0}`, "Arc refused the request: Rate limit exceeded: 10 queries per minute"},
+		{429, `{"success":false,"error":"Hourly query quota exceeded"}`, "Arc refused the request: Hourly query quota exceeded"},
+		{429, `<html><body>429 Too Many Requests from proxy</body></html>`, "Arc returned an error — see server logs for details."},
 	}
 	for _, tt := range tests {
 		got := UserMessage(arcErrorFrom("query", tt.status, []byte(tt.body)))
