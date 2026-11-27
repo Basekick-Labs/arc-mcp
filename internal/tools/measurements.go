@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,10 +28,11 @@ type DescribeMeasurementArgs struct {
 // RegisterListMeasurements registers the list_measurements tool.
 func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_measurements",
-		Title:       "List measurements",
-		Annotations: readOnly("List measurements"),
-		Description: "List all measurements (tables) in a database. Returns measurement names.",
+		Name:         "list_measurements",
+		OutputSchema: measurementsOutputSchema,
+		Title:        "List measurements",
+		Annotations:  readOnly("List measurements"),
+		Description:  "List all measurements (tables) in a database. Returns measurement names.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ListMeasurementsArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" {
@@ -68,12 +70,16 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 			}, nil, nil
 		}
 
+		structured := MeasurementsOutput{Database: args.Database, Measurements: []string{}, Count: len(result.Measurements)}
+		for _, m := range result.Measurements {
+			structured.Measurements = append(structured.Measurements, m.Name)
+		}
 		if len(result.Measurements) == 0 {
-			return &mcp.CallToolResult{
+			return withStructured(&mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: fmt.Sprintf("No measurements found in database '%s'.", args.Database)},
 				},
-			}, nil, nil
+			}, structured), nil, nil
 		}
 
 		var sb strings.Builder
@@ -81,21 +87,22 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 		for _, m := range result.Measurements {
 			fmt.Fprintf(&sb, "- %s\n", m.Name)
 		}
-		return &mcp.CallToolResult{
+		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: sb.String()},
 			},
-		}, nil, nil
+		}, structured), nil, nil
 	})
 }
 
 // RegisterDescribeMeasurement registers the describe_measurement tool.
 func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "describe_measurement",
-		Title:       "Describe a measurement",
-		Annotations: readOnly("Describe a measurement"),
-		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics read every file's metadata and may scan the time column; a statistic that cannot be computed says why.",
+		Name:         "describe_measurement",
+		OutputSchema: describeOutputSchema,
+		Title:        "Describe a measurement",
+		Annotations:  readOnly("Describe a measurement"),
+		Description:  "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics read every file's metadata and may scan the time column; a statistic that cannot be computed says why.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
@@ -172,11 +179,19 @@ func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResp
 			text = TruncateResponse(text, maxResponseChars)
 		}
 
-		return &mcp.CallToolResult{
+		structured := DescribeOutput{Database: args.Database, Measurement: args.Measurement, Columns: []ColumnInfo{}, Statistics: statsOutput(stats)}
+		for _, c := range columns {
+			typ := c.typ
+			if typ == unknownType {
+				typ = ""
+			}
+			structured.Columns = append(structured.Columns, ColumnInfo{Name: c.name, Type: typ})
+		}
+		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
 			},
-		}, nil, nil
+		}, structured), nil, nil
 	})
 }
 
@@ -227,7 +242,7 @@ const statsLatestWindow = "(SELECT now() - INTERVAL '30 days')"
 // --timeout more than its DESCRIBE. A statement that fails (timed out, refused by Arc's governance,
 // a query error) marks its lines "not computed" with the reason, and nothing
 // further is sent.
-func measurementStats(ctx context.Context, client *arc.Client, database, measurement string, describeMs float64) [3]string {
+func measurementStats(ctx context.Context, client *arc.Client, database, measurement string, describeMs float64) [3]statResult {
 	budget := deadlineBudget(ctx, client)
 	if t := client.Timeout(); t > 0 {
 		var cancel context.CancelFunc
@@ -235,7 +250,7 @@ func measurementStats(ctx context.Context, client *arc.Client, database, measure
 		defer cancel()
 	}
 	folded := describeMs > 0 && describeMs < statsGateMs
-	var out [3]string
+	var out [3]statResult
 	// Safe to interpolate: the caller validated measurement with ValidateIdentifier.
 	sql := fmt.Sprintf("SELECT count(*) as row_count, min(time) as earliest, max(time) as latest FROM %s", measurement)
 	if folded {
@@ -273,15 +288,66 @@ func statsRow(ctx context.Context, client *arc.Client, database, sql string, n i
 
 // statValue renders value i of row, or, when err is set, why it is missing
 // (see failureReason).
-func statValue(budget time.Duration, row []any, i int, err error) string {
+// statResult is one statistic: its value as Arc returned it (nil for a
+// SQL null), or, when it could not be computed, why.
+type statResult struct {
+	value  any
+	reason string
+}
+
+// String is the statistic as the text shows it.
+func (s statResult) String() string {
+	switch {
+	case s.reason != "":
+		return s.reason
+	case s.value == nil:
+		return "none"
+	default:
+		return fmt.Sprintf("%v", s.value)
+	}
+}
+
+func statValue(budget time.Duration, row []any, i int, err error) statResult {
 	switch reason := failureReason(budget, err); {
 	case err == nil:
-		return fmt.Sprintf("%v", row[i])
+		return statResult{value: row[i]}
 	case reason != "":
-		return "not computed (" + reason + ")"
+		return statResult{reason: "not computed (" + reason + ")"}
 	default:
-		return "not computed: " + arc.UserMessage(err)
+		return statResult{reason: "not computed: " + arc.UserMessage(err)}
 	}
+}
+
+// statsOutput is the structured form of describe's statistics.
+func statsOutput(stats [3]statResult) StatsOutput {
+	var out StatsOutput
+	names := [3]string{"row_count", "earliest", "latest"}
+	for i, s := range stats {
+		if s.reason != "" {
+			if out.Errors == nil {
+				out.Errors = map[string]string{}
+			}
+			out.Errors[names[i]] = s.reason
+			continue
+		}
+		if s.value == nil {
+			continue
+		}
+		str := fmt.Sprintf("%v", s.value)
+		switch i {
+		case 0:
+			if n, err := strconv.ParseInt(str, 10, 64); err == nil {
+				out.RowCount = &n
+			} else {
+				out.Errors = map[string]string{names[0]: "Arc returned a row count that is not an integer: " + str}
+			}
+		case 1:
+			out.Earliest = &str
+		case 2:
+			out.Latest = &str
+		}
+	}
+	return out
 }
 
 // failureReason is a short reason for a describe statement that ran out of

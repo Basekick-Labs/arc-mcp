@@ -131,7 +131,7 @@ func TestDescribe_FullStatementHasNoFallback(t *testing.T) {
 	}}
 	text := describeCPU(t, fake, 5*time.Second)
 	wantSent(t, fake, "DESCRIBE SELECT * FROM cpu", fullStatsSQL)
-	if want := statsBlock("5", "<nil>", "<nil>"); !strings.HasSuffix(text, want) {
+	if want := statsBlock("5", "none", "none"); !strings.HasSuffix(text, want) {
 		t.Errorf("want suffix %q\ngot:\n%s", want, text)
 	}
 }
@@ -147,7 +147,7 @@ func TestDescribe_ZeroRowsNoFallback(t *testing.T) {
 	}}
 	text := describeCPU(t, fake, 5*time.Second)
 	wantSent(t, fake, "DESCRIBE SELECT * FROM cpu", foldedStatsSQL)
-	if want := statsBlock("0", "<nil>", "<nil>"); !strings.HasSuffix(text, want) {
+	if want := statsBlock("0", "none", "none"); !strings.HasSuffix(text, want) {
 		t.Errorf("want suffix %q\ngot:\n%s", want, text)
 	}
 }
@@ -417,7 +417,7 @@ func TestDescribe_StatsTimeoutNamesTheDeadlineThatFired(t *testing.T) {
 	defer cancel()
 	got := measurementStats(ctx, client, "db", "cpu", 30)
 	for i, v := range got {
-		if v != "not computed (timed out after 150ms)" {
+		if v.String() != "not computed (timed out after 150ms)" {
 			t.Errorf("line %d = %q", i, v)
 		}
 	}

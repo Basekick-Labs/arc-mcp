@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"strconv"
-	"strings"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,9 +27,10 @@ type GetSampleDataArgs struct {
 // MinRowLimit..MaxRowLimit (see ClampRowLimit).
 func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "query",
-		Title:       "Run a read-only SQL query",
-		Annotations: readOnly("Run a read-only SQL query"),
+		Name:         "query",
+		OutputSchema: queryOutputSchema,
+		Title:        "Run a read-only SQL query",
+		Annotations:  readOnly("Run a read-only SQL query"),
 		Description: "Execute one read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. " +
 			"Bound it by time with a top-level WHERE on time (time > now() - INTERVAL '1 hour') in a single-table query: Arc then reads only those partitions; a JOIN, CTE or subquery reads all history. " +
 			"At most " + strconv.Itoa(maxRows) + " rows come back; when there are more, the answer says so at the top. " +
@@ -78,38 +78,38 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 
 		// Arc was asked for maxRows+1 rows; getting them all means there are
 		// more. Statements sent unchanged are cut here too.
-		var notes []string
+		var notes []note
 		if len(result.Data) > maxRows {
 			result.Data = result.Data[:maxRows]
 			hint := "Narrow the statement to see the rest."
 			if q.Selectable() {
 				hint = "Aggregate (time_bucket, GROUP BY) or narrow the time range to see all of it."
 			}
-			notes = append(notes, fmt.Sprintf("**Showing the first %s; the query returned more.** %s", plural(maxRows, "row"), hint))
+			notes = append(notes, note{"row_limit", fmt.Sprintf("Showing the first %s; the query returned more.", plural(maxRows, "row")), hint})
 		}
 		if result.RowsCapped {
-			notes = append(notes, fmt.Sprintf("**Arc's row cap (%d) cut this result; more rows exist.** Aggregate or narrow the time range.", result.RowCap))
+			notes = append(notes, note{"arc_row_cap", fmt.Sprintf("Arc's row cap (%d) cut this result; more rows exist.", result.RowCap), "Aggregate or narrow the time range."})
 		}
 		if result.Truncated {
 			log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
 			if why := result.FixableTruncation(); why != "" {
 				// A failure the query itself causes (a bad cast on a later
 				// row, say) happens again on every retry: say what it is.
-				notes = append(notes, "**Arc stopped partway through this result, so it is incomplete:** "+why+" Fix the query; running it again fails the same way.")
+				notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete:", why + " Fix the query; running it again fails the same way."})
 			} else {
-				notes = append(notes, "**Arc stopped partway through this result, so it is incomplete.** Try again, or narrow the query.")
+				notes = append(notes, note{"stream_incomplete", "Arc stopped partway through this result, so it is incomplete.", "Try again, or narrow the query."})
 			}
 		}
 		noData := fmt.Sprintf("No data: Arc found nothing to read for this query. A measurement that does not exist in database '%s', "+
 			"or has no data written yet, reads as empty (an aggregate over it returns nothing, not 0). Check the name with list_measurements.", args.Database)
-		text := formatQueryResult(result, notes, noData)
+		text, structured := renderResult(result, notes, noData, maxResponseChars)
 		if maxResponseChars > 0 {
-			text = TruncateResponse(text, maxResponseChars)
+			text = TruncateResponse(text, maxResponseChars) // a backstop; renderResult already fits
 		}
 
-		return &mcp.CallToolResult{
+		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: text}},
-		}, nil, nil
+		}, structured), nil, nil
 	})
 }
 
@@ -124,10 +124,11 @@ var sampleWindows = []string{
 // RegisterGetSampleData registers the get_sample_data tool.
 func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_sample_data",
-		Title:       "Sample recent rows",
-		Annotations: readOnly("Sample recent rows"),
-		Description: "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
+		Name:         "get_sample_data",
+		OutputSchema: queryOutputSchema,
+		Title:        "Sample recent rows",
+		Annotations:  readOnly("Sample recent rows"),
+		Description:  "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
 		if args.Database == "" || args.Measurement == "" {
@@ -181,70 +182,15 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 		}
 
 		noData := fmt.Sprintf("No data: measurement '%s' does not exist in database '%s', or has no data written yet. Check the name with list_measurements.", args.Measurement, args.Database)
-		text := formatQueryResult(result, nil, noData)
+		text, structured := renderResult(result, nil, noData, maxResponseChars)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
 
-		return &mcp.CallToolResult{
+		return withStructured(&mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: text}},
-		}, nil, nil
+		}, structured), nil, nil
 	})
-}
-
-// formatQueryResult formats a QueryResponse as a readable markdown table.
-// notes say the result is incomplete and why. They go first, so they
-// survive when TruncateResponse later cuts the text from the end. noData is
-// the answer when Arc read nothing at all: it returns no columns only when it
-// found no files, which means a measurement that does not exist or has no
-// data (a time range that matches nothing still returns the columns).
-func formatQueryResult(result *arc.QueryResponse, notes []string, noData string) string {
-	if len(result.Columns) == 0 {
-		return noData
-	}
-
-	var sb strings.Builder
-	for _, n := range notes {
-		sb.WriteString(n)
-		sb.WriteString("\n\n")
-	}
-
-	// Header
-	sb.WriteString("| ")
-	for i, col := range result.Columns {
-		if i > 0 {
-			sb.WriteString(" | ")
-		}
-		sb.WriteString(escapeMarkdownCell(col))
-	}
-	sb.WriteString(" |\n")
-
-	// Separator
-	sb.WriteString("|")
-	for range result.Columns {
-		sb.WriteString("---|")
-	}
-	sb.WriteString("\n")
-
-	// Rows
-	for _, row := range result.Data {
-		sb.WriteString("| ")
-		for i, val := range row {
-			if i > 0 {
-				sb.WriteString(" | ")
-			}
-			sb.WriteString(escapeMarkdownCell(val))
-		}
-		sb.WriteString(" |\n")
-	}
-
-	verb := "returned"
-	if len(notes) > 0 {
-		verb = "shown"
-	}
-	fmt.Fprintf(&sb, "\n*%s %s in %.1fms*", plural(len(result.Data), "row"), verb, result.ExecutionTimeMs)
-
-	return sb.String()
 }
 
 // truncateForLog shortens a SQL preview for stderr logging to avoid filling
