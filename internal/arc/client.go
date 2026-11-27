@@ -71,7 +71,11 @@ func (e *Error) Error() string { return e.Kind + ": " + e.Detail }
 // arcErrorFrom classifies a non-2xx HTTP response into an Error and logs
 // the full body snippet to stderr. Callers receive only the Kind.
 func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
-	detail := fmt.Sprintf("%s: HTTP %d: %s", op, statusCode, strings.TrimSpace(string(snippet)))
+	logged := snippet
+	if len(logged) > maxErrorBodyBytes {
+		logged = logged[:maxErrorBodyBytes]
+	}
+	detail := fmt.Sprintf("%s: HTTP %d: %s", op, statusCode, strings.TrimSpace(string(logged)))
 	log.Printf("arc error: %s", detail)
 	kind := KindServer
 	switch {
@@ -87,8 +91,17 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 		kind = KindNotFound
 	}
 	e := &Error{Kind: kind, Status: statusCode, Detail: detail}
-	if statusCode == http.StatusBadRequest {
+	switch {
+	case statusCode == http.StatusBadRequest:
 		e.Message = refusalText(snippet)
+	case op == "query" && statusCode == http.StatusInternalServerError:
+		if isOutOfMemory(snippet) {
+			e.Message = "Arc ran out of memory running it. Aggregate (time_bucket, GROUP BY), narrow the time range, or select fewer columns."
+		} else {
+			e.Message = queryErrorFromBody(snippet)
+		}
+	case op == "query" && statusCode == http.StatusGatewayTimeout:
+		e.Message = "it timed out in Arc. Aggregate (time_bucket, GROUP BY) or narrow the time range, then try again."
 	}
 	return e
 }
@@ -194,8 +207,11 @@ func UserMessage(err error) string {
 		case KindQuery:
 			return "Arc rejected the query — check the SQL syntax."
 		case KindServer:
-			if ae.Message != "" {
+			switch {
+			case ae.Message != "" && ae.Status == http.StatusBadRequest:
 				return "Arc refused the request: " + ae.Message
+			case ae.Message != "":
+				return "The query failed: " + ae.Message
 			}
 			return "Arc returned an error — see server logs for details."
 		default:
@@ -443,7 +459,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 	respBody := io.LimitReader(resp.Body, maxArcResponseBytes+1)
 
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(respBody, maxErrorBodyBytes))
+		snippet, _ := io.ReadAll(io.LimitReader(respBody, maxQueryErrorBodyBytes))
 		return nil, arcErrorFrom("query", resp.StatusCode, snippet)
 	}
 

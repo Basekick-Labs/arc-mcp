@@ -1,8 +1,8 @@
 # arc-mcp
 
-MCP (Model Context Protocol) server for [Arc](https://github.com/basekick-labs/arc) — a high-performance columnar analytical database.
+MCP (Model Context Protocol) server for [Arc](https://github.com/basekick-labs/arc), the open-source time-series lakehouse: every telemetry reading kept at full resolution, recent data hot and years of history as Parquet in your own bucket, queried with one SQL.
 
-Connect any MCP-compatible LLM (Claude, GPT, etc.) to your Arc instance to discover schemas and query data using natural language.
+Connect any MCP-compatible assistant (Claude, Cursor, and others) to your Arc instance and ask questions of your whole history in natural language. arc-mcp only reads: it discovers databases and measurements, describes their schema, and runs read-only SQL with the guardrails an agent needs (time-bounded queries, a row cap that says when more rows exist, Arc's own errors passed back so the model can fix its SQL).
 
 ## Installation
 

@@ -342,3 +342,60 @@ func TestQuery_ArcCapAndTruncationAreSaid(t *testing.T) {
 		})
 	}
 }
+
+// #17: every tool is marked read-only and closed-world, with a title, so
+// clients can run it without asking the user each time.
+func TestEveryToolIsAnnotatedReadOnly(t *testing.T) {
+	cs := newSession(t, &fakeArc{reply: func(string) (int, string) { return 200, rowsBody(1) }}, func(server *mcp.Server, client *arc.Client) {
+		RegisterListDatabases(server, client)
+		RegisterListMeasurements(server, client)
+		RegisterDescribeMeasurement(server, client, 50_000)
+		RegisterQuery(server, client, 500, 50_000)
+		RegisterGetSampleData(server, client, 50_000)
+	})
+	tools, err := cs.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools.Tools) != 5 {
+		t.Fatalf("%d tools registered, want 5", len(tools.Tools))
+	}
+	for _, tool := range tools.Tools {
+		a := tool.Annotations
+		if a == nil || !a.ReadOnlyHint || a.Title == "" || a.OpenWorldHint == nil || *a.OpenWorldHint {
+			t.Errorf("%s: annotations %+v", tool.Name, a)
+		}
+	}
+}
+
+// Arc returns no columns only when it found nothing to read: a measurement
+// that does not exist or has no data. Say that, naming where to look.
+func TestEmptyResultNamesTheLikelyCause(t *testing.T) {
+	fake := &fakeArc{reply: func(string) (int, string) {
+		return 200, `{"success":true,"columns":[],"data":[],"row_count":0,"execution_time_ms":1}`
+	}}
+	cs := dataSession(t, fake, 500, 50_000)
+
+	text, isErr := call(t, cs, "query", map[string]any{"database": "telemetry", "sql": "SELECT avg(v) FROM cpuu"})
+	if isErr || !strings.Contains(text, "No data") || !strings.Contains(text, "database 'telemetry'") || !strings.Contains(text, "not 0") {
+		t.Errorf("query: isErr=%v %q", isErr, text)
+	}
+	text, _ = call(t, cs, "get_sample_data", map[string]any{"database": "telemetry", "measurement": "cpuu"})
+	if !strings.Contains(text, "measurement 'cpuu' does not exist in database 'telemetry'") {
+		t.Errorf("get_sample_data: %q", text)
+	}
+}
+
+// A failure the query causes partway through (a bad cast on a later row) is
+// said as it is, without inviting a retry that fails the same way.
+func TestMidStreamQueryErrorIsSaid(t *testing.T) {
+	fake := &fakeArc{reply: func(string) (int, string) {
+		return 200, `{"success":true,"columns":["n"],"data":[[1]],"row_count":1,"truncated":true,` +
+			`"truncation_reason":"arrow query failed: Conversion Error: Could not convert string 'x' to INT64\n\nLINE 1: SELECT ... read_parquet(['/app/data/x.parquet'])"}`
+	}}
+	cs := dataSession(t, fake, 500, 50_000)
+	text, _ := call(t, cs, "query", map[string]any{"database": "db", "sql": "SELECT CAST(s AS BIGINT) FROM t"})
+	if !strings.Contains(text, "Could not convert string 'x' to INT64") || strings.Contains(text, "Try again") || strings.Contains(text, "/app/") {
+		t.Errorf("got %q", text)
+	}
+}

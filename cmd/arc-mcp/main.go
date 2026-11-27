@@ -1,5 +1,5 @@
-// Command arc-mcp is an MCP server that exposes Arc, a columnar analytical
-// database, to LLM clients over stdio.
+// Command arc-mcp is an MCP server that gives LLM clients read-only access to
+// Arc, the open-source time-series lakehouse, over stdio.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,7 +105,7 @@ func main() {
 		Name:    "arc-mcp",
 		Version: Version,
 	}, &mcp.ServerOptions{
-		Instructions: "Arc is a high-performance columnar analytical database. Use list_databases to discover databases, list_measurements to see tables, describe_measurement to understand schema, and query to run SQL (DuckDB dialect). Always describe a measurement before querying it.",
+		Instructions: serverInstructions(*maxRows),
 	})
 
 	// Register tools
@@ -222,4 +223,22 @@ func resolveToken(flagValue string) (string, error) {
 		log.Printf("WARNING: token supplied via --arc-token flag is visible in ps aux; prefer ARC_TOKEN env var or ARC_TOKEN_FILE")
 	}
 	return flagValue, nil
+}
+
+// serverInstructions is what every client receives on connect: what Arc is,
+// and the habits that make queries on it cheap and right. Per-tool detail
+// lives in the tool descriptions.
+func serverInstructions(maxRows int) string {
+	return "Arc is the open-source time-series lakehouse: it keeps every telemetry reading at full resolution, " +
+		"recent data hot and years of history as Parquet in object storage, queried with one SQL (DuckDB dialect).\n\n" +
+		"How to query it well:\n" +
+		"1. Discover first: list_databases, list_measurements, then describe_measurement for column names, types and the time range " +
+		"(its statistics scan the whole measurement, so on very large ones prefer a time-bounded query).\n" +
+		"2. Bound every query by time with a top-level condition on the time column compared to a literal or to now(): " +
+		"WHERE time > now() - INTERVAL '1 hour', or time BETWEEN '...' AND '...'. Arc reads only the partitions in that range; " +
+		"without it, or with the bound inside a subquery, CTE, OR or a function of time, it reads all history.\n" +
+		"3. Aggregate before returning rows: time_bucket(INTERVAL '5 minutes', time) or date_trunc('hour', time) with GROUP BY. " +
+		"Results are capped at " + strconv.Itoa(maxRows) + " rows, and the answer says when more exist.\n" +
+		"4. Start with a recent window and widen it deliberately.\n" +
+		"5. A column named like a reserved word (load, copy, set, ...) must be double-quoted: \"load\"."
 }

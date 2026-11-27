@@ -28,8 +28,10 @@ type GetSampleDataArgs struct {
 // MinRowLimit..MaxRowLimit (see ClampRowLimit).
 func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "query",
+		Name:        "query",
+		Annotations: readOnly("Run a read-only SQL query"),
 		Description: "Execute one read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. " +
+			"Bound it by time (WHERE time > now() - INTERVAL '1 hour'): Arc then reads only those partitions. " +
 			"At most " + strconv.Itoa(maxRows) + " rows come back; when there are more, the answer says so at the top. " +
 			"Arc refuses some words anywhere in a query, even as column names or aliases (load, copy, set, pragma, call, ...): double-quote such a name, as in AS \"load\".",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (out *mcp.CallToolResult, _ any, _ error) {
@@ -89,9 +91,17 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 		}
 		if result.Truncated {
 			log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
-			notes = append(notes, "**Arc stopped partway through this result, so it is incomplete.** Try again, or narrow the query.")
+			if why := arc.QueryErrorText(result.TruncationReason); why != "" {
+				// A failure the query itself causes (a bad cast on a later
+				// row, say) happens again on every retry: say what it is.
+				notes = append(notes, "**Arc stopped partway through this result, so it is incomplete:** "+why+" Fix the query; running it again fails the same way.")
+			} else {
+				notes = append(notes, "**Arc stopped partway through this result, so it is incomplete.** Try again, or narrow the query.")
+			}
 		}
-		text := formatQueryResult(result, notes)
+		noData := fmt.Sprintf("No data: Arc found nothing to read for this query. A measurement that does not exist in database '%s', "+
+			"or has no data written yet, reads as empty (an aggregate over it returns nothing, not 0). Check the name with list_measurements.", args.Database)
+		text := formatQueryResult(result, notes, noData)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
@@ -106,6 +116,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_sample_data",
+		Annotations: readOnly("Sample recent rows"),
 		Description: "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (out *mcp.CallToolResult, _ any, _ error) {
 		defer RecoverToolPanic(&out)
@@ -148,7 +159,8 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 			}, nil, nil
 		}
 
-		text := formatQueryResult(result, nil)
+		noData := fmt.Sprintf("No data: measurement '%s' does not exist in database '%s', or has no data written yet. Check the name with list_measurements.", args.Measurement, args.Database)
+		text := formatQueryResult(result, nil, noData)
 		if maxResponseChars > 0 {
 			text = TruncateResponse(text, maxResponseChars)
 		}
@@ -161,10 +173,13 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 
 // formatQueryResult formats a QueryResponse as a readable markdown table.
 // notes say the result is incomplete and why. They go first, so they
-// survive when TruncateResponse later cuts the text from the end.
-func formatQueryResult(result *arc.QueryResponse, notes []string) string {
+// survive when TruncateResponse later cuts the text from the end. noData is
+// the answer when Arc read nothing at all: it returns no columns only when it
+// found no files, which means a measurement that does not exist or has no
+// data (a time range that matches nothing still returns the columns).
+func formatQueryResult(result *arc.QueryResponse, notes []string, noData string) string {
 	if len(result.Columns) == 0 {
-		return fmt.Sprintf("Query returned no columns. (%s, %.1fms)", plural(len(result.Data), "row"), result.ExecutionTimeMs)
+		return noData
 	}
 
 	var sb strings.Builder
