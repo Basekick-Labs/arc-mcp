@@ -1,0 +1,9 @@
+Arc is a time-series lakehouse: every reading kept at full resolution, years of history as Parquet, queried with one SQL (DuckDB dialect) through these read-only tools.
+
+How to query it well:
+1. Discover first: list_databases, list_measurements, then describe_measurement for column names, types and the time range.
+2. Bound by time. Arc reads only the partitions in range when a single-table SELECT has a top-level condition on time against now() plus or minus one interval (seconds to months) or a literal without a UTC offset: WHERE time > now() - INTERVAL '1 hour', or time BETWEEN '2026-11-01' AND '2026-11-02'. A JOIN, CTE, UNION or subquery anywhere in the query, an OR, or a function of time reads all history.
+3. Aggregate before returning rows: time_bucket(INTERVAL '5 minutes', time) or date_trunc('hour', time) with GROUP BY. Results are capped at 500 rows, and the answer says when more exist.
+4. Start with a recent window and widen it deliberately.
+5. Arc blocks some words anywhere in a query, even as column names (load, copy, set, ...): double-quote such a name, as in "load".
+6. When a query fails, the error says why (a misspelled column and its candidates, a bad cast): fix the SQL rather than retrying it as is.
