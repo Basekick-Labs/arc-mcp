@@ -280,7 +280,10 @@ Numbers come through exactly as Arc sends them.
 Answers are never cut short to fit `--max-response-size`: history is sampled
 further (fewer points), `arc_health` drops Arc's bodies and keeps the statuses,
 and a snapshot that does not fit is refused, naming the setting, as is history
-when not even the newest point fits.
+when not even the newest point fits. The limit applies to each answer's text; the
+same answer is also attached as structured content (JSON a client can read
+without parsing the text), so what crosses the wire can be about twice that
+size.
 
 ```json
 {"family":"api_history","history":{"from":"2026-11-27T01:35:36.157-03:00","to":"2026-11-27T01:45:06.156-03:00","total_points":120,"sampled_every":6,"points":[{"timestamp":"2026-11-27T01:35:36.157-03:00","values":{"http_requests_total":51200,"http_latency_avg_us":840,"...":"..."}},"..."]}}

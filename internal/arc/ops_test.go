@@ -31,6 +31,8 @@ func TestClient_GetJSON_Failures(t *testing.T) {
 			_, _ = w.Write([]byte(`"}`))
 		}, KindTooLarge},
 		{"not JSON", func(w http.ResponseWriter) { _, _ = w.Write([]byte("<html>")) }, KindParse},
+		{"JSON followed by a page", func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"a":1}<html>`)) }, KindParse},
+		{"two JSON values", func(w http.ResponseWriter) { _, _ = w.Write([]byte(`{"a":1} {"b":2}`)) }, KindParse},
 		{"404", func(w http.ResponseWriter) { w.WriteHeader(404) }, KindNotFound},
 	}
 	for _, tt := range tests {
@@ -73,6 +75,10 @@ func TestClient_Probe(t *testing.T) {
 		case "/health":
 			w.WriteHeader(502)
 			_, _ = w.Write([]byte(`<html>`))
+		case "/trail":
+			_, _ = w.Write([]byte("{\"status\":\"ok\"} \n<html>"))
+		case "/spaces":
+			_, _ = w.Write([]byte("{\"status\":\"ok\"} \n\t"))
 		default:
 			_, _ = w.Write([]byte(strings.Repeat(" ", maxProbeBodyBytes+1)))
 		}
@@ -83,6 +89,12 @@ func TestClient_Probe(t *testing.T) {
 	}
 	if status, body, err := c.Probe(context.Background(), "/health"); err != nil || status != 502 || body != nil {
 		t.Errorf("/health: %d %v %v", status, body, err)
+	}
+	if status, body, err := c.Probe(context.Background(), "/trail"); err != nil || status != 200 || body != nil {
+		t.Errorf("/trail: Arc's JSON followed by a page must not pass as Arc's: %d %v %v", status, body, err)
+	}
+	if status, body, err := c.Probe(context.Background(), "/spaces"); err != nil || status != 200 || body["status"] != "ok" {
+		t.Errorf("/spaces: trailing whitespace is fine: %d %v %v", status, body, err)
 	}
 	var ae *Error
 	if status, _, err := c.Probe(context.Background(), "/big"); status != 200 || !errors.As(err, &ae) || ae.Kind != KindTooLarge {

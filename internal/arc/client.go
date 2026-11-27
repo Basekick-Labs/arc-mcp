@@ -664,9 +664,15 @@ func transportError(op string, err error) *Error {
 // Decoding into interface{} would otherwise make every number a float64:
 // integers above 2^53 change value, and counts print as 1.783416e+06.
 func decodeExact(r io.Reader, v any) error {
+	return newExactDecoder(r).Decode(v)
+}
+
+// newExactDecoder is the decoder decodeExact uses: numbers kept as
+// json.Number.
+func newExactDecoder(r io.Reader) *json.Decoder {
 	dec := json.NewDecoder(r)
 	dec.UseNumber()
-	return dec.Decode(v)
+	return dec
 }
 
 func (c *Client) setAuth(req *http.Request) {

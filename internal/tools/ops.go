@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -436,7 +437,9 @@ func compactJSON(v any) (string, error) {
 // metricsErrorText is the model's text for a failed metrics read. Only an
 // unwrapped *arc.Error reaches arc.UserMessage, whose fall-through prints the
 // error itself (Arc's URL included); the kinds whose shared text talks about
-// queries or databases get text of their own.
+// queries or databases get text of their own. So do 400 and 429: Arc does not
+// send them on these routes, so their body is someone else's (a proxy's, say,
+// which may name its upstream), and the shared text would quote it.
 func metricsErrorText(name string, timeout time.Duration, err error) string {
 	var ae *arc.Error
 	if !errors.As(err, &ae) {
@@ -453,6 +456,12 @@ func metricsErrorText(name string, timeout time.Duration, err error) string {
 		// A per-database refusal makes no sense for server metrics: say
 		// what is true of any 403.
 		return arc.UserMessage(&arc.Error{Kind: arc.KindForbidden})
+	}
+	switch ae.Status {
+	case http.StatusTooManyRequests:
+		return "The request for Arc's " + name + " metrics was rate limited (HTTP 429). Try again later."
+	case http.StatusBadRequest:
+		return "The request for Arc's " + name + " metrics was refused (HTTP 400); the answer is in the arc-mcp log."
 	}
 	return arc.UserMessage(ae)
 }

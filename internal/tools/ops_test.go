@@ -47,16 +47,18 @@ type opsRoute struct {
 }
 
 // opsArc answers each path from routes, 404 for any other, and records the
-// request URI (path and query) of every request.
+// request URI (path and query) and the Authorization header of every request.
 type opsArc struct {
 	mu     sync.Mutex
 	routes map[string]opsRoute
 	seen   []string
+	auth   []string
 }
 
 func (f *opsArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.seen = append(f.seen, r.URL.RequestURI())
+	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	route, ok := f.routes[r.URL.Path]
 	f.mu.Unlock()
 	if !ok {
@@ -82,6 +84,21 @@ func (f *opsArc) requests() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.seen...)
+}
+
+// assertToken fails unless every request so far carried the session's token.
+func (f *opsArc) assertToken(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.auth) == 0 {
+		t.Error("no request reached the fake Arc")
+	}
+	for i, a := range f.auth {
+		if a != "Bearer tok" {
+			t.Errorf("request %s carried Authorization %q, want the token", f.seen[i], a)
+		}
+	}
 }
 
 // healthyArc answers both probes and every metrics family.
@@ -381,6 +398,7 @@ func TestMetrics_EachFamilyReadsItsRoute(t *testing.T) {
 		if family := tt.args["family"].(string); !strings.HasPrefix(text, `{"family":"`+family+`",`) {
 			t.Errorf("%v: answer %s", tt.args, text)
 		}
+		fake.assertToken(t)
 		assertNoLeak(t, text, addr)
 	}
 }
@@ -436,14 +454,20 @@ func TestMetrics_ArcErrors(t *testing.T) {
 			"does not carry the permission the endpoint requires", nil},
 		{"403 shaped like a per-database refusal", opsRoute{status: 403, body: `{"error":"no permission for read on database 'x'"}`},
 			"does not carry the permission the endpoint requires", []string{"specific databases", "database"}},
-		{"429 carries Arc's reason", opsRoute{status: 429, body: `{"error":"Rate limit exceeded: 10 queries per minute"}`},
-			"Arc refused the request: Rate limit exceeded", nil},
+		// Arc sends no 400 or 429 on these routes: the body is someone
+		// else's and is never quoted.
+		{"429 from a proxy", opsRoute{status: 429, body: `{"error":"upstream 10.0.0.7:8000 is rate limiting you"}`},
+			"The request for Arc's memory metrics was rate limited (HTTP 429). Try again later.", []string{"10.0.0.7", "upstream", "Arc refused"}},
+		{"400 from a proxy", opsRoute{status: 400, body: `{"error":"gateway 10.0.0.7 rejected the request"}`},
+			"The request for Arc's memory metrics was refused (HTTP 400)", []string{"10.0.0.7", "gateway", "Arc refused"}},
 		{"500 stays generic", opsRoute{status: 500, body: `{"error":"open /var/lib/arc/secret: permission denied"}`},
 			"Arc returned an error — see server logs", []string{"/var/lib"}},
 		{"502 from a proxy", opsRoute{status: 502, body: proxyPage},
 			"Arc returned an error — see server logs", []string{"<html>"}},
 		{"200 that is not JSON", opsRoute{status: 200, body: proxyPage},
 			"Arc returned an unexpected response format", []string{"<html>"}},
+		{"200 JSON followed by a page", opsRoute{status: 200, body: memoryBody + proxyPage},
+			"Arc returned an unexpected response format", []string{"<html>", "alloc_bytes"}},
 		{"200 that is not an object", opsRoute{status: 200, body: `[1,2,3]`},
 			"Arc returned an unexpected response format", nil},
 	}
@@ -562,9 +586,41 @@ func TestOps_BaseURLWithSlashOrPrefix(t *testing.T) {
 	}
 }
 
+// A query string on the configured URL is kept, and the look-back appended
+// to it, never a second "?".
+func TestOps_BaseURLWithQuery(t *testing.T) {
+	fake := healthyArc()
+	cs, _ := opsSession(t, fake, opsOpts{baseURL: "http://" + fakeHost + ":8000/?site=a%20b"})
+	for _, call := range []struct {
+		tool string
+		args map[string]any
+	}{{"arc_health", nil}, {"arc_metrics", map[string]any{"family": "memory"}}, {"arc_metrics", map[string]any{"family": "api_history"}}} {
+		if text, res := callOps(t, cs, call.tool, call.args); res.IsError || strings.Contains(text, `"error"`) {
+			t.Errorf("%s %v: %s", call.tool, call.args, text)
+		}
+	}
+	want := "/health?site=a%20b /ready?site=a%20b /api/v1/metrics/memory?site=a%20b /api/v1/metrics/timeseries/api?site=a%20b&duration_minutes=10"
+	if got := strings.Join(fake.requests(), " "); got != want {
+		t.Errorf("requested %q, want %q", got, want)
+	}
+}
+
 // A snapshot that does not fit --max-response-size is refused whole, naming
 // the setting, rather than cut into invalid JSON; 0 means no limit.
 func TestMetrics_SnapshotAndTheSizeCap(t *testing.T) {
+	// Exactly at the cap is allowed; one character over is not.
+	full := `{"family":"counters","response":` + countersBody + `}`
+	for _, tt := range []struct {
+		maxChars int
+		ok       bool
+	}{{len(full), true}, {len(full) - 1, false}} {
+		cs, _ := opsSession(t, healthyArc(), opsOpts{maxChars: tt.maxChars})
+		text, res := callOps(t, cs, "arc_metrics", map[string]any{"family": "counters"})
+		if tt.ok != (!res.IsError && text == full) {
+			t.Errorf("cap %d (answer %d): isErr=%v %s", tt.maxChars, len(full), res.IsError, text)
+		}
+	}
+
 	cs, _ := opsSession(t, healthyArc(), opsOpts{maxChars: 60})
 	text, res := callOps(t, cs, "arc_metrics", map[string]any{"family": "counters"})
 	if !res.IsError || !strings.Contains(text, "Arc's counters answer does not fit in arc-mcp's --max-response-size (60 characters)") {
@@ -739,6 +795,7 @@ func TestHealth_HealthyAndReady(t *testing.T) {
 	if got := strings.Join(fake.requests(), " "); got != "/health /ready" {
 		t.Errorf("probed %q", got)
 	}
+	fake.assertToken(t)
 	assertNoLeak(t, text, addr)
 }
 
@@ -759,6 +816,7 @@ func TestHealth_ReadyStates(t *testing.T) {
 		{"401 from a proxy", opsRoute{status: 401, body: `{}`}, `"ready":{"http_status":401,"error":"refused"}`},
 		{"302", opsRoute{status: 302, body: ``}, `"ready":{"http_status":302,"error":"unexpected status"}`},
 		{"200 that is not JSON", opsRoute{status: 200, body: proxyPage}, `"ready":{"http_status":200,"error":"not Arc's answer: the body is not a JSON object"}`},
+		{"200 JSON followed by a page", opsRoute{status: 200, body: readyBody + proxyPage}, `"ready":{"http_status":200,"error":"not Arc's answer: the body is not a JSON object"}`},
 		{"503 that is not JSON", opsRoute{status: 503, body: "Service Unavailable"}, `"ready":{"http_status":503,"error":"not Arc's answer: the body is not a JSON object"}`},
 	}
 	for _, tt := range tests {
@@ -795,19 +853,32 @@ func TestHealth_ReadyTimesOutAfterHealth(t *testing.T) {
 // remains, so the tool never takes longer than the timeout.
 func TestHealth_OneDeadlineForBothProbes(t *testing.T) {
 	fake := &opsArc{routes: map[string]opsRoute{
-		"/health": {status: 200, body: healthBody, delay: 500 * time.Millisecond},
-		"/ready":  {status: 200, body: readyBody, delay: 500 * time.Millisecond},
+		"/health": {status: 200, body: healthBody, delay: 1200 * time.Millisecond},
+		"/ready":  {status: 200, body: readyBody, delay: 1200 * time.Millisecond},
 	}}
-	// /health answers with 300 ms of the 800 ms left, which /ready (500 ms)
+	// /health answers with 800 ms of the 2 s left, which /ready (1.2 s)
 	// cannot use up; with a deadline per probe, both would answer.
-	cs, _ := opsSession(t, fake, opsOpts{timeout: 800 * time.Millisecond})
+	cs, _ := opsSession(t, fake, opsOpts{timeout: 2 * time.Second})
 	start := time.Now()
 	text, res := callOps(t, cs, "arc_health", nil)
 	if res.IsError || !strings.HasPrefix(text, `{"health":{"http_status":200,`) || !strings.HasSuffix(text, `"ready":{"error":"timed out"}}`) {
 		t.Errorf("isErr=%v %s", res.IsError, text)
 	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Errorf("took %s for an 800ms timeout", took)
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("took %s for a 2s timeout", took)
+	}
+}
+
+// A /health answer larger than any of Arc's is a state of that probe, not a
+// failure of the tool: Arc (or something) answered.
+func TestHealth_HealthTooLarge(t *testing.T) {
+	big := `{"status":"ok","pad":"` + strings.Repeat("x", 1<<20) + `"}`
+	fake := &opsArc{routes: map[string]opsRoute{"/health": {status: 200, body: big}, "/ready": {status: 200, body: readyBody}}}
+	cs, _ := opsSession(t, fake, opsOpts{})
+	text, res := callOps(t, cs, "arc_health", nil)
+	want := `{"health":{"http_status":200,"error":"answer too large to be Arc's"},"ready":{"http_status":200,"body":` + readyBody + `}}`
+	if res.IsError || text != want {
+		t.Errorf("isErr=%v\n got %.300s\nwant %s", res.IsError, text, want)
 	}
 }
 
@@ -841,17 +912,22 @@ func TestHealth_NoAnswer(t *testing.T) {
 }
 
 // Under a small --max-response-size the statuses survive and Arc's bodies
-// go; below even that, the tool says so.
+// go; below even that, the tool says so. Exactly at either size is allowed.
 func TestHealth_SizeCap(t *testing.T) {
-	cs, _ := opsSession(t, healthyArc(), opsOpts{maxChars: 200})
-	text, res := callOps(t, cs, "arc_health", nil)
-	want := `{"health":{"http_status":200,"error":"answer larger than --max-response-size allows"},"ready":{"http_status":200,"error":"answer larger than --max-response-size allows"}}`
-	if res.IsError || text != want || len(text) > 200 {
-		t.Errorf("isErr=%v %s", res.IsError, text)
-	}
-	cs, _ = opsSession(t, healthyArc(), opsOpts{maxChars: 50})
-	if text, res := callOps(t, cs, "arc_health", nil); !res.IsError || !strings.Contains(text, "Arc's health answer does not fit") {
-		t.Errorf("cap 50: isErr=%v %s", res.IsError, text)
+	full := `{"health":{"http_status":200,"body":` + healthBody + `},"ready":{"http_status":200,"body":` + readyBody + `}}`
+	bare := `{"health":{"http_status":200,"error":"answer larger than --max-response-size allows"},"ready":{"http_status":200,"error":"answer larger than --max-response-size allows"}}`
+	for _, tt := range []struct {
+		maxChars int
+		want     string // "" for the tool error
+	}{{len(full), full}, {len(full) - 1, bare}, {len(bare), bare}, {len(bare) - 1, ""}} {
+		cs, _ := opsSession(t, healthyArc(), opsOpts{maxChars: tt.maxChars})
+		text, res := callOps(t, cs, "arc_health", nil)
+		switch {
+		case tt.want == "" && (!res.IsError || !strings.Contains(text, "Arc's health answer does not fit")):
+			t.Errorf("cap %d: want the tool error, got isErr=%v %s", tt.maxChars, res.IsError, text)
+		case tt.want != "" && (res.IsError || text != tt.want):
+			t.Errorf("cap %d: isErr=%v\n got %s\nwant %s", tt.maxChars, res.IsError, text, tt.want)
+		}
 	}
 }
 
