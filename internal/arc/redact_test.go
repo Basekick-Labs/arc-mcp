@@ -128,3 +128,20 @@ func TestClient_LoggedURLsOmitQueryAndUserinfo(t *testing.T) {
 		assertNoCredentials(t, name+" error", err.Error())
 	}
 }
+
+// The operations routes follow the same rule: a base URL that does not parse
+// fails before any request, and the logged detail carries neither the
+// userinfo nor the query string.
+func TestOps_LoggedURLsOmitQueryAndUserinfo(t *testing.T) {
+	c := NewClient("http://"+credUser+":"+credPass+"@"+addrHost+"/%zz/"+addrPrefix+"?p="+credQuery, "tok", time.Second)
+	buf := captureLog(t)
+	if _, err := c.GetJSON(context.Background(), "/api/v1/metrics", nil); err == nil {
+		t.Fatal("GetJSON: no error")
+	}
+	assertNoCredentials(t, "GetJSON log", buf.String())
+	buf.Reset()
+	if _, err := c.GetJSON(context.Background(), "/api/v1/metrics/timeseries/system", url.Values{"duration_minutes": {"10"}}); err == nil {
+		t.Fatal("GetJSON with a query: no error")
+	}
+	assertNoCredentials(t, "GetJSON with a query log", buf.String())
+}
