@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -359,7 +360,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 // refused: it would otherwise run the endpoint without authentication.
 func resolveHTTPToken() (string, error) {
 	if path := os.Getenv("ARC_MCP_HTTP_TOKEN_FILE"); path != "" {
-		data, err := os.ReadFile(path) //nolint:gosec // #nosec G304 -- path comes from ARC_MCP_HTTP_TOKEN_FILE, set by the operator
+		data, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // #nosec G304 -- path comes from ARC_MCP_HTTP_TOKEN_FILE, set by the operator
 		if err != nil {
 			return "", fmt.Errorf("reading ARC_MCP_HTTP_TOKEN_FILE %q: %w", path, err)
 		}
