@@ -409,7 +409,13 @@ func resolveToken(flagValue string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("reading ARC_TOKEN_FILE %q: %w", path, err)
 		}
-		return strings.TrimSpace(string(data)), nil
+		// An empty file is a mistake (a token never written, a mount that
+		// did not happen), not a request to run without a token.
+		t := strings.TrimSpace(string(data))
+		if t == "" {
+			return "", fmt.Errorf("ARC_TOKEN_FILE %q is empty", path)
+		}
+		return t, nil
 	}
 	if v := os.Getenv("ARC_TOKEN"); v != "" {
 		return v, nil

@@ -65,6 +65,19 @@ func TestResolveToken(t *testing.T) {
 			t.Error("resolveToken with missing file should return error")
 		}
 	})
+
+	// An empty (or whitespace-only) file is refused, not read as no token.
+	t.Run("empty file returns error", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "token.txt")
+		if err := os.WriteFile(f, []byte(" \n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("ARC_TOKEN_FILE", f)
+		t.Setenv("ARC_TOKEN", "fallback")
+		if tok, err := resolveToken(""); err == nil {
+			t.Errorf("empty ARC_TOKEN_FILE accepted as %q", tok)
+		}
+	})
 }
 
 func TestValidateArcURL(t *testing.T) {
