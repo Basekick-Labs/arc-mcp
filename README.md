@@ -274,9 +274,13 @@ records a point every 5 seconds and keeps 30 minutes of them by default
 in Arc's configuration). A history answer carries at most 20 points: when Arc
 has more, arc-mcp keeps every k-th one counting back from the newest, which is
 always kept, and says so in `sampled_every`. `from` and `to` are the timestamps
-of the oldest and the newest point returned, the window actually covered. Numbers come
-through exactly as Arc sends them. An answer that does not fit
-`--max-response-size` is refused, naming the setting, rather than cut short.
+of the oldest and the newest point returned, the window actually covered.
+Numbers come through exactly as Arc sends them.
+
+Answers are never cut short to fit `--max-response-size`: history is sampled
+further (fewer points), `arc_health` drops Arc's bodies and keeps the statuses,
+and a snapshot that does not fit is refused, naming the setting, as is history
+when not even the newest point fits.
 
 ```json
 {"family":"api_history","history":{"from":"2026-11-27T01:35:36.157-03:00","to":"2026-11-27T01:45:06.156-03:00","total_points":120,"sampled_every":6,"points":[{"timestamp":"2026-11-27T01:35:36.157-03:00","values":{"http_requests_total":51200,"http_latency_avg_us":840,"...":"..."}},"..."]}}
