@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,13 +35,6 @@ func (c *Client) opsURL(path string, query url.Values) (string, error) {
 	return u.String(), nil
 }
 
-// opsError logs detail, as every other client error is logged, and returns
-// it as a bare *Error of kind.
-func opsError(kind, detail string) *Error {
-	log.Printf("arc error: %s", detail)
-	return &Error{Kind: kind, Detail: detail}
-}
-
 // errTrailingData is decodeWhole's error for bytes after the JSON value.
 var errTrailingData = errors.New("data after the JSON value")
 
@@ -67,11 +59,11 @@ func decodeWhole(raw []byte, v any) error {
 func (c *Client) opsGet(ctx context.Context, path string, query url.Values) (*http.Response, error) {
 	u, err := c.opsURL(path, query)
 	if err != nil {
-		return nil, opsError(KindNetwork, fmt.Sprintf("GET %s: building the URL: %v", path, err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("GET %s: building the URL: %v", path, RedactError(err)))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, opsError(KindNetwork, fmt.Sprintf("GET %s: creating the request: %v", path, err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("GET %s: creating the request: %v", path, RedactError(err)))
 	}
 	req.Header.Set("Accept", "application/json")
 	if err := c.setAuth(req); err != nil {
@@ -109,11 +101,11 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values) (an
 		return nil, transportError("GET "+path, err)
 	}
 	if len(raw) > maxArcResponseBytes {
-		return nil, opsError(KindTooLarge, fmt.Sprintf("GET %s: answer over %d bytes", path, maxArcResponseBytes))
+		return nil, loggedError(KindTooLarge, fmt.Sprintf("GET %s: answer over %d bytes", path, maxArcResponseBytes))
 	}
 	var v any
 	if err := decodeWhole(raw, &v); err != nil {
-		return nil, opsError(KindParse, fmt.Sprintf("GET %s: decoding the answer: %v", path, err))
+		return nil, loggedError(KindParse, fmt.Sprintf("GET %s: decoding the answer: %v", path, err))
 	}
 	return v, nil
 }
@@ -142,7 +134,7 @@ func (c *Client) Probe(ctx context.Context, path string) (status int, body map[s
 		return 0, nil, transportError("GET "+path, err)
 	}
 	if len(raw) > maxProbeBodyBytes {
-		e := opsError(KindTooLarge, fmt.Sprintf("GET %s: answer over %d bytes", path, maxProbeBodyBytes))
+		e := loggedError(KindTooLarge, fmt.Sprintf("GET %s: answer over %d bytes", path, maxProbeBodyBytes))
 		e.Status = resp.StatusCode
 		return resp.StatusCode, nil, e
 	}
