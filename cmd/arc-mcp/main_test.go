@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -84,6 +85,15 @@ func TestValidateArcURL(t *testing.T) {
 		{"empty url rejected", "", "abc", false, true},
 		{"bad scheme rejected", "ftp://arc.example.com", "abc", false, true},
 		{"missing host rejected", "https://", "abc", false, true},
+		// A query string or userinfo in the URL is sent on every request,
+		// and can carry credentials: the same rule as a token.
+		{"http remote with query and no token rejected", "http://arc.example.com/?p=abc", "", false, true},
+		{"http remote with userinfo and no token rejected", "http://u:p@arc.example.com", "", false, true},
+		{"http remote with query and token rejected", "http://arc.example.com/?k=v", "abc", false, true},
+		{"http remote with query and insecure ok", "http://arc.example.com/?p=abc", "", true, false},
+		{"http loopback with query ok", "http://127.0.0.1:8000/?p=abc", "", false, false},
+		{"https remote with query and userinfo ok", "https://u:p@arc.example.com/?p=abc", "", false, false},
+		{"http remote with empty query ok", "http://arc.example.com/?", "", false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -92,5 +102,26 @@ func TestValidateArcURL(t *testing.T) {
 				t.Errorf("validateArcURL(%q, token=%q, insecure=%v) err = %v, wantErr %v", tt.url, tt.token, tt.insecure, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// The refusals name the host, never the query string or the userinfo.
+func TestValidateArcURL_ErrorsOmitQueryAndUserinfo(t *testing.T) {
+	for _, raw := range []string{
+		"http://user-marker:pass-marker@arc.example.com/arc/?p=query-marker",
+		"http://user-marker:pass-marker@arc.example.com/%zz?p=query-marker",
+	} {
+		err := validateArcURL(raw, "", false)
+		if err == nil {
+			t.Fatalf("%q: accepted", raw)
+		}
+		for _, s := range []string{"user-marker", "pass-marker", "query-marker"} {
+			if strings.Contains(err.Error(), s) {
+				t.Errorf("%q: error carries %q: %v", raw, s, err)
+			}
+		}
+		if !strings.Contains(err.Error(), "arc.example.com") {
+			t.Errorf("%q: error does not name the host: %v", raw, err)
+		}
 	}
 }

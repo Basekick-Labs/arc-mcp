@@ -356,16 +356,16 @@ func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 func (c *Client) Health(ctx context.Context) error {
 	healthURL, err := c.buildURL("health")
 	if err != nil {
-		return fmt.Errorf("building the health URL: %w", err)
+		return fmt.Errorf("building the health URL: %w", RedactError(err))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return fmt.Errorf("creating request: %w", RedactError(err))
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("connecting to Arc at %s: %w", c.baseURL, err)
+		return fmt.Errorf("connecting to Arc at %s: %w", RedactURL(c.baseURL), RedactError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -379,17 +379,17 @@ func (c *Client) Health(ctx context.Context) error {
 func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 	verifyURL, err := c.buildURL("api", "v1", "auth", "verify")
 	if err != nil {
-		return nil, fmt.Errorf("building the token verification URL: %w", err)
+		return nil, fmt.Errorf("building the token verification URL: %w", RedactError(err))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("creating request: %w", RedactError(err))
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("verifying token: %w", err)
+		return nil, fmt.Errorf("verifying token: %w", RedactError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -413,17 +413,17 @@ func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, error) {
 	databasesURL, err := c.buildURL("api", "v1", "databases")
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: building the URL: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: building the URL: %v", RedactError(err)))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, databasesURL, nil)
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: creating the request: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: creating the request: %v", RedactError(err)))
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, listingTransportError("list databases", err)
+		return nil, c.listingTransportError("list databases", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -444,17 +444,17 @@ func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, erro
 func (c *Client) ListMeasurements(ctx context.Context, database string) (*MeasurementListResponse, error) {
 	measurementsURL, err := c.buildURL("api", "v1", "databases", database, "measurements")
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: building the URL: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: building the URL: %v", RedactError(err)))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, measurementsURL, nil)
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: creating the request: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list measurements: creating the request: %v", RedactError(err)))
 	}
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, listingTransportError("list measurements", err)
+		return nil, c.listingTransportError("list measurements", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -471,17 +471,23 @@ func (c *Client) ListMeasurements(ctx context.Context, database string) (*Measur
 	return &result, nil
 }
 
-// listingTimedOutText is the answer for a listing request arc-mcp gave up on.
-// The query's own timeout text advises changing the SQL, which does not
-// apply to a listing.
-const listingTimedOutText = "Arc did not answer within arc-mcp's --timeout. Ask the user to check that the Arc server is running and not overloaded, then try again."
+// listingTimedOutText is the answer for a listing request arc-mcp gave up on
+// after timeout (its --timeout; 0 when unset). The query's own timeout text
+// advises changing the SQL, which does not apply to a listing.
+func listingTimedOutText(timeout time.Duration) string {
+	within := "in time"
+	if timeout > 0 {
+		within = "within " + timeout.String() + " (arc-mcp's --timeout)"
+	}
+	return "Arc did not answer " + within + ". Ask the user to check that the Arc server is running and not overloaded, then try again."
+}
 
 // listingTransportError is transportError for the database and measurement
 // listings, with their own timeout text.
-func listingTransportError(op string, err error) *Error {
+func (c *Client) listingTransportError(op string, err error) *Error {
 	e := transportError(op, err)
 	if e.Kind == KindTimeout {
-		e.Message = listingTimedOutText
+		e.Message = listingTimedOutText(c.httpClient.Timeout)
 	}
 	return e
 }
@@ -492,6 +498,43 @@ func listingTransportError(op string, err error) *Error {
 func loggedError(kind, detail string) *Error {
 	log.Printf("arc error: %s", detail)
 	return &Error{Kind: kind, Detail: detail}
+}
+
+// RedactURL is raw without its userinfo, query string and fragment: the
+// scheme://host/path form arc-mcp logs. The query and the userinfo can carry
+// credentials (Arc reads a token from a query parameter, and Go sends
+// userinfo as Basic auth). A URL that does not parse is cut at its query or
+// fragment, and everything between :// and its last @ is dropped (a slash in
+// a password is one reason such a URL does not parse).
+func RedactURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		u.User = nil
+		u.RawQuery, u.ForceQuery = "", false
+		u.Fragment, u.RawFragment = "", ""
+		return u.String()
+	}
+	s, _, _ := strings.Cut(raw, "?")
+	s, _, _ = strings.Cut(s, "#")
+	scheme, rest, ok := strings.Cut(s, "://")
+	if !ok {
+		return s
+	}
+	if i := strings.LastIndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	return scheme + "://" + rest
+}
+
+// RedactError is err with the URL its *url.Error quotes reduced by
+// RedactURL, for logging. An error with no *url.Error in it is returned as
+// it is; for one that wraps a *url.Error, that error alone is returned, so
+// no outer text quotes the URL.
+func RedactError(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	return &url.Error{Op: ue.Op, URL: RedactURL(ue.URL), Err: ue.Err}
 }
 
 // normalizeBaseURL drops the trailing slashes from the path of Arc's base
@@ -528,8 +571,14 @@ func (c *Client) buildURL(segments ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// NewClient has trimmed it already; trimmed here too so that no other
+	// way of setting c.baseURL can bring back a doubled slash.
+	basePath := strings.TrimRight(u.EscapedPath(), "/")
+	if u.Path, err = url.PathUnescape(basePath); err != nil {
+		return "", err
+	}
 	var b strings.Builder
-	b.WriteString(u.EscapedPath())
+	b.WriteString(basePath)
 	for _, s := range segments {
 		b.WriteByte('/')
 		b.WriteString(url.PathEscape(s))
@@ -550,11 +599,11 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 
 	queryURL, err := c.buildURL("api", "v1", "query")
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("query: building the URL: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("query: building the URL: %v", RedactError(err)))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, queryURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, loggedError(KindNetwork, fmt.Sprintf("query: creating the request: %v", err))
+		return nil, loggedError(KindNetwork, fmt.Sprintf("query: creating the request: %v", RedactError(err)))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-arc-database", database)
@@ -598,7 +647,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 // The raw error carries Arc's URL, so it goes to the log only, never to the
 // model.
 func transportError(op string, err error) *Error {
-	detail := fmt.Sprintf("%s: %v", op, err)
+	detail := fmt.Sprintf("%s: %v", op, RedactError(err))
 	log.Printf("arc error: %s", detail)
 	var ue *url.Error
 	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ue) && ue.Timeout() {

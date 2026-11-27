@@ -85,7 +85,7 @@ func TestListingTools_TimeoutAnswersWithoutTheAddress(t *testing.T) {
 
 	for _, c := range dataToolCalls[:2] {
 		text, isErr := call(t, cs, c.tool, c.args)
-		if !isErr || !strings.Contains(text, "did not answer within arc-mcp's --timeout") || strings.Contains(text, "Aggregate") {
+		if !isErr || !strings.Contains(text, "did not answer within 100ms (arc-mcp's --timeout)") || strings.Contains(text, "Aggregate") {
 			t.Errorf("%s: isError=%v text=%q", c.tool, isErr, text)
 		}
 		assertNoArcAddress(t, c.tool, text, addr)

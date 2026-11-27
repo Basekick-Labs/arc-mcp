@@ -32,7 +32,12 @@ const (
 
 // clientVia is a client for addrBase whose connections all go to target.
 func clientVia(target string, timeout time.Duration) *Client {
-	c := NewClient(addrBase, "tok", timeout)
+	return clientAt(addrBase, target, timeout)
+}
+
+// clientAt is a client for base whose connections all go to target.
+func clientAt(base, target string, timeout time.Duration) *Client {
+	c := NewClient(base, "tok", timeout)
 	c.httpClient.Transport = &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, target)
@@ -55,16 +60,19 @@ func assertNoAddress(t *testing.T, text, target string) {
 }
 
 // dataCalls are the client reads behind the data tools, with the text each
-// gives the model when arc-mcp's --timeout fires.
+// gives the model when arc-mcp's --timeout (timeoutFor) fires.
 var dataCalls = []struct {
 	name        string
 	call        func(*Client) error
 	timeoutText string
 }{
-	{"list databases", func(c *Client) error { _, err := c.ListDatabases(context.Background()); return err }, listingTimedOutText},
-	{"list measurements", func(c *Client) error { _, err := c.ListMeasurements(context.Background(), "db"); return err }, listingTimedOutText},
+	{"list databases", func(c *Client) error { _, err := c.ListDatabases(context.Background()); return err }, listingTimedOutText(timeoutFor)},
+	{"list measurements", func(c *Client) error { _, err := c.ListMeasurements(context.Background(), "db"); return err }, listingTimedOutText(timeoutFor)},
 	{"query", func(c *Client) error { _, err := c.Query(context.Background(), "db", "SELECT 1"); return err }, "The query failed: " + timedOutHint},
 }
+
+// timeoutFor is the client timeout of the rows that must time out.
+const timeoutFor = 300 * time.Millisecond
 
 // closedAddr is a local address nothing listens on.
 func closedAddr(t *testing.T) string {
@@ -145,7 +153,7 @@ func TestDataReads_FailuresWithoutAnAnswerCarryNoAddress(t *testing.T) {
 				// long enough for a slow runner.
 				timeout := 10 * time.Second
 				if tt.name == "timeout" {
-					timeout = 300 * time.Millisecond
+					timeout = timeoutFor
 				}
 				err := dc.call(clientVia(tt.target, timeout))
 				if err == nil {
@@ -193,7 +201,7 @@ func TestUserMessage_UnclassifiedErrorsAreNotShown(t *testing.T) {
 		{"url.Error", &url.Error{Op: "Get", URL: addrBase, Err: errors.New("connection refused")}, genericText},
 		{"wrapped url.Error", fmt.Errorf("listing databases: %w", &url.Error{Op: "Get", URL: addrBase, Err: errors.New("x")}), genericText},
 		{"wrapped *Error", fmt.Errorf("listing databases: %w", &Error{Kind: KindNetwork, Detail: addrBase}), unreachableText},
-		{"wrapped listing timeout", fmt.Errorf("x: %w", &Error{Kind: KindTimeout, Detail: addrBase, Message: listingTimedOutText}), listingTimedOutText},
+		{"wrapped listing timeout", fmt.Errorf("x: %w", &Error{Kind: KindTimeout, Detail: addrBase, Message: listingTimedOutText(time.Second)}), listingTimedOutText(time.Second)},
 		{"typed nil *Error", error((*Error)(nil)), genericText},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

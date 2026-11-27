@@ -81,9 +81,9 @@ func main() {
 	if err := client.Health(ctx); err != nil {
 		healthy = false
 		log.Printf("Warning: Arc health check failed: %v", err)
-		log.Printf("The MCP server will start anyway — queries will fail until Arc is reachable at %s", *arcURL)
+		log.Printf("The MCP server will start anyway — queries will fail until Arc is reachable at %s", arc.RedactURL(*arcURL))
 	} else {
-		log.Printf("Connected to Arc at %s", *arcURL)
+		log.Printf("Connected to Arc at %s", arc.RedactURL(*arcURL))
 	}
 	// Skipped when Arc is unreachable: a second failure would only repeat
 	// the health warning above.
@@ -143,15 +143,18 @@ func tokenScopeLog(permissions []string) []string {
 }
 
 // validateArcURL rejects configurations that would send a Bearer token over
-// cleartext HTTP to a non-loopback host. Passing --insecure (or setting
-// ARC_MCP_INSECURE) bypasses the check but logs a prominent warning.
+// cleartext HTTP to a non-loopback host. A query string or userinfo in the
+// URL follows the same rule as a token: both are sent on every request and
+// can carry credentials. Passing --insecure (or setting ARC_MCP_INSECURE)
+// bypasses the check but logs a prominent warning. Errors name the URL
+// without its query string and userinfo.
 func validateArcURL(rawURL, token string, insecure bool) error {
 	if rawURL == "" {
 		return errors.New("arc URL is required")
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("arc URL is not a valid URL: %w", err)
+		return fmt.Errorf("arc URL is not a valid URL: %w", arc.RedactError(err))
 	}
 	switch u.Scheme {
 	case "http", "https":
@@ -161,12 +164,16 @@ func validateArcURL(rawURL, token string, insecure bool) error {
 	if u.Host == "" {
 		return errors.New("arc URL is missing host")
 	}
-	if u.Scheme == "https" || token == "" || insecure {
+	inURL := u.RawQuery != "" || u.User != nil
+	if u.Scheme == "https" || (token == "" && !inURL) || insecure {
 		return nil
 	}
 	host := u.Hostname()
 	if isLoopbackHost(host) {
 		return nil
+	}
+	if token == "" {
+		return fmt.Errorf("refusing to send the arc URL's query string or userinfo over plaintext HTTP to remote host %q — use https:// or pass --insecure", host)
 	}
 	return fmt.Errorf("refusing to send Bearer token over plaintext HTTP to remote host %q — use https:// or pass --insecure", host)
 }

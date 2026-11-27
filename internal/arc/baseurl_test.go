@@ -92,3 +92,20 @@ func TestClient_EveryRequestKeepsTheBasePath(t *testing.T) {
 		}
 	}
 }
+
+// buildURL drops a trailing slash itself, so a client whose base URL did not
+// come through NewClient still reaches Arc's routes.
+func TestBuildURL_TrimsTheBasePathItself(t *testing.T) {
+	for _, tt := range []struct{ base, want string }{
+		{"http://h:8000/", "http://h:8000/api/v1/databases"},
+		{"http://h:8000/arc//", "http://h:8000/arc/api/v1/databases"},
+		{"http://h:8000/arc/?k=v", "http://h:8000/arc/api/v1/databases?k=v"},
+		{"http://h:8000/a%2Fb/", "http://h:8000/a%2Fb/api/v1/databases"},
+	} {
+		c := &Client{baseURL: tt.base}
+		got, err := c.buildURL("api", "v1", "databases")
+		if err != nil || got != tt.want {
+			t.Errorf("buildURL on %q = %q, %v; want %q", tt.base, got, err, tt.want)
+		}
+	}
+}
