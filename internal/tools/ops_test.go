@@ -42,7 +42,8 @@ const (
 type opsRoute struct {
 	status int
 	body   string
-	hang   bool // wait for the client to give up instead of answering
+	hang   bool          // wait for the client to give up instead of answering
+	delay  time.Duration // answer this late, or not at all if the client gives up first
 }
 
 // opsArc answers each path from routes, 404 for any other, and records the
@@ -64,6 +65,13 @@ func (f *opsArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if route.hang {
 		<-r.Context().Done()
 		return
+	}
+	if route.delay > 0 {
+		select {
+		case <-time.After(route.delay):
+		case <-r.Context().Done():
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(route.status)
@@ -775,6 +783,24 @@ func TestHealth_ReadyTimesOutAfterHealth(t *testing.T) {
 		t.Errorf("isErr=%v %s", res.IsError, text)
 	}
 	assertNoLeak(t, text, addr)
+}
+
+// The two probes share one --timeout: a slow /health leaves /ready only what
+// remains, so the tool never takes longer than the timeout.
+func TestHealth_OneDeadlineForBothProbes(t *testing.T) {
+	fake := &opsArc{routes: map[string]opsRoute{
+		"/health": {status: 200, body: healthBody, delay: 300 * time.Millisecond},
+		"/ready":  {status: 200, body: readyBody, delay: 300 * time.Millisecond},
+	}}
+	cs, _ := opsSession(t, fake, opsOpts{timeout: 450 * time.Millisecond})
+	start := time.Now()
+	text, res := callOps(t, cs, "arc_health", nil)
+	if res.IsError || !strings.HasPrefix(text, `{"health":{"http_status":200,`) || !strings.HasSuffix(text, `"ready":{"error":"timed out"}}`) {
+		t.Errorf("isErr=%v %s", res.IsError, text)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("took %s for a 450ms timeout", took)
+	}
 }
 
 // /health answering anything at all is reported; only no answer is a tool
