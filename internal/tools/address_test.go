@@ -91,3 +91,45 @@ func TestListingTools_TimeoutAnswersWithoutTheAddress(t *testing.T) {
 		assertNoArcAddress(t, c.tool, text, addr)
 	}
 }
+
+// A trailing slash on the configured URL, or on a path prefix in it, reaches
+// Arc's routes rather than //api/v1/..., which Arc answers with 404.
+func TestDataTools_TrailingSlashInTheURL(t *testing.T) {
+	for _, tt := range []struct{ suffix, prefix string }{
+		{"/", ""},
+		{"//", ""},
+		{"/arc", "/arc"},
+		{"/arc/", "/arc"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.EscapedPath() {
+			case tt.prefix + "/api/v1/databases":
+				_, _ = w.Write([]byte(listBodyOK))
+			case tt.prefix + "/api/v1/databases/metrics/measurements":
+				_, _ = w.Write([]byte(measBodyOK))
+			case tt.prefix + "/api/v1/query":
+				_, _ = w.Write([]byte(`{"success":true,"columns":["x"],"data":[[1]],"row_count":1}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(notFound404))
+			}
+		}))
+		cs := newSessionClient(t, arc.NewClient(srv.URL+tt.suffix, "tok", 10*time.Second), registerDataTools)
+		for _, c := range []struct {
+			tool string
+			args map[string]any
+			want string
+		}{
+			{"list_databases", map[string]any{}, "metrics"},
+			{"list_measurements", map[string]any{"database": "metrics"}, "cpu"},
+			{"query", map[string]any{"database": "metrics", "sql": "SELECT 1"}, "x"},
+		} {
+			text, isErr := call(t, cs, c.tool, c.args)
+			if isErr || !strings.Contains(text, c.want) {
+				t.Errorf("ARC_URL %q, %s: isError=%v text=%q", srv.URL+tt.suffix, c.tool, isErr, text)
+			}
+		}
+		srv.Close()
+	}
+}

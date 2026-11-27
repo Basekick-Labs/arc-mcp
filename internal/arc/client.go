@@ -337,10 +337,11 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a new Arc API client.
+// NewClient creates a new Arc API client. baseURL is Arc's base URL; see
+// normalizeBaseURL for what is done to it.
 func NewClient(baseURL, token string, timeout time.Duration) *Client {
 	return &Client{
-		baseURL: baseURL,
+		baseURL: normalizeBaseURL(baseURL),
 		token:   token,
 		httpClient: &http.Client{
 			Timeout: timeout,
@@ -353,7 +354,11 @@ func (c *Client) Timeout() time.Duration { return c.httpClient.Timeout }
 
 // Health checks if the Arc instance is reachable.
 func (c *Client) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/health", nil)
+	healthURL, err := c.buildURL("health")
+	if err != nil {
+		return fmt.Errorf("building the health URL: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
 		return fmt.Errorf("creating request: %w", err)
 	}
@@ -372,7 +377,11 @@ func (c *Client) Health(ctx context.Context) error {
 
 // VerifyToken returns the permissions reported by Arc for the configured token.
 func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/auth/verify", nil)
+	verifyURL, err := c.buildURL("api", "v1", "auth", "verify")
+	if err != nil {
+		return nil, fmt.Errorf("building the token verification URL: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -402,7 +411,11 @@ func (c *Client) VerifyToken(ctx context.Context) ([]string, error) {
 
 // ListDatabases returns all databases from Arc.
 func (c *Client) ListDatabases(ctx context.Context) (*DatabaseListResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/databases", nil)
+	databasesURL, err := c.buildURL("api", "v1", "databases")
+	if err != nil {
+		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: building the URL: %v", err))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, databasesURL, nil)
 	if err != nil {
 		return nil, loggedError(KindNetwork, fmt.Sprintf("list databases: creating the request: %v", err))
 	}
@@ -481,9 +494,31 @@ func loggedError(kind, detail string) *Error {
 	return &Error{Kind: kind, Detail: detail}
 }
 
+// normalizeBaseURL drops the trailing slashes from the path of Arc's base
+// URL, so http://h:8000/ and http://h:8000/arc/ give /api/v1/... and
+// /arc/api/v1/... rather than //api/v1/..., which Arc answers with 404. The
+// path prefix and a query string are kept; an escaped slash (%2F) is part of
+// the prefix, not a trailing slash. A URL that does not parse is kept as
+// given: main validates it first, and buildURL reports it.
+func normalizeBaseURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	escaped := strings.TrimRight(u.EscapedPath(), "/")
+	path, err := url.PathUnescape(escaped)
+	if err != nil {
+		return raw
+	}
+	u.Path, u.RawPath = path, escaped
+	return u.String()
+}
+
 // buildURL safely composes the request URL by appending escaped path segments
 // onto c.baseURL. This prevents path traversal or query/fragment injection via
-// user-influenced segments (e.g., a malicious database name).
+// user-influenced segments (e.g., a malicious database name). Every request
+// is built here, so the base URL's path prefix and query string are kept;
+// c.baseURL has no trailing slash (NewClient), so none is doubled.
 //
 // Unlike path.Join, this never collapses ".." segments — url.PathEscape renders
 // such content as literal characters in the path, so Arc receives exactly the
@@ -493,15 +528,13 @@ func (c *Client) buildURL(segments ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	basePath := strings.TrimRight(u.Path, "/")
 	var b strings.Builder
-	b.WriteString(basePath)
+	b.WriteString(u.EscapedPath())
 	for _, s := range segments {
 		b.WriteByte('/')
 		b.WriteString(url.PathEscape(s))
 	}
 	u.RawPath = b.String()
-	u.Path = basePath
 	for _, s := range segments {
 		u.Path += "/" + s
 	}
@@ -515,7 +548,11 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 		return nil, fmt.Errorf("marshaling request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/query", bytes.NewReader(body))
+	queryURL, err := c.buildURL("api", "v1", "query")
+	if err != nil {
+		return nil, loggedError(KindNetwork, fmt.Sprintf("query: building the URL: %v", err))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, queryURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, loggedError(KindNetwork, fmt.Sprintf("query: creating the request: %v", err))
 	}
