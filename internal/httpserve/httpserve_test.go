@@ -121,7 +121,7 @@ func TestBearerRequired(t *testing.T) {
 			t.Errorf("%s token: connected", name)
 		}
 	}
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, strings.NewReader(`{}`))
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+Path, strings.NewReader(`{}`))
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestStaticToken(t *testing.T) {
 func TestHealthzAndOldPaths(t *testing.T) {
 	srv := endpoint(t, Options{Verify: StaticToken(secret)})
 	for path, want := range map[string]int{"/healthz": 200, "/sse": http.StatusGone, "/message": http.StatusGone} {
-		resp, err := srv.Client().Get(srv.URL + path)
+		resp, err := srv.Client().Do(get(t, srv.URL+path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +169,7 @@ func TestHealthzAndOldPaths(t *testing.T) {
 
 func TestBodyLimit(t *testing.T) {
 	srv := endpoint(t, Options{Verify: StaticToken(secret)})
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, bytes.NewReader(make([]byte, MaxBodyBytes+1)))
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+Path, bytes.NewReader(make([]byte, MaxBodyBytes+1)))
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := srv.Client().Do(req)
@@ -188,7 +188,7 @@ func TestDNSRebindingProtection(t *testing.T) {
 	for _, allow := range []bool{false, true} {
 		srv := endpoint(t, Options{AllowAnyHost: allow, Verify: StaticToken(secret)})
 		body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"1"}}}`
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, strings.NewReader(body))
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+Path, strings.NewReader(body))
 		req.Host = "evil.example.com"
 		req.Header.Set("Authorization", "Bearer "+secret)
 		req.Header.Set("Content-Type", "application/json")
@@ -266,7 +266,7 @@ func TestLimitConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, Path, nil))
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodPost, Path, nil))
 		}()
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -345,7 +345,7 @@ func TestServeShutsDown(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Serve did not return after cancel")
 	}
-	if resp, err := http.Get("http://" + ln.Addr().String() + "/healthz"); err == nil {
+	if resp, err := http.DefaultClient.Do(get(t, "http://"+ln.Addr().String()+"/healthz")); err == nil {
 		_ = resp.Body.Close()
 		t.Error("still serving after shutdown")
 	}
@@ -366,7 +366,10 @@ func slowArc(t *testing.T) (*httptest.Server, *gate) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := g.inFlight.Add(1)
 		defer g.inFlight.Add(-1)
-		for p := g.peak.Load(); n > p && !g.peak.CompareAndSwap(p, n); p = g.peak.Load() {
+		for p := g.peak.Load(); n > p; p = g.peak.Load() {
+			if g.peak.CompareAndSwap(p, n) {
+				break
+			}
 		}
 		g.started <- struct{}{}
 		<-g.release
@@ -390,7 +393,7 @@ const callBody = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name"
 // protocol sends it (no MCP-Protocol-Version header).
 func callRequest(t *testing.T, url, token string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(callBody))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(callBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +453,7 @@ func TestBatchRefused(t *testing.T) {
 func TestUnauthenticatedNeverReachesMCP(t *testing.T) {
 	srv := endpoint(t, Options{Verify: StaticToken(secret)})
 	for _, m := range []string{http.MethodGet, http.MethodDelete, http.MethodPost, http.MethodPut} {
-		req, _ := http.NewRequest(m, srv.URL+Path, nil)
+		req, _ := http.NewRequestWithContext(t.Context(), m, srv.URL+Path, nil)
 		resp, err := srv.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -460,7 +463,7 @@ func TestUnauthenticatedNeverReachesMCP(t *testing.T) {
 			t.Errorf("%s: status %d, want 401", m, resp.StatusCode)
 		}
 	}
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+Path, bytes.NewReader(make([]byte, MaxBodyBytes+1)))
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+Path, bytes.NewReader(make([]byte, MaxBodyBytes+1)))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := srv.Client().Do(req)
 	if err != nil {
@@ -501,7 +504,7 @@ func TestListenTLS(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- Serve(ctx, ln, Handler(mcpServer(t), Options{}), Options{}) }()
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // self-signed test certificate
-	resp, err := client.Get("https://" + ln.Addr().String() + "/healthz")
+	resp, err := client.Do(get(t, "https://"+ln.Addr().String()+"/healthz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,4 +542,13 @@ func selfSigned(t *testing.T) (certFile, keyFile string) {
 		t.Fatal(err)
 	}
 	return certFile, keyFile
+}
+
+func get(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return req
 }

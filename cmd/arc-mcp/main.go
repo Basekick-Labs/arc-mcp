@@ -158,7 +158,7 @@ func main() {
 			httpOpts.Verify = httpserve.StaticToken(httpToken)
 		}
 		if os.Getenv("MCPGODEBUG") != "" {
-			log.Printf("WARNING: MCPGODEBUG is set (%q): it can turn off the MCP SDK's DNS-rebinding and cross-origin protection", os.Getenv("MCPGODEBUG"))
+			log.Print("WARNING: MCPGODEBUG is set: it can turn off the MCP SDK's DNS-rebinding and cross-origin protection")
 		}
 		var err error
 		ln, err = httpserve.Listen(httpOpts)
@@ -359,7 +359,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 // refused: it would otherwise run the endpoint without authentication.
 func resolveHTTPToken() (string, error) {
 	if path := os.Getenv("ARC_MCP_HTTP_TOKEN_FILE"); path != "" {
-		data, err := os.ReadFile(path) //nolint:gosec // path comes from ARC_MCP_HTTP_TOKEN_FILE, not user input
+		data, err := os.ReadFile(path) //nolint:gosec // #nosec G304 -- path comes from ARC_MCP_HTTP_TOKEN_FILE, set by the operator
 		if err != nil {
 			return "", fmt.Errorf("reading ARC_MCP_HTTP_TOKEN_FILE %q: %w", path, err)
 		}

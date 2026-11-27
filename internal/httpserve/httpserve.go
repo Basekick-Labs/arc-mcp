@@ -90,7 +90,7 @@ func Listen(opts Options) (net.Listener, error) {
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
-	ln, err := net.Listen("tcp", opts.Listen)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", opts.Listen)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +348,7 @@ func accessLog(next http.Handler) http.Handler {
 		if info.tool != "" {
 			line += " tool=" + logField(info.tool)
 		}
-		log.Print(line)
+		log.Print(line) //nolint:gosec // #nosec G706 -- client values pass through logField
 	})
 }
 
