@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -151,6 +153,25 @@ func newRig(t testing.TB, cfg Config, keys ...any) *rig {
 
 func (r *rig) verify(tok string) (*Token, error) { return r.v.Verify(context.Background(), tok) }
 
+// hold makes every fetch wait until the returned func runs (or cleanup).
+func (r *rig) hold(t testing.TB) func() {
+	gate := make(chan struct{})
+	r.idp.gate.Store(gate)
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	return release
+}
+
+// waiters is how many lookups wait on the fetch in progress.
+func (r *rig) waiters() int {
+	r.v.keys.mu.Lock()
+	defer r.v.keys.mu.Unlock()
+	if r.v.keys.flight == nil {
+		return 0
+	}
+	return r.v.keys.flight.waiters
+}
+
 // waitFlight waits for a background fetch to finish.
 func (r *rig) waitFlight() {
 	r.v.keys.mu.Lock()
@@ -239,8 +260,11 @@ func TestVerify(t *testing.T) {
 		}, 0, false},
 		{"ES384", func() string { return sign(t, ec384Key, jose.ES384, "ec384", "at+jwt", payload(now)) }, 0, false},
 		{"EdDSA", func() string { return sign(t, edKey, jose.EdDSA, "ed", "at+jwt", payload(now)) }, 0, false},
-		{"RS512 on a key pinned to RS512, x5t kept", func() string {
-			return sign(t, rsaKey, jose.RS512, "rs512", "at+jwt", payload(now), "x5t", "dGh1bWI")
+		{"scp array", func() string { return rs(del("scope"), set("scp", []string{"openid", "arc:read"})) }, 0, false},
+		{"scp string", func() string { return rs(del("scope"), set("scp", "openid arc:read")) }, 0, false},
+		{"scp a number", func() string { return rs(del("scope"), set("scp", 7)) }, ReasonMalformed, false},
+		{"RS512 on a key pinned to RS512, x5t and x5t#S256 kept", func() string {
+			return sign(t, rsaKey, jose.RS512, "rs512", "at+jwt", payload(now), "x5t", "dGh1bWI", "x5t#S256", "dGh1bWI")
 		}, 0, false},
 		{"exp inside the leeway", func() string { return rs(set("exp", now.Add(-Leeway+time.Second).Unix())) }, 0, false},
 		{"expired at the leeway edge", func() string { return rs(set("exp", now.Add(-Leeway).Unix())) }, ReasonExpired, false},
@@ -401,10 +425,10 @@ func TestRotationAndCooldown(t *testing.T) {
 // starts another fetch nor cancels this one for the others.
 func TestLookupsShareOneFetch(t *testing.T) {
 	r := newRig(t, Config{})
-	gate := make(chan struct{})
-	r.idp.gate.Store(gate)
+	release := r.hold(t)
 	tok := sign(t, ecKey, jose.ES256, "ec", "at+jwt", payload(start))
-	done := make(chan error, 1)
+	absent := sign(t, ecKey, jose.ES256, "absent", "at+jwt", payload(start))
+	done, late := make(chan error, 1), make(chan error, 1)
 	go func() { _, err := r.verify(tok); done <- err }()
 	for r.idp.hits.Load() == 0 {
 		time.Sleep(time.Millisecond)
@@ -413,16 +437,147 @@ func TestLookupsShareOneFetch(t *testing.T) {
 	cancel()
 	_, err := r.v.Verify(ctx, tok)
 	checkRefusal(t, err, ReasonKeyFetchFailed)
+	go func() { _, err := r.verify(absent); late <- err }()
+	for r.waiters() < 2 {
+		time.Sleep(time.Millisecond)
+	}
 	r.v.keys.mu.Lock()
 	f := r.v.keys.flight
 	r.v.keys.mu.Unlock()
-	close(gate)
+	release()
 	if err := <-done; err != nil {
 		t.Fatalf("the waiting lookup: %v", err)
 	}
+	// It joined a fetch begun before it, so the set may predate its key: 503.
+	checkRefusal(t, <-late, ReasonKeyCooldown)
 	<-f.done
 	if n := r.idp.hits.Load(); n != 1 {
 		t.Fatalf("fetches = %d, want 1", n)
+	}
+}
+
+// Past maxWaiters, a lookup that would wait on a stalled fetch is refused at
+// once.
+func TestWaitersCapped(t *testing.T) {
+	r := newRig(t, Config{})
+	release := r.hold(t)
+	tok := sign(t, ecKey, jose.ES256, "ec", "at+jwt", payload(start))
+	errs := make(chan error, maxWaiters+1)
+	for range maxWaiters {
+		go func() { _, err := r.verify(tok); errs <- err }()
+	}
+	for r.waiters() < maxWaiters {
+		time.Sleep(time.Millisecond)
+	}
+	over := make(chan error, 1)
+	go func() { _, err := r.verify(tok); over <- err }()
+	select {
+	case err := <-over:
+		checkRefusal(t, err, ReasonKeyFetchFailed)
+	case <-time.After(10 * time.Second):
+		t.Error("a lookup past the cap waited on the fetch")
+	}
+	release()
+	for range maxWaiters {
+		if err := <-errs; err != nil {
+			t.Errorf("waiting lookup: %v", err)
+		}
+	}
+}
+
+// A key stops being trusted once the set is maxKeyAge old, even while every
+// fetch fails.
+func TestKeySetMaxAge(t *testing.T) {
+	r := newRig(t, Config{})
+	at := func(d time.Duration) string {
+		return sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(start.Add(d)))
+	}
+	if err := r.v.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.idp.status.Store(http.StatusServiceUnavailable)
+	r.clk.add(maxKeyAge - time.Second)
+	if _, err := r.verify(at(maxKeyAge - time.Second)); err != nil { // its background refresh fails
+		t.Fatal(err)
+	}
+	r.waitFlight()
+	r.clk.add(time.Second)
+	_, err := r.verify(at(maxKeyAge))
+	checkRefusal(t, err, ReasonKeyFetchFailed)
+	r.clk.add(refetchCooldown)
+	_, err = r.verify(at(maxKeyAge + refetchCooldown))
+	checkRefusal(t, err, ReasonKeyFetchFailed)
+	r.idp.status.Store(http.StatusOK)
+	r.clk.add(refetchCooldown)
+	if _, err := r.verify(at(maxKeyAge + 2*refetchCooldown)); err != nil {
+		t.Fatalf("after a fetch succeeds again: %v", err)
+	}
+}
+
+// A set that parses is authoritative even with nothing usable in it: the
+// withdrawn key is refused as soon as that set is fetched.
+func TestUnusableSetWithdrawsKeys(t *testing.T) {
+	genKeys()
+	huge := make([]byte, 640) // a 5120-bit modulus, over go-jose's MaxRSAModulusBits
+	huge[0] = 0x80
+	for name, keys := range map[string][]any{
+		"empty":       {},
+		"only enc":    {map[string]any{"kty": "RSA", "kid": "rsa", "use": "enc", "n": b64(rsaKey.N.Bytes()), "e": "AQAB"}},
+		"only 5120 b": {map[string]any{"kty": "RSA", "kid": "rsa", "n": b64(huge), "e": "AQAB"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, Config{}, jwk(&rsaKey.PublicKey, "rsa", ""))
+			tok := sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(start))
+			if _, err := r.verify(tok); err != nil {
+				t.Fatal(err)
+			}
+			r.idp.serve(t, keys...)
+			r.clk.add(refetchCooldown)
+			if err := r.v.Refresh(context.Background()); err == nil {
+				t.Fatal("Refresh did not report a set with no usable key")
+			}
+			_, err := r.verify(tok)
+			checkRefusal(t, err, ReasonKeyCooldown)
+			r.clk.add(refetchCooldown)
+			_, err = r.verify(tok)
+			checkRefusal(t, err, ReasonUnknownKey)
+		})
+	}
+}
+
+func TestFetchTimesOut(t *testing.T) {
+	r := newRig(t, Config{})
+	r.hold(t)
+	r.v.keys.client.Timeout = 50 * time.Millisecond
+	if err := r.v.Refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("Refresh = %v", err)
+	}
+	_, err := r.verify(sign(t, rsaKey, jose.RS256, "rsa", "at+jwt", payload(start)))
+	checkRefusal(t, err, ReasonKeyFetchFailed)
+}
+
+// No fetch goes through a proxy from the environment. net/http reads it once
+// per process, so a child gets it; 0.0.0.0 is not loopback, so it would be proxied.
+func TestFetchIgnoresProxyEnv(t *testing.T) {
+	if os.Getenv("OAUTH_PROXY_CHILD") == "1" {
+		v, _ := New(Config{Issuer: testIssuer, Audience: testAudience, JWKSURL: "https://0.0.0.0:1/jwks"})
+		v.keys.client.Timeout = 300 * time.Millisecond
+		_ = v.Refresh(context.Background())
+		return
+	}
+	var hits atomic.Int64
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestFetchIgnoresProxyEnv$")
+	cmd.Env = append(os.Environ(), "OAUTH_PROXY_CHILD=1", "HTTPS_PROXY="+proxy.URL, "https_proxy="+proxy.URL, "NO_PROXY=", "no_proxy=")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("child: %v\n%s", err, out)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("the key set fetch went through the environment's proxy")
 	}
 }
 
@@ -462,7 +617,6 @@ func TestKeySetFetchFailures(t *testing.T) {
 			p.location.Store(target.srv.URL + "/jwks")
 		}},
 		{"not JSON", func(_ *testing.T, p *idp) { p.body.Store([]byte("<html>MARKER")) }},
-		{"no usable key", func(t *testing.T, p *idp) { p.serve(t, jwk(&rsaSmall.PublicKey, "rsa", "")) }},
 		{"too many keys", func(t *testing.T, p *idp) {
 			keys := make([]any, maxKeys+1)
 			for i := range keys {
@@ -540,6 +694,7 @@ func TestNewChecksConfig(t *testing.T) {
 		{Issuer: testIssuer, Audience: testAudience},
 		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "http://203.0.113.5/jwks"},
 		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "http://idp.example/jwks"},
+		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "http://idp.localhost/jwks"},
 		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "https://u:p@idp.example/jwks"},
 		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "https://idp.example/jwks#k"},
 		{Issuer: testIssuer, Audience: testAudience, JWKSURL: "/jwks"},
@@ -551,6 +706,9 @@ func TestNewChecksConfig(t *testing.T) {
 	r := newRig(t, Config{})
 	if r.idp.hits.Load() != 0 {
 		t.Fatal("New fetched the key set")
+	}
+	if tr, ok := r.v.keys.client.Transport.(*http.Transport); !ok || tr.Proxy != nil || r.v.keys.client.Timeout != fetchTimeout {
+		t.Fatal("the key set client may use a proxy, or lacks the 10 s timeout")
 	}
 }
 
