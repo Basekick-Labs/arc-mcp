@@ -29,9 +29,10 @@ type GetSampleDataArgs struct {
 func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "query",
+		Title:       "Run a read-only SQL query",
 		Annotations: readOnly("Run a read-only SQL query"),
 		Description: "Execute one read-only SQL query against Arc (DuckDB SQL dialect). Supports SELECT, aggregations, JOINs, CTEs, time_bucket(), date_trunc(), and more. " +
-			"Bound it by time (WHERE time > now() - INTERVAL '1 hour'): Arc then reads only those partitions. " +
+			"Bound it by time with a top-level WHERE on time (time > now() - INTERVAL '1 hour') in a single-table query: Arc then reads only those partitions; a JOIN, CTE or subquery reads all history. " +
 			"At most " + strconv.Itoa(maxRows) + " rows come back; when there are more, the answer says so at the top. " +
 			"Arc refuses some words anywhere in a query, even as column names or aliases (load, copy, set, pragma, call, ...): double-quote such a name, as in AS \"load\".",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args QueryArgs) (out *mcp.CallToolResult, _ any, _ error) {
@@ -91,7 +92,7 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 		}
 		if result.Truncated {
 			log.Printf("query: Arc truncated the result: %s", result.TruncationReason)
-			if why := arc.QueryErrorText(result.TruncationReason); why != "" {
+			if why := result.FixableTruncation(); why != "" {
 				// A failure the query itself causes (a bad cast on a later
 				// row, say) happens again on every retry: say what it is.
 				notes = append(notes, "**Arc stopped partway through this result, so it is incomplete:** "+why+" Fix the query; running it again fails the same way.")
@@ -112,10 +113,19 @@ func RegisterQuery(server *mcp.Server, client *arc.Client, maxRows int, maxRespo
 	})
 }
 
+// sampleWindows are the time bounds get_sample_data tries in turn, each a
+// top-level condition Arc prunes partitions by.
+var sampleWindows = []string{
+	" WHERE time > now() - INTERVAL '1 day'",
+	" WHERE time > now() - INTERVAL '30 days'",
+	"",
+}
+
 // RegisterGetSampleData registers the get_sample_data tool.
 func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_sample_data",
+		Title:       "Sample recent rows",
 		Annotations: readOnly("Sample recent rows"),
 		Description: "Get recent sample rows from a measurement, ordered by time descending. Useful for understanding the data shape and recent values.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args GetSampleDataArgs) (out *mcp.CallToolResult, _ any, _ error) {
@@ -149,14 +159,25 @@ func RegisterGetSampleData(server *mcp.Server, client *arc.Client, maxResponseCh
 			limit = 100
 		}
 
-		// Safe to interpolate: ValidateIdentifier ensured args.Measurement is [A-Za-z_][A-Za-z0-9_]*.
-		sql := fmt.Sprintf("SELECT * FROM %s ORDER BY time DESC LIMIT %d", args.Measurement, limit)
-		result, err := client.Query(ctx, args.Database, sql)
-		if err != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
-				IsError: true,
-			}, nil, nil
+		// The most recent rows, without reading all history to find them:
+		// the last day first, then the last 30 days, then everything. A
+		// measurement with no files answers with no columns at the first
+		// step, and that answer is final.
+		var result *arc.QueryResponse
+		for _, window := range sampleWindows {
+			// Safe to interpolate: ValidateIdentifier ensured args.Measurement is [A-Za-z_][A-Za-z0-9_]*.
+			sql := fmt.Sprintf("SELECT * FROM %s%s ORDER BY time DESC LIMIT %d", args.Measurement, window, limit)
+			r, err := client.Query(ctx, args.Database, sql)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: arc.UserMessage(err)}},
+					IsError: true,
+				}, nil, nil
+			}
+			result = r
+			if len(r.Columns) == 0 || len(r.Data) > 0 {
+				break
+			}
 		}
 
 		noData := fmt.Sprintf("No data: measurement '%s' does not exist in database '%s', or has no data written yet. Check the name with list_measurements.", args.Measurement, args.Database)

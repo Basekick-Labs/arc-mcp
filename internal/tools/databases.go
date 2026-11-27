@@ -17,6 +17,7 @@ type ListDatabasesArgs struct{}
 func RegisterListDatabases(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_databases",
+		Title:       "List databases",
 		Annotations: readOnly("List databases"),
 		Description: "List all databases in the Arc instance. Returns database names and measurement counts.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ ListDatabasesArgs) (out *mcp.CallToolResult, _ any, _ error) {

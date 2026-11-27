@@ -27,6 +27,7 @@ type DescribeMeasurementArgs struct {
 func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_measurements",
+		Title:       "List measurements",
 		Annotations: readOnly("List measurements"),
 		Description: "List all measurements (tables) in a database. Returns measurement names.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args ListMeasurementsArgs) (out *mcp.CallToolResult, _ any, _ error) {
@@ -91,6 +92,7 @@ func RegisterListMeasurements(server *mcp.Server, client *arc.Client) {
 func RegisterDescribeMeasurement(server *mcp.Server, client *arc.Client, maxResponseChars int) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "describe_measurement",
+		Title:       "Describe a measurement",
 		Annotations: readOnly("Describe a measurement"),
 		Description: "Describe a measurement: column names and types, row count, and the time range of its data. Call it before querying; use the time range to choose the WHERE time bound. Its statistics scan the whole measurement.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, args DescribeMeasurementArgs) (out *mcp.CallToolResult, _ any, _ error) {

@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for [Arc](https://github.com/basekick-labs/arc), the open-source time-series lakehouse: every telemetry reading kept at full resolution, recent data hot and years of history as Parquet in your own bucket, queried with one SQL.
 
-Connect any MCP-compatible assistant (Claude, Cursor, and others) to your Arc instance and ask questions of your whole history in natural language. arc-mcp only reads: it discovers databases and measurements, describes their schema, and runs read-only SQL with the guardrails an agent needs (time-bounded queries, a row cap that says when more rows exist, Arc's own errors passed back so the model can fix its SQL).
+Connect any MCP-compatible assistant (Claude, Cursor, and others) to your Arc instance and ask questions of your whole history in natural language. arc-mcp only reads: it discovers databases and measurements, describes their schema, and runs read-only SQL with what an agent needs to use it well: guidance to bound queries by time (what Arc prunes partitions by), a row cap that says when more rows exist, and Arc's own errors passed back so the model can fix its SQL.
 
 ## Installation
 
@@ -214,7 +214,7 @@ Get column names, types, row count, and time range for a measurement.
 
 ### query
 
-Execute a read-only SQL query (DuckDB dialect). Supports SELECT, aggregations, JOINs, CTEs, `time_bucket()`, `date_trunc()`, and more.
+Execute a read-only SQL query (DuckDB dialect). Supports SELECT, aggregations, JOINs, CTEs, `time_bucket()`, `date_trunc()`, and more. Bound single-table queries by time with a top-level condition (`WHERE time > now() - INTERVAL '1 hour'`): Arc then reads only the partitions in range. A JOIN, CTE or subquery reads all history.
 
 **Example prompts:**
 - "What's the average CPU usage per host in the last hour?"
@@ -233,17 +233,19 @@ Get recent sample rows from a measurement, ordered by time descending.
 - **Permission answers are kept apart:** Arc's 401 (token missing, invalid or expired), its 403 for a token without read permission, its 403 for a token scoped to other databases, and its 404 for a database that does not exist produce four different messages. arc-mcp never retries a refusal and never widens a token's reach to work around one
 - **Row limits:** Queries return at most 500 rows by default (`--max-rows` / `ARC_MCP_MAX_ROWS`, 1 to 100,000). arc-mcp asks Arc for one row more than it shows: it appends `LIMIT 501` when the query has no LIMIT of its own and lowers a larger one, leaving the WHERE clause untouched so Arc still prunes partitions by time. When more rows exist, the answer says so at the top instead of looking complete
 - **Response truncation:** Large responses are truncated to prevent overwhelming LLM context windows
-- **Timeout:** 30-second default query timeout
+- **Timeout:** 30-second default query timeout; a query that runs out of time tells the model to aggregate or narrow the time range
+- **Read-only, declared:** every tool carries the MCP read-only annotation, so clients can run it without asking each time
+- **Errors the model can act on:** when DuckDB rejects a query (a misspelled column and its candidates, a bad cast, a missing GROUP BY), its message is passed back with Arc's rewritten SQL and every storage path removed; storage and server faults stay generic
 
 ## Architecture
 
 ```
-arc-mcp (MCP Server)  ──HTTP──>  Arc (Analytical DB)
+arc-mcp (MCP Server)  ──HTTP──>  Arc (time-series lakehouse)
      │                              │
   stdio/JSON-RPC               REST API
      │                              │
   LLM Client                   Parquet Storage
-(Claude, GPT, etc.)
+(Claude, Cursor, etc.)
 ```
 
 The MCP server is a thin client that communicates with Arc over its existing REST API. It does not import Arc internals or share code with Arc.

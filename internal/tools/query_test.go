@@ -275,7 +275,7 @@ func TestGetSampleData_LimitIsOptional(t *testing.T) {
 	if text, isErr := call(t, cs, "get_sample_data", map[string]any{"database": "db", "measurement": "cpu"}); isErr {
 		t.Fatalf("call without limit failed: %s", text)
 	}
-	if sent := fake.received(); len(sent) != 1 || sent[0] != "SELECT * FROM cpu ORDER BY time DESC LIMIT 10" {
+	if sent := fake.received(); len(sent) != 1 || sent[0] != "SELECT * FROM cpu WHERE time > now() - INTERVAL '1 day' ORDER BY time DESC LIMIT 10" {
 		t.Errorf("Arc received %q", sent)
 	}
 
@@ -347,11 +347,7 @@ func TestQuery_ArcCapAndTruncationAreSaid(t *testing.T) {
 // clients can run it without asking the user each time.
 func TestEveryToolIsAnnotatedReadOnly(t *testing.T) {
 	cs := newSession(t, &fakeArc{reply: func(string) (int, string) { return 200, rowsBody(1) }}, func(server *mcp.Server, client *arc.Client) {
-		RegisterListDatabases(server, client)
-		RegisterListMeasurements(server, client)
-		RegisterDescribeMeasurement(server, client, 50_000)
-		RegisterQuery(server, client, 500, 50_000)
-		RegisterGetSampleData(server, client, 50_000)
+		RegisterAll(server, client, 500, 50_000)
 	})
 	tools, err := cs.ListTools(t.Context(), nil)
 	if err != nil {
@@ -362,7 +358,8 @@ func TestEveryToolIsAnnotatedReadOnly(t *testing.T) {
 	}
 	for _, tool := range tools.Tools {
 		a := tool.Annotations
-		if a == nil || !a.ReadOnlyHint || a.Title == "" || a.OpenWorldHint == nil || *a.OpenWorldHint {
+		if a == nil || !a.ReadOnlyHint || a.Title == "" || tool.Title == "" || !a.IdempotentHint ||
+			a.DestructiveHint == nil || *a.DestructiveHint || a.OpenWorldHint == nil || *a.OpenWorldHint {
 			t.Errorf("%s: annotations %+v", tool.Name, a)
 		}
 	}
@@ -390,12 +387,32 @@ func TestEmptyResultNamesTheLikelyCause(t *testing.T) {
 // said as it is, without inviting a retry that fails the same way.
 func TestMidStreamQueryErrorIsSaid(t *testing.T) {
 	fake := &fakeArc{reply: func(string) (int, string) {
+		// As Arc sends it: its stream prefix, one line, quoted values masked
+		// (SanitizeErrText in the arc repo).
 		return 200, `{"success":true,"columns":["n"],"data":[[1]],"row_count":1,"truncated":true,` +
-			`"truncation_reason":"arrow query failed: Conversion Error: Could not convert string 'x' to INT64\n\nLINE 1: SELECT ... read_parquet(['/app/data/x.parquet'])"}`
+			`"truncation_reason":"arrow reader error after 1000 rows: Conversion Error: Could not convert string '...' to INT64"}`
 	}}
 	cs := dataSession(t, fake, 500, 50_000)
 	text, _ := call(t, cs, "query", map[string]any{"database": "db", "sql": "SELECT CAST(s AS BIGINT) FROM t"})
-	if !strings.Contains(text, "Could not convert string 'x' to INT64") || strings.Contains(text, "Try again") || strings.Contains(text, "/app/") {
+	if !strings.Contains(text, "Conversion Error: Could not convert string '...' to INT64") || strings.Contains(text, "Try again") || strings.Contains(text, "arrow reader error") {
 		t.Errorf("got %q", text)
+	}
+}
+
+// get_sample_data widens its window only while the measurement exists and
+// the window is empty, and never reads all history first.
+func TestGetSampleData_WidensTheWindowWhenEmpty(t *testing.T) {
+	empty := `{"success":true,"columns":["time","v"],"data":[],"row_count":0}`
+	fake := &fakeArc{reply: func(sql string) (int, string) {
+		if strings.Contains(sql, "30 days") {
+			return 200, `{"success":true,"columns":["time","v"],"data":[["2026-11-01T00:00:00Z",7]],"row_count":1}`
+		}
+		return 200, empty
+	}}
+	cs := dataSession(t, fake, 500, 50_000)
+	text, _ := call(t, cs, "get_sample_data", map[string]any{"database": "db", "measurement": "cpu"})
+	sent := fake.received()
+	if len(sent) != 2 || !strings.Contains(sent[0], "1 day") || !strings.Contains(sent[1], "30 days") || !strings.Contains(text, "| 7 |") {
+		t.Errorf("sent %q, got %q", sent, text)
 	}
 }

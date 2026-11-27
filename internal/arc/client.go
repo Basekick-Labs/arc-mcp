@@ -23,9 +23,11 @@ type Error struct {
 	Kind   string // see the Kind* constants
 	Status int    // HTTP status when the error came from a response, 0 otherwise
 	Detail string // full detail — log to stderr, never send to LLM
-	// Message is Arc's own text for a request it refused as invalid (HTTP
-	// 400): a fixed validation message, such as "Dangerous SQL operation
-	// not allowed", safe to show the model. Empty otherwise.
+	// Message is text safe to show the model, set where it can act on it:
+	// Arc's fixed validation message for a refused request (HTTP 400), the
+	// fixable part of a failed query (redacted, see queryErrorText), or a
+	// fixed hint for a query that ran out of memory, timed out or lost data
+	// mid-run. Empty otherwise; UserMessage then gives the generic text.
 	Message string
 }
 
@@ -64,12 +66,15 @@ const (
 	KindParse = "parse"
 	// KindQuery is a query Arc rejected.
 	KindQuery = "query"
+	// KindTimeout is a request arc-mcp gave up on after its own --timeout.
+	KindTimeout = "timeout"
 )
 
 func (e *Error) Error() string { return e.Kind + ": " + e.Detail }
 
 // arcErrorFrom classifies a non-2xx HTTP response into an Error and logs
-// the full body snippet to stderr. Callers receive only the Kind.
+// the body (its first 4 KiB) to stderr. Callers get the Kind, and Message when
+// the model can act on it.
 func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 	logged := snippet
 	if len(logged) > maxErrorBodyBytes {
@@ -101,10 +106,18 @@ func arcErrorFrom(op string, statusCode int, snippet []byte) *Error {
 			e.Message = queryErrorFromBody(snippet)
 		}
 	case op == "query" && statusCode == http.StatusGatewayTimeout:
-		e.Message = "it timed out in Arc. Aggregate (time_bucket, GROUP BY) or narrow the time range, then try again."
+		e.Message = timedOutHint
+	case op == "query" && statusCode == http.StatusServiceUnavailable && strings.Contains(errorField(snippet), "retry the query"):
+		// Arc's fixed answer when data the query read was removed while it
+		// ran (retention, compaction, a delete): the one failure a retry fixes.
+		e.Message = "data it read was removed while it ran (retention, compaction or a delete). Run it again once."
 	}
 	return e
 }
+
+// timedOutHint is the hint for a query that ran out of time, in Arc or in
+// arc-mcp's own --timeout.
+const timedOutHint = "it timed out. Aggregate (time_bucket, GROUP BY) or narrow the time range, then try again."
 
 // refusalText is the first line of the error message in Arc's JSON error
 // body, at most 300 runes; "" for a body that is not Arc's (a proxy's HTML
@@ -205,12 +218,20 @@ func UserMessage(err error) string {
 		case KindParse:
 			return "Arc returned an unexpected response format."
 		case KindQuery:
+			if ae.Message != "" {
+				return "The query failed: " + ae.Message
+			}
 			return "Arc rejected the query — check the SQL syntax."
+		case KindTimeout:
+			return "The query failed: " + timedOutHint
+		case KindNetwork:
+			return "Arc could not be reached. Ask the user to check that the Arc server is running at the configured URL."
 		case KindServer:
 			switch {
 			case ae.Message != "" && ae.Status == http.StatusBadRequest:
 				return "Arc refused the request: " + ae.Message
 			case ae.Message != "":
+				// Only the query path sets Message on other statuses.
 				return "The query failed: " + ae.Message
 			}
 			return "Arc returned an error — see server logs for details."
@@ -270,8 +291,9 @@ type QueryResponse struct {
 	Error           string          `json:"error,omitempty"`
 	// RowsCapped is set when Arc's own governance row cap (RowCap) cut the
 	// result. Truncated is set when Arc stopped streaming partway; the data
-	// is real but incomplete, and TruncationReason says why (for the log,
-	// not the model). Both still come with success:true.
+	// is real but incomplete, and TruncationReason says why (logged; only
+	// FixableTruncation's redacted form reaches the model). Both still come
+	// with success:true.
 	RowsCapped       bool   `json:"rows_capped,omitempty"`
 	RowCap           int64  `json:"row_cap,omitempty"`
 	Truncated        bool   `json:"truncated,omitempty"`
@@ -453,7 +475,14 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("executing query: %w", err)
+		// Never the raw error to the model: it carries Arc's URL.
+		detail := fmt.Sprintf("query: %v", err)
+		log.Printf("arc error: %s", detail)
+		var ue *url.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ue) && ue.Timeout() {
+			return nil, &Error{Kind: KindTimeout, Detail: detail}
+		}
+		return nil, &Error{Kind: KindNetwork, Detail: detail}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody := io.LimitReader(resp.Body, maxArcResponseBytes+1)
@@ -479,7 +508,7 @@ func (c *Client) Query(ctx context.Context, database, sql string) (*QueryRespons
 	if !result.Success {
 		detail := fmt.Sprintf("query: Arc error: %s", result.Error)
 		log.Printf("arc error: %s", detail)
-		return nil, &Error{Kind: KindQuery, Detail: detail}
+		return nil, &Error{Kind: KindQuery, Detail: detail, Message: queryErrorText(result.Error)}
 	}
 	return &result, nil
 }
