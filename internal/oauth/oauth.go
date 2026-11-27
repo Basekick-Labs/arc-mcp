@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -114,12 +115,7 @@ var algorithms = []jose.SignatureAlgorithm{
 }
 
 func allowedAlgorithm(alg string) bool {
-	for _, a := range algorithms {
-		if string(a) == alg {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(algorithms, jose.SignatureAlgorithm(alg))
 }
 
 // Config configures a Verifier.
@@ -135,15 +131,12 @@ type Config struct {
 	// redirects are refused and the fetch is bounded by a 10 s timeout.
 	HTTPClient *http.Client
 	// UntypedAccessToken decides tokens whose typ header is "JWT" or absent,
-	// which RFC 9068 §4 tells a resource server to refuse: it returns true
-	// only when the verified token shows it is an access token and not, for
-	// example, an ID token for the same audience. It sees only tokens that
-	// passed every other check. nil refuses every untyped token. What
-	// separates the two token kinds differs between authorization servers,
-	// so the rule for one is set where that server is configured, from
-	// tokens it actually issued; a typ of "at+jwt" (or
-	// "application/at+jwt") never reaches it, and any other typ is refused
-	// without asking it.
+	// which RFC 9068 §4 refuses: true only when the verified token shows it
+	// is an access token, not (say) an ID token for the same audience. It
+	// sees only tokens that passed every other check; nil refuses them all.
+	// What tells the two apart differs between authorization servers, so the
+	// rule is set where the server is configured, from tokens it issued.
+	// typ "at+jwt" never reaches it; any other typ is refused unasked.
 	UntypedAccessToken func(*Token) bool
 }
 
@@ -177,11 +170,8 @@ func (t *Token) HasClaim(name string) bool {
 // StringClaim returns the named claim when it is a JSON string.
 func (t *Token) StringClaim(name string) (string, bool) {
 	raw, ok := t.claims[name]
-	if !ok {
-		return "", false
-	}
 	var s string
-	if josejson.Unmarshal(raw, &s) != nil {
+	if !ok || len(raw) == 0 || raw[0] != '"' || josejson.Unmarshal(raw, &s) != nil {
 		return "", false
 	}
 	return s, true
