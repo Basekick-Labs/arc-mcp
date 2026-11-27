@@ -101,3 +101,11 @@ jobs:
           version: '3.14.0'
       - name: Lint Helm chart
         run: helm lint helm/arc-mcp
+      - name: Render Helm chart
+        run: |
+          helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok >/dev/null
+          helm template t helm/arc-mcp --set http.tokenSecretRef.name=tok --set http.tlsSecretName=tls >/dev/null
+          helm template t helm/arc-mcp --set http.insecureListen=true >/dev/null
+          # The guards: no inbound token, and the removed gateway values.
+          ! helm template t helm/arc-mcp >/dev/null 2>&1
+          ! helm template t helm/arc-mcp --set http.insecureListen=true --set gateway.enabled=true >/dev/null 2>&1

@@ -37,6 +37,19 @@ arc-mcp \
 | `ARC_TOKEN_FILE` | File containing the Arc API token | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
 | `ARC_MCP_TOOLS` | Tool groups to serve: `data`, `ops` or `data,ops` (see [Operations tools](#operations-tools-opt-in)) | `data` |
+| `ARC_MCP_TIMEOUT` | Query timeout (`30s`, `2m`) | `30s` |
+| `ARC_MCP_MAX_RESPONSE_SIZE` | Size limit of an answer, in characters | `50000` |
+| `ARC_MCP_INSECURE` | `true` to allow a token over plaintext HTTP to a non-loopback Arc | `false` |
+| `ARC_MCP_TRANSPORT` | `stdio` or `http` (see [Remote access over HTTP](#remote-access-over-http)) | `stdio` |
+| `ARC_MCP_LISTEN` | HTTP: address to listen on | `127.0.0.1:8080` |
+| `ARC_MCP_HTTP_TOKEN_FILE` | HTTP: file containing the bearer token clients must send | (none) |
+| `ARC_MCP_HTTP_TOKEN` | HTTP: the bearer token clients must send | (none) |
+| `ARC_MCP_INSECURE_LISTEN` | HTTP: `true` to serve a non-loopback address with no token | `false` |
+| `ARC_MCP_MAX_CONCURRENT` | HTTP: requests served at once (`0` for no limit) | `8` |
+| `ARC_MCP_TLS_CERT_FILE`, `ARC_MCP_TLS_KEY_FILE` | HTTP: serve HTTPS with this certificate and key | (none) |
+| `ARC_MCP_ALLOW_ANY_HOST` | HTTP: accept any `Host` header on a loopback listener (see below) | `false` |
+
+Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused at startup.
 
 ### CLI Flags
 
@@ -48,6 +61,14 @@ arc-mcp \
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Size limit of an answer, in characters (minimum 4000). Applies to the text and to the structured rows alike, each stopping at a row boundary | `50000` |
 | `--tools` | Tool groups to serve, comma-separated: `data`, `ops` | `$ARC_MCP_TOOLS` or `data` |
+| `--transport` | `stdio` or `http` | `stdio` |
+| `--listen` | HTTP: address to listen on | `127.0.0.1:8080` |
+| `--insecure-listen` | HTTP: serve a non-loopback address with no inbound token | `false` |
+| `--max-concurrent` | HTTP: requests served at once | `8` |
+| `--tls-cert`, `--tls-key` | HTTP: serve HTTPS | (none) |
+| `--allow-any-host` | HTTP: turn off DNS-rebinding protection on a loopback listener | `false` |
+
+Every flag also has the environment variable in the table above. The inbound HTTP token has no flag, so it never shows in the process list.
 
 ### Token hygiene
 
@@ -74,18 +95,59 @@ permissions and logs them, with one warning naming any of `write`, `delete` or
 own permissions, not RBAC roles, and it does not stop arc-mcp from starting:
 Arc remains responsible for enforcing permissions.
 
+## Remote access over HTTP
+
+By default arc-mcp speaks stdio: the MCP client starts it as a subprocess. To run it as a service that clients reach over the network, use the Streamable HTTP transport:
+
+```bash
+export ARC_TOKEN_FILE=/etc/arc-mcp/arc-token
+export ARC_MCP_HTTP_TOKEN_FILE=/etc/arc-mcp/http-token   # e.g. openssl rand -hex 32 > http-token
+arc-mcp --transport http --listen 0.0.0.0:8080
+```
+
+- MCP endpoint: `http://host:8080/mcp`. Liveness: `GET /healthz` (does not call Arc, needs no token).
+- **Inbound token.** With `ARC_MCP_HTTP_TOKEN_FILE` or `ARC_MCP_HTTP_TOKEN` set, every request to `/mcp` needs `Authorization: Bearer <token>`. arc-mcp refuses to listen on a non-loopback address without one, unless `--insecure-listen` is set. On `127.0.0.1` the token is optional.
+- **One token for everyone.** The inbound token is a shared secret for the endpoint, not per-user authentication: every client acts with arc-mcp's Arc token, and Arc sees all their queries as that token. Give arc-mcp a read-only Arc token, and use the access log (one line per request: peer, JSON-RPC method, tool) to see who did what.
+- **TLS.** The bearer token travels in every request. Serve HTTPS with `--tls-cert`/`--tls-key`, or terminate TLS at a proxy in front of arc-mcp. A proxy on the same host that forwards to `127.0.0.1` with the public `Host` header is refused by the DNS-rebinding protection; pass `--allow-any-host` for that setup, and only for it.
+- **Stateless.** Each request is answered on its own (JSON responses, no long-lived stream), so any number of replicas can sit behind a load balancer.
+- At most `--max-concurrent` requests (default 8) are served at once; the rest wait. Request bodies are limited to 2 MiB. On SIGTERM, requests in flight get up to 4 × `--timeout` + 5s to finish.
+- Requests must be `Content-Type: application/json` and accept `application/json, text/event-stream`, as the MCP specification says. Browser clients are not supported (no CORS).
+
+Clients connect with the URL and the header. For Claude Code:
+
+```bash
+claude mcp add --transport http arc http://host:8080/mcp --header "Authorization: Bearer $ARC_MCP_HTTP_TOKEN"
+```
+
+Clients configured with JSON (Cursor, Windsurf and others) take a `url` and `headers`:
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "url": "https://arc-mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer your-http-token" }
+    }
+  }
+}
+```
+
+**Upgrading from the `arc-mcp-gateway` image.** Earlier releases exposed HTTP through a separate image that wrapped arc-mcp with supergateway, serving the older HTTP+SSE transport at `/sse`. That image is no longer published. Run the `arc-mcp` image with `--transport http` instead, and point clients at `/mcp`. The Helm chart's `gateway.*` values are gone: set `http.tokenSecretRef.name` (or `http.insecureListen`); the chart refuses to render with the old values.
+
 ## Docker Compose (quick-start)
 
-The fastest way to evaluate arc-mcp is with Docker Compose — it brings up Arc and arc-mcp together, exposing MCP over HTTP/SSE for remote LLM clients:
+The fastest way to evaluate arc-mcp is with Docker Compose — it brings up Arc and arc-mcp together, serving MCP over Streamable HTTP for remote LLM clients:
 
 ```bash
 cp .env.example .env
-# edit .env — at minimum set ARC_TOKEN
+# edit .env — at minimum set ARC_TOKEN and ARC_MCP_HTTP_TOKEN
 docker compose --profile with-arc up
 ```
 
-- Arc API:             `http://localhost:8000`
-- MCP over SSE:        `http://localhost:8080/sse`
+- Arc API:      `http://localhost:8000`
+- MCP endpoint: `http://localhost:8080/mcp` (send `Authorization: Bearer $ARC_MCP_HTTP_TOKEN`)
+
+The port is published on the host's loopback address only. The inbound token is required even so: without it, a web page open in a browser on the same machine could reach the endpoint through DNS rebinding.
 
 If you already run Arc elsewhere, omit the `--profile with-arc` flag, set `ARC_URL` and `ARC_TOKEN` in `.env`, and run:
 
@@ -97,7 +159,7 @@ See [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example
 
 ## Connecting to LLM Clients
 
-arc-mcp uses the **stdio** transport (JSON-RPC over stdin/stdout), which is supported by all major MCP-compatible clients.
+The examples below use the **stdio** transport (JSON-RPC over stdin/stdout), which is supported by all major MCP-compatible clients. For a shared, remote arc-mcp, see [Remote access over HTTP](#remote-access-over-http).
 
 ### Claude Desktop
 
@@ -315,7 +377,7 @@ admin token, and arc-mcp asks for a read-only one.
 ```
 arc-mcp (MCP Server)  ──HTTP──>  Arc (time-series lakehouse)
      │                              │
-  stdio/JSON-RPC               REST API
+  stdio or Streamable HTTP     REST API
      │                              │
   LLM Client                   Parquet Storage
 (Claude, Cursor, etc.)

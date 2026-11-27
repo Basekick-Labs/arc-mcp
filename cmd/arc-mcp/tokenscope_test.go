@@ -18,7 +18,7 @@ func TestTokenScopeLog(t *testing.T) {
 		{"delete without write", []string{"read", "delete"}, "carries delete;"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			lines := tokenScopeLog(tc.permissions)
+			lines := tokenScopeLog(tc.permissions, false)
 			if want := "Arc token permissions: " + strings.Join(tc.permissions, ", "); lines[0] != want {
 				t.Fatalf("first line = %q, want %q", lines[0], want)
 			}
@@ -47,7 +47,7 @@ func TestTokenScopeLog(t *testing.T) {
 // report them, so the log must say so rather than print an empty list.
 func TestTokenScopeLog_NoDirectPermissions(t *testing.T) {
 	for _, perms := range [][]string{nil, {}} {
-		lines := tokenScopeLog(perms)
+		lines := tokenScopeLog(perms, false)
 		if len(lines) != 1 || !strings.Contains(lines[0], "RBAC roles") {
 			t.Fatalf("tokenScopeLog(%v) = %v", perms, lines)
 		}

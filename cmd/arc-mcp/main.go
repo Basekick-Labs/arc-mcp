@@ -1,5 +1,5 @@
 // Command arc-mcp is an MCP server that gives LLM clients read-only access to
-// Arc, the open-source time-series lakehouse, over stdio.
+// Arc, the open-source time-series lakehouse, over stdio or Streamable HTTP.
 package main
 
 import (
@@ -11,11 +11,14 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
+	"github.com/basekick-labs/arc-mcp/internal/httpserve"
 	"github.com/basekick-labs/arc-mcp/internal/tools"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -29,6 +32,8 @@ const (
 	defaultMaxRows         = 500
 	defaultTimeout         = 30 * time.Second
 	defaultMaxResponseSize = 50000
+	defaultListen          = "127.0.0.1:8080"
+	defaultMaxConcurrent   = 8
 	// minResponseSize leaves room for a few rows next to the notes and the
 	// footer; below it, every answer would be notes only.
 	minResponseSize = 4000
@@ -38,9 +43,16 @@ func main() {
 	arcURL := flag.String("arc-url", envOrDefault("ARC_URL", "http://localhost:8000"), "Arc instance URL")
 	arcToken := flag.String("arc-token", envOrDefault("ARC_TOKEN", ""), "Arc API token (prefer ARC_TOKEN env var or ARC_TOKEN_FILE to avoid ps aux exposure)")
 	maxRows := flag.Int("max-rows", envOrDefaultInt("ARC_MCP_MAX_ROWS", defaultMaxRows), "Maximum rows per query")
-	timeout := flag.Duration("timeout", defaultTimeout, "Query timeout")
-	maxResponseSize := flag.Int("max-response-size", defaultMaxResponseSize, "Maximum response size in characters")
-	insecure := flag.Bool("insecure", envOrDefault("ARC_MCP_INSECURE", "") != "", "Allow token auth over plaintext HTTP to non-loopback hosts (credentials will be sent in cleartext)")
+	timeout := flag.Duration("timeout", envDuration("ARC_MCP_TIMEOUT", defaultTimeout), "Query timeout")
+	maxResponseSize := flag.Int("max-response-size", envOrDefaultInt("ARC_MCP_MAX_RESPONSE_SIZE", defaultMaxResponseSize), "Maximum response size in characters")
+	insecure := flag.Bool("insecure", envBool("ARC_MCP_INSECURE"), "Allow token auth over plaintext HTTP to non-loopback hosts (credentials will be sent in cleartext)")
+	transport := flag.String("transport", envOrDefault("ARC_MCP_TRANSPORT", "stdio"), "How MCP clients connect: stdio (the default) or http (Streamable HTTP at /mcp)")
+	listen := flag.String("listen", envOrDefault("ARC_MCP_LISTEN", defaultListen), "HTTP transport: address to listen on")
+	insecureListen := flag.Bool("insecure-listen", envBool("ARC_MCP_INSECURE_LISTEN"), "HTTP transport: allow a non-loopback address with no inbound token (anyone who can reach it can query Arc)")
+	tlsCert := flag.String("tls-cert", envOrDefault("ARC_MCP_TLS_CERT_FILE", ""), "HTTP transport: TLS certificate file (with --tls-key) to serve HTTPS")
+	tlsKey := flag.String("tls-key", envOrDefault("ARC_MCP_TLS_KEY_FILE", ""), "HTTP transport: TLS key file (with --tls-cert)")
+	maxConcurrent := flag.Int("max-concurrent", envOrDefaultInt("ARC_MCP_MAX_CONCURRENT", defaultMaxConcurrent), "HTTP transport: requests served at once (0 for no limit)")
+	allowAnyHost := flag.Bool("allow-any-host", envBool("ARC_MCP_ALLOW_ANY_HOST"), "HTTP transport: accept any Host header on a loopback listener (for a TLS proxy on the same host); turns off DNS-rebinding protection")
 	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics)")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
@@ -48,6 +60,29 @@ func main() {
 	if *version {
 		fmt.Println(Version)
 		os.Exit(0)
+	}
+	if badEnv != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", badEnv)
+		os.Exit(2)
+	}
+	switch *transport {
+	case "stdio", "http":
+	default:
+		fmt.Fprintf(os.Stderr, "Refusing to start: unknown --transport/ARC_MCP_TRANSPORT %q; use stdio or http\n", *transport)
+		os.Exit(2)
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(os.Stderr, "Refusing to start: --tls-cert and --tls-key go together")
+		os.Exit(2)
+	}
+	var httpToken string
+	if *transport == "http" {
+		t, err := resolveHTTPToken()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+		httpToken = t
 	}
 
 	if *maxResponseSize < minResponseSize {
@@ -114,7 +149,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Arc token verification failed: %v", err)
 		} else {
-			for _, line := range tokenScopeLog(permissions) {
+			for _, line := range tokenScopeLog(permissions, *transport == "http") {
 				log.Print(line)
 			}
 		}
@@ -131,6 +166,42 @@ func main() {
 	// Register tools
 	tools.RegisterAll(server, client, groups, *maxRows, *maxResponseSize)
 
+	if *transport == "http" {
+		opts := httpserve.Options{
+			Listen:         *listen,
+			InsecureListen: *insecureListen,
+			TLSCertFile:    *tlsCert,
+			TLSKeyFile:     *tlsKey,
+			AllowAnyHost:   *allowAnyHost,
+			MaxConcurrent:  *maxConcurrent,
+			QueryTimeout:   *timeout,
+		}
+		if httpToken != "" {
+			opts.Verify = httpserve.StaticToken(httpToken)
+		}
+		ln, err := httpserve.Listen(opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Refusing to start: %v\n", err)
+			os.Exit(2)
+		}
+		scheme := "http"
+		if *tlsCert != "" {
+			scheme = "https"
+		}
+		auth := "no inbound token"
+		if httpToken != "" {
+			auth = "bearer token required"
+		}
+		log.Printf("arc-mcp serving %s://%s%s (%s; max-rows=%d, timeout=%s, max-concurrent=%d)", scheme, ln.Addr(), httpserve.Path, auth, *maxRows, *timeout, *maxConcurrent)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := httpserve.Serve(ctx, ln, httpserve.Handler(server, opts), opts); err != nil {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// Run on stdio
 	log.Printf("arc-mcp server starting (max-rows=%d, timeout=%s)", *maxRows, *timeout)
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
@@ -144,7 +215,7 @@ func main() {
 // naming every write-class permission (write, delete, admin), since arc-mcp's
 // tools only read. Advisory only: Arc enforces permissions, and a token's
 // RBAC roles (which /api/v1/auth/verify does not report) can grant more.
-func tokenScopeLog(permissions []string) []string {
+func tokenScopeLog(permissions []string, remote bool) []string {
 	if len(permissions) == 0 {
 		return []string{"Arc token has no direct permissions; its access comes from RBAC roles, which this check cannot see"}
 	}
@@ -158,6 +229,9 @@ func tokenScopeLog(permissions []string) []string {
 	}
 	if len(overScoped) > 0 {
 		lines = append(lines, fmt.Sprintf("WARNING: Arc token carries %s; arc-mcp only reads, so give it a token with only the read permission", strings.Join(overScoped, ", ")))
+		if remote {
+			lines = append(lines, "WARNING: over HTTP, every client of this endpoint acts with this token's permissions")
+		}
 	}
 	return lines
 }
@@ -213,6 +287,64 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// badEnv is the first boolean or duration environment variable whose value
+// could not be read; main refuses to start on it rather than guess.
+var badEnv error
+
+// envBool reads a boolean environment variable with strconv.ParseBool: unset
+// or empty is false, and a value that is not a boolean ("yes", a typo) is
+// refused at startup. "0" and "false" mean false.
+func envBool(key string) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		if badEnv == nil {
+			badEnv = fmt.Errorf("%s=%q is not a boolean (use true or false)", key, v)
+		}
+		return false
+	}
+	return b
+}
+
+// envDuration reads a duration environment variable ("30s", "2m"); unset is
+// fallback, a value that does not parse is refused at startup.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		if badEnv == nil {
+			badEnv = fmt.Errorf("%s=%q is not a duration (for example 30s or 2m)", key, v)
+		}
+		return fallback
+	}
+	return d
+}
+
+// resolveHTTPToken returns the inbound token for the HTTP transport:
+// ARC_MCP_HTTP_TOKEN_FILE, then ARC_MCP_HTTP_TOKEN, "" when neither is set.
+// There is no flag, so it never shows in ps. A file that is set but empty is
+// refused: it would otherwise run the endpoint without authentication.
+func resolveHTTPToken() (string, error) {
+	if path := os.Getenv("ARC_MCP_HTTP_TOKEN_FILE"); path != "" {
+		data, err := os.ReadFile(path) //nolint:gosec // path comes from ARC_MCP_HTTP_TOKEN_FILE, not user input
+		if err != nil {
+			return "", fmt.Errorf("reading ARC_MCP_HTTP_TOKEN_FILE %q: %w", path, err)
+		}
+		t := strings.TrimSpace(string(data))
+		if t == "" {
+			return "", fmt.Errorf("ARC_MCP_HTTP_TOKEN_FILE %q is empty", path)
+		}
+		return t, nil
+	}
+	return strings.TrimSpace(os.Getenv("ARC_MCP_HTTP_TOKEN")), nil
 }
 
 func envOrDefaultInt(key string, fallback int) int {

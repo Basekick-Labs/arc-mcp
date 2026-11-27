@@ -1,6 +1,6 @@
 # Default values for arc-mcp.
-# This chart deploys arc-mcp wrapped by supergateway, exposing the MCP server
-# over SSE so remote LLM agents can connect over the network.
+# This chart deploys arc-mcp serving MCP over Streamable HTTP at /mcp, so
+# remote LLM clients can connect over the network.
 
 replicaCount: 1
 
@@ -39,20 +39,29 @@ arc:
   tools:
     - data
 
-# Gateway that wraps arc-mcp's stdio as HTTP/SSE so remote LLM clients can
-# connect. Default uses ghcr.io/basekick-labs/arc-mcp-gateway, which bundles
-# arc-mcp with supergateway (https://github.com/supercorp-ai/supergateway).
-# Disable to run arc-mcp as stdio-only (useful for sidecar topologies).
-gateway:
-  enabled: true
-  image:
-    repository: ghcr.io/basekick-labs/arc-mcp-gateway
-    # tag defaults to the chart's appVersion (set by CI)
-    tag: ""
-    pullPolicy: IfNotPresent
+# The MCP endpoint (arc-mcp --transport http): Streamable HTTP at /mcp,
+# liveness at /healthz.
+http:
   port: 8080
-  # Extra args passed to supergateway.
-  extraArgs: []
+  # Required unless insecureListen: a pre-existing Secret holding the bearer
+  # token MCP clients must send. Mounted as a file (ARC_MCP_HTTP_TOKEN_FILE).
+  #   kubectl create secret generic arc-mcp-http --from-literal=token=$(openssl rand -hex 32)
+  tokenSecretRef:
+    name: ""
+    key: "token"
+  # Serve without an inbound token. Anyone who can reach the Service then
+  # queries Arc with arc-mcp's Arc token: only with network policies of your
+  # own restricting who can reach it.
+  insecureListen: false
+  # Requests served at once (ARC_MCP_MAX_CONCURRENT); 0 for no limit.
+  maxConcurrent: 8
+  # Serve HTTPS from a kubernetes.io/tls Secret (tls.crt, tls.key). Otherwise
+  # terminate TLS at your ingress: the bearer token travels in every request.
+  tlsSecretName: ""
+
+# Room for queries in flight to finish on shutdown: arc-mcp waits up to
+# 4 x arc.timeout + 5s (125s at the default 30s).
+terminationGracePeriodSeconds: 130
 
 service:
   type: ClusterIP
@@ -91,16 +100,19 @@ resources:
     cpu: 100m
     memory: 64Mi
 
+# /healthz answers without calling Arc, so a slow Arc does not restart pods.
 livenessProbe:
-  tcpSocket:
+  httpGet:
+    path: /healthz
     port: http
-  initialDelaySeconds: 10
+  initialDelaySeconds: 5
   periodSeconds: 20
 
 readinessProbe:
-  tcpSocket:
+  httpGet:
+    path: /healthz
     port: http
-  initialDelaySeconds: 5
+  initialDelaySeconds: 2
   periodSeconds: 10
 
 nodeSelector: {}
