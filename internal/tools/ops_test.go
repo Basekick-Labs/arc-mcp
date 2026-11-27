@@ -424,9 +424,9 @@ func TestMetrics_ArcErrors(t *testing.T) {
 	}{
 		{"404 is a wrong URL, not a missing database", opsRoute{status: 404, body: `{"error":"Cannot GET /api/v1/metrics/memory"}`},
 			"Arc answered HTTP 404 for the memory metrics", []string{"database", "measurement"}},
-		{"401", opsRoute{status: 401, body: `{"error":"Authentication required"}`},
+		{"401", opsRoute{status: 401, body: `{}`},
 			"Arc rejected the token", nil},
-		{"403", opsRoute{status: 403, body: `{"error":"token does not have 'read' permission"}`},
+		{"403", opsRoute{status: 403, body: `{}`},
 			"does not carry the permission the endpoint requires", nil},
 		{"403 shaped like a per-database refusal", opsRoute{status: 403, body: `{"error":"no permission for read on database 'x'"}`},
 			"does not carry the permission the endpoint requires", []string{"specific databases", "database"}},
