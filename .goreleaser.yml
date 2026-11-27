@@ -10,6 +10,10 @@
 #   - Multi-arch Docker images to ghcr.io/basekick-labs/arc-mcp
 #   - Cosign signatures (keyless via GH OIDC) for blobs and images
 #   - GitHub Release
+#   - Homebrew formula in Basekick-Labs/homebrew-tap (final releases only)
+#
+# Publish order is images → GitHub release → formula. CI's release-dry-run
+# job runs this file as a snapshot on every PR (nothing is published).
 
 version: 2
 
@@ -168,12 +172,52 @@ docker_signs:
     artifacts: manifests
     output: true
 
+# Homebrew formula: `brew install basekick-labs/tap/arc-mcp`, pushed to
+# Basekick-Labs/homebrew-tap as arcli's is. Needs the HOMEBREW_TAP_TOKEN
+# secret (fine-grained PAT, contents:write on the tap); release.yml refuses
+# to start without it. `brews` is deprecated in favour of casks, so
+# `goreleaser check` exits 2 ("valid, but uses deprecated properties"); CI
+# and `make check` accept that exit. Kept until GoReleaser v3, as in arcli:
+# a formula also serves Linuxbrew, and arcli in the same tap is a formula.
+brews:
+  - name: arc-mcp
+    ids: [default]
+    repository:
+      owner: Basekick-Labs
+      name: homebrew-tap
+      branch: main
+      # Evaluated only when the formula is pushed, the last publish step:
+      # snapshots and fork PRs render the formula without the secret.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "arc-mcp {{ .Tag }}"
+    homepage: https://github.com/Basekick-Labs/arc-mcp
+    description: MCP server for Arc, the time-series lakehouse
+    license: MIT
+    # No formula for a prerelease tag (v26.05.1-rc.1), the same semver rule
+    # as `prerelease: auto` below.
+    skip_upload: auto
+    install: |
+      bin.install "arc-mcp"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/arc-mcp --version")
+
 release:
   github:
     owner: basekick-labs
     name: arc-mcp
   draft: false
   prerelease: auto
+  # GoReleaser uploads the assets to a draft and publishes it only once all
+  # are up, so a failed upload leaves a draft, not a public release. The
+  # formula is pushed after that. Rerunning the tag after a failed formula
+  # push finds the published release and replaces its assets (a rebuild
+  # differs in bytes, so checksums.txt and its signature are replaced too)
+  # instead of stopping at the first one that already exists.
+  replace_existing_artifacts: true
   name_template: "arc-mcp v{{ .Version }}"
   header: |
     arc-mcp {{ .Version }} — MCP server for [Arc](https://github.com/basekick-labs/arc).
