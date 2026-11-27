@@ -5,11 +5,15 @@
 #   - Platform binaries (linux/darwin/windows × amd64/arm64, skip windows/arm64)
 #   - .tar.gz / .zip archives
 #   - checksums.txt (sha256)
-#   - CycloneDX SBOM via syft
+#   - SPDX SBOM per archive via syft
 #   - .deb and .rpm packages (amd64, arm64)
 #   - Multi-arch Docker images to ghcr.io/basekick-labs/arc-mcp
 #   - Cosign signatures (keyless via GH OIDC) for blobs and images
 #   - GitHub Release
+#   - Homebrew formula in Basekick-Labs/homebrew-tap (final releases only)
+#
+# Publish order is images → GitHub release → formula. CI's release-dry-run
+# job runs this file as a snapshot on every PR (nothing is published).
 
 version: 2
 
@@ -35,11 +39,17 @@ builds:
     ignore:
       - goos: windows
         goarch: arm64
+    # Reproducible: a rerun of the same tag rebuilds byte-identical binaries,
+    # archives and debs (no build time, no build path, commit-date mtimes),
+    # so the formula's sha256s stay valid. The archives record the building
+    # user's name, the rpms the build host's. main.go has no Commit or
+    # BuildTime variable, so no -X for them: they only stamped the time.
+    flags:
+      - -trimpath
+    mod_timestamp: '{{ .CommitTimestamp }}'
     ldflags:
       - -s -w
       - -X main.Version={{.Version}}
-      - -X main.Commit={{.ShortCommit}}
-      - -X main.BuildTime={{.Date}}
 
 archives:
   - id: default
@@ -51,9 +61,15 @@ archives:
     format_overrides:
       - goos: windows
         formats: ['zip']
+    builds_info:
+      mtime: '{{ .CommitDate }}'
     files:
-      - LICENSE
-      - README.md
+      - src: LICENSE
+        info:
+          mtime: '{{ .CommitDate }}'
+      - src: README.md
+        info:
+          mtime: '{{ .CommitDate }}'
 
 checksum:
   name_template: 'checksums.txt'
@@ -90,6 +106,7 @@ nfpms:
       - deb
       - rpm
     bindir: /usr/bin
+    mtime: '{{ .CommitDate }}'
     contents:
       - src: LICENSE
         dst: /usr/share/doc/arc-mcp/LICENSE
@@ -168,12 +185,57 @@ docker_signs:
     artifacts: manifests
     output: true
 
+# Homebrew formula: `brew install basekick-labs/tap/arc-mcp`, pushed to
+# Basekick-Labs/homebrew-tap as arcli's is. Needs the HOMEBREW_TAP_TOKEN
+# secret (fine-grained PAT, contents:write on the tap); release.yml refuses
+# to start without it. `brews` is deprecated in favour of casks, so
+# `goreleaser check` exits 2 ("valid, but uses deprecated properties"); CI
+# and `make check` accept that exit. Kept until GoReleaser v3, as in arcli,
+# whose formula is in the same tap. No cask: the macOS binary is not signed
+# or notarised, so a cask would need GoReleaser's post-install hook that
+# strips the quarantine attribute, i.e. bypasses Gatekeeper.
+brews:
+  - name: arc-mcp
+    ids: [default]
+    repository:
+      owner: Basekick-Labs
+      name: homebrew-tap
+      branch: main
+      # Evaluated only when the formula is pushed, the last publish step:
+      # snapshots and fork PRs render the formula without the secret.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "arc-mcp {{ .Tag }}"
+    homepage: https://github.com/Basekick-Labs/arc-mcp
+    description: MCP server for Arc, the time-series lakehouse
+    license: MIT
+    # No formula for a prerelease tag (v26.05.1-rc.1), the same semver rule
+    # as `prerelease: auto` below.
+    skip_upload: auto
+    install: |
+      bin.install "arc-mcp"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/arc-mcp --version")
+
 release:
   github:
     owner: basekick-labs
     name: arc-mcp
   draft: false
   prerelease: auto
+  # GoReleaser uploads the assets to a draft and publishes it only once all
+  # are up, so a failed upload leaves a draft, not a public release. The
+  # formula is pushed after that. Rerunning the tag after a failed formula
+  # push finds the published release and replaces its assets instead of
+  # stopping at the first one that already exists. The archives and debs
+  # come out byte-identical (builds above); the rpms (build host name) and
+  # the SBOMs (syft stamps a creation time and a random namespace) do not, so
+  # checksums.txt and its signature are new. A rerun also resets a
+  # hand-edited release title and prerelease flag; the notes are kept.
+  replace_existing_artifacts: true
   name_template: "arc-mcp v{{ .Version }}"
   header: |
     arc-mcp {{ .Version }} — MCP server for [Arc](https://github.com/basekick-labs/arc).
@@ -183,7 +245,7 @@ release:
     cosign verify-blob \
       --certificate checksums.txt.pem \
       --signature checksums.txt.sig \
-      --certificate-identity-regexp 'https://github\.com/basekick-labs/arc-mcp/' \
+      --certificate-identity-regexp '^https://github\.com/Basekick-Labs/arc-mcp/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
       --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
       checksums.txt
     ```
