@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/basekick-labs/arc-mcp/internal/arc"
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -55,6 +54,11 @@ const (
 	stateNotLicensed = "not_licensed"
 	stateNotServed   = "not_served"
 	stateNotFound    = "not_found"
+	// stateUnavailable is a capabilities area arc-mcp could not read; the
+	// other areas still answer, as each arc_health probe does.
+	stateUnavailable = "unavailable"
+	// stateUnknown is a licence status arc-mcp does not know.
+	stateUnknown = "unknown"
 )
 
 // Arc's filters for /api/v1/cluster/nodes (validRoles and validStates in
@@ -84,41 +88,33 @@ type EnterpriseArgs struct {
 
 // EnterpriseArea is one part of the capabilities view.
 type EnterpriseArea struct {
-	State     string `json:"state" jsonschema:"active, not_enabled, not_licensed or not_served (this Arc does not serve the route)."`
-	Reason    string `json:"reason,omitempty" jsonschema:"Why the area is not active, in Arc's words when Arc gives a reason."`
-	Data      any    `json:"data,omitempty" jsonschema:"Arc's answer for the area, numbers exact."`
-	Truncated bool   `json:"truncated,omitempty" jsonschema:"cq_scheduler: data.jobs lists fewer jobs than data.job_count."`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+	Data   any    `json:"data,omitempty"`
 }
 
 // EnterpriseResult is arc_enterprise's answer: state, reason, answered_by
-// and data for every view but capabilities, which answers per area.
+// and data for every view but capabilities, which answers per area. Only the
+// descriptions the field names do not already say are in the schema: it is
+// part of every tools/list.
 type EnterpriseResult struct {
 	View               string          `json:"view"`
-	State              string          `json:"state,omitempty" jsonschema:"Every view but capabilities: active, not_enabled, not_licensed, not_served (this Arc does not serve the route) or not_found (view node)."`
-	Reason             string          `json:"reason,omitempty" jsonschema:"Why the view is not active, in Arc's words when Arc gives a reason."`
-	AnsweredBy         string          `json:"answered_by,omitempty" jsonschema:"The id of the node that answered, from Arc's own answer (views cluster and local_node); absent when Arc's answer does not name it."`
-	Data               any             `json:"data,omitempty" jsonschema:"Arc's answer, numbers exact; nodes sorted by id."`
-	Returned           *int            `json:"returned,omitempty" jsonschema:"Views cluster and nodes: the nodes listed in data."`
-	Total              *int            `json:"total,omitempty" jsonschema:"Views cluster and nodes: the nodes Arc returned."`
-	Truncated          bool            `json:"truncated,omitempty" jsonschema:"True when data lists fewer nodes than Arc returned, to fit the answer's size limit."`
-	License            *EnterpriseArea `json:"license,omitempty" jsonschema:"capabilities: the licence, from /health."`
-	Clustering         *EnterpriseArea `json:"clustering,omitempty" jsonschema:"capabilities: clustering; data names the node that answered and, in cluster mode, carries the licence's features."`
-	CQScheduler        *EnterpriseArea `json:"cq_scheduler,omitempty" jsonschema:"capabilities: the continuous query scheduler, with up to 20 jobs sorted by cq_id."`
-	RetentionScheduler *EnterpriseArea `json:"retention_scheduler,omitempty" jsonschema:"capabilities: the retention scheduler; in a cluster only the primary writer runs it (can_run)."`
+	State              string          `json:"state,omitempty" jsonschema:"active, not_enabled, not_licensed, not_served (this Arc lacks the route) or not_found (node). capabilities has one per area instead, which can also be unavailable (not read: see reason) or, for the licence, unknown."`
+	Reason             string          `json:"reason,omitempty"`
+	AnsweredBy         string          `json:"answered_by,omitempty" jsonschema:"The answering node's id, when Arc's answer names it (cluster, local_node)."`
+	Data               any             `json:"data,omitempty" jsonschema:"Arc's answer, numbers exact."`
+	Returned           *int            `json:"returned,omitempty" jsonschema:"nodes: the nodes in data, of total."`
+	Total              *int            `json:"total,omitempty"`
+	Truncated          bool            `json:"truncated,omitempty" jsonschema:"Cut to fit the size limit: fewer nodes (nodes), parts left out (cluster, see omitted) or fewer CQ jobs (capabilities)."`
+	Omitted            []string        `json:"omitted,omitempty" jsonschema:"cluster: status parts left out to fit, largest first."`
+	License            *EnterpriseArea `json:"license,omitempty"`
+	Clustering         *EnterpriseArea `json:"clustering,omitempty"`
+	CQScheduler        *EnterpriseArea `json:"cq_scheduler,omitempty"`
+	RetentionScheduler *EnterpriseArea `json:"retention_scheduler,omitempty"`
 	Note               string          `json:"note,omitempty"`
 }
 
-// enterpriseOutputSchema is EnterpriseResult's schema with the four areas'
-// shared shape stated once, under $defs, rather than inlined four times:
-// the schema is part of every tools/list.
-var enterpriseOutputSchema = func() *jsonschema.Schema {
-	s := mustSchema[EnterpriseResult]()
-	s.Defs = map[string]*jsonschema.Schema{"area": mustSchema[EnterpriseArea]()}
-	for _, name := range []string{"license", "clustering", "cq_scheduler", "retention_scheduler"} {
-		s.Properties[name] = &jsonschema.Schema{Ref: "#/$defs/area", Description: s.Properties[name].Description}
-	}
-	return s
-}()
+var enterpriseOutputSchema = mustSchema[EnterpriseResult]()
 
 // enterpriseInputSchema is arc_enterprise's input schema, written out for
 // its enums and bounds (#37). "" stands for "not given" in node_id, role and
@@ -186,9 +182,10 @@ func RegisterEnterprise(server *mcp.Server, client *arc.Client, maxResponseChars
 		Annotations:  readOnly("Read Arc Enterprise status"),
 		Description: "Read the state of Arc's Enterprise features (about Arc itself, not data stored in it). view: " +
 			"capabilities (start here: the licence, clustering with the licence's features in cluster mode, and the CQ and retention schedulers), " +
-			"cluster (the full cluster status), nodes (every node; role and state filter it), node (one node, by node_id), " +
+			"cluster (the cluster status), nodes (every node; role and state filter it), node (one node, by node_id), " +
 			"local_node (the node that answered) or cluster_health. " +
-			"Each answer or area has a state: active, not_enabled, not_licensed or not_served (this Arc predates the route); these are results to report, not failures. " +
+			"Each answer, and each capabilities area, has a state: active, not_enabled, not_licensed or not_served (this Arc predates the route); these are results to report, not failures. " +
+			"A capabilities area arc-mcp could not read is unavailable, with the reason. " +
 			"Answers come from the Arc node at the configured URL, and answered_by names it when Arc's answer does (cluster and local_node); behind a load balancer, calls may reach different nodes. " +
 			"Node entries carry each node's addresses as Arc reports them.",
 		InputSchema: enterpriseInputSchema(),
@@ -290,7 +287,7 @@ func clusterView(ctx context.Context, client *arc.Client, args EnterpriseArgs, m
 			return res, "", errNotArc.Error()
 		}
 		res.AnsweredBy, _ = obj["local_node_id"].(string)
-		return fitNodes(res, obj, maxChars)
+		return fitStatus(res, obj, maxChars)
 	case "nodes":
 		return fitNodes(res, obj, maxChars)
 	case "node":
@@ -317,15 +314,13 @@ func clusterView(ctx context.Context, client *arc.Client, args EnterpriseArgs, m
 }
 
 // fitNodes answers with obj, its nodes list sorted by id and cut, whole
-// nodes from the end, to fit maxChars. Arc builds the list from a map, so
-// its order changes from call to call.
+// nodes from the end, to fit maxChars.
 func fitNodes(res EnterpriseResult, obj map[string]any, maxChars int) (EnterpriseResult, string, string) {
 	nodes, ok := obj["nodes"].([]any)
 	if !ok {
 		return res, "", errNotArc.Error()
 	}
-	nodes = slices.Clone(nodes)
-	slices.SortStableFunc(nodes, func(a, b any) int { return strings.Compare(stringField(a, "id"), stringField(b, "id")) })
+	nodes = sortedNodes(nodes)
 	total := len(nodes)
 	return fit(res, total, func(r *EnterpriseResult, k int) {
 		data := cloneMap(obj)
@@ -334,10 +329,72 @@ func fitNodes(res EnterpriseResult, obj map[string]any, maxChars int) (Enterpris
 	}, maxChars)
 }
 
+// sortedNodes is nodes sorted by id: Arc builds its node lists from a map,
+// so their order changes from call to call.
+func sortedNodes(nodes []any) []any {
+	nodes = slices.Clone(nodes)
+	slices.SortStableFunc(nodes, func(a, b any) int { return strings.Compare(stringField(a, "id"), stringField(b, "id")) })
+	return nodes
+}
+
+// statusCore is what the cluster view always keeps of Arc's status: the
+// answering node and the cluster's size, health and primary writer.
+var statusCore = map[string]bool{
+	"enabled": true, "mode": true, "running": true, "cluster_name": true, "local_node_id": true, "local_role": true,
+	"node_count": true, "healthy_count": true, "writers": true, "readers": true, "compactors": true,
+	"primary_writer_id": true, "read_ready": true, "read_not_ready_reason": true,
+}
+
+// fitStatus answers with Arc's cluster status, its nodes sorted by id. One
+// that does not fit maxChars loses its largest parts outside statusCore, one
+// by one, each named in omitted. The node list (which view nodes also gives),
+// Raft and replication detail are the parts that grow with the cluster, so a
+// cluster of any size answers at the smallest limit.
+func fitStatus(res EnterpriseResult, obj map[string]any, maxChars int) (EnterpriseResult, string, string) {
+	data := cloneMap(obj)
+	if nodes, ok := data["nodes"].([]any); ok {
+		data["nodes"] = sortedNodes(nodes)
+	}
+	type part struct {
+		key  string
+		size int
+	}
+	var parts []part
+	for k, v := range data {
+		if statusCore[k] {
+			continue
+		}
+		text, err := compactJSON(v)
+		if err != nil {
+			log.Printf("arc_enterprise cluster: rendering the answer: %v", err)
+			return res, "", errNotArc.Error()
+		}
+		parts = append(parts, part{k, len(text)})
+	}
+	slices.SortFunc(parts, func(a, b part) int {
+		if a.size != b.size {
+			return b.size - a.size
+		}
+		return strings.Compare(a.key, b.key)
+	})
+	// fit keeps the most it can: here, the most of the smallest parts.
+	return fit(res, len(parts), func(r *EnterpriseResult, kept int) {
+		d := cloneMap(data)
+		var omitted []string
+		for _, p := range parts[:len(parts)-kept] {
+			delete(d, p.key)
+			omitted = append(omitted, p.key)
+		}
+		r.Data, r.Omitted, r.Truncated = d, omitted, len(omitted) > 0
+	}, maxChars)
+}
+
 // capabilities reads the licence (/health), clustering (/api/v1/cluster)
 // and the schedulers (/api/v1/schedulers): three requests, which behind a
 // load balancer may reach three nodes, so only the clustering part, whose
-// answer names its node, says which.
+// answer names its node, says which. Only a failed /health fails the call:
+// a later read that fails leaves its area unavailable and the others
+// answered, as arc_health reports each probe.
 func capabilities(ctx context.Context, client *arc.Client, maxChars int) (EnterpriseResult, string, string) {
 	res := EnterpriseResult{View: "capabilities"}
 	v, err := client.GetJSON(ctx, routeHealth, nil)
@@ -351,32 +408,23 @@ func capabilities(ctx context.Context, client *arc.Client, maxChars int) (Enterp
 	res.License = licenseArea(health["license"])
 
 	cl, notServed, failed := readObject(ctx, client, routeCluster, nil)
-	if failed != "" {
-		return res, "", failed
-	}
-	if res.Clustering = clusteringArea(cl, notServed); res.Clustering == nil {
-		return res, "", errNotArc.Error()
-	}
+	res.Clustering = clusteringArea(cl, notServed, failed)
 
 	sch, notServed, failed := readObject(ctx, client, routeSchedulers, nil)
-	if failed != "" {
-		return res, "", failed
-	}
 	var jobs []any
-	if notServed {
+	switch {
+	case failed != "":
+		res.CQScheduler = &EnterpriseArea{State: stateUnavailable, Reason: failed}
+		res.RetentionScheduler = &EnterpriseArea{State: stateUnavailable, Reason: failed}
+	case notServed:
 		res.CQScheduler = &EnterpriseArea{State: stateNotServed, Reason: notServedText(routeSchedulers)}
 		res.RetentionScheduler = &EnterpriseArea{State: stateNotServed, Reason: notServedText(routeSchedulers)}
-	} else {
+	default:
 		res.CQScheduler, jobs = schedulerArea(sch["cq_scheduler"])
 		res.RetentionScheduler, _ = schedulerArea(sch["retention_scheduler"])
-		if res.CQScheduler == nil || res.RetentionScheduler == nil {
-			return res, "", errNotArc.Error()
-		}
 	}
-	// An Arc before 26.09.1 reports no licence in /health even with one in
-	// force; the other areas still show it.
-	if _, reported := health["license"]; !reported && (licensed(res.Clustering) || licensed(res.CQScheduler) || licensed(res.RetentionScheduler)) {
-		res.License = &EnterpriseArea{State: stateActive, Reason: "This Arc's /health does not report its licence (Arc does since 26.09.1), but the areas below show one in force."}
+	if _, reported := health["license"]; !reported {
+		res.License = unreportedLicence(res)
 	}
 	if res.License.State == stateActive && res.Clustering.State != stateActive {
 		res.Note = "Arc lists the licence's features only in cluster mode."
@@ -390,14 +438,16 @@ func capabilities(ctx context.Context, client *arc.Client, maxChars int) (Enterp
 		data := cloneMap(cqData)
 		data["jobs"] = jobs[:k]
 		area := cq
-		area.Data, area.Truncated = data, k < len(jobs)
-		r.CQScheduler = &area
+		area.Data = data
+		r.CQScheduler, r.Truncated = &area, k < len(jobs)
 	}, maxChars)
 }
 
 // licenseArea reads /health's licence. Arc reports one there whenever a
-// licence is configured, with tier oss and status unlicensed when it failed;
-// status is active, grace_period, writes_stopped or expired.
+// licence is configured, and the statuses are a closed set: main's phases
+// (active, grace_period, writes_stopped, expired), unlicensed for a licence
+// configured but not in force, and read_only, which the licence server sent
+// up to v26.09.4. Any other is unknown, never active.
 func licenseArea(v any) *EnterpriseArea {
 	lic, ok := v.(map[string]any)
 	if !ok {
@@ -405,12 +455,53 @@ func licenseArea(v any) *EnterpriseArea {
 	}
 	area := &EnterpriseArea{State: stateActive, Data: lic}
 	switch status, _ := lic["status"].(string); status {
-	case "unlicensed":
-		area.State, area.Reason = stateNotLicensed, "A licence is configured, but Arc runs without it; Arc's log says why."
+	case "active":
+	case "grace_period":
+		area.Reason = "The licence has expired and is in its grace period: its features stay on until the grace period ends (writes_stop_at and cutoff, where Arc reports them, say when)."
+	case "writes_stopped":
+		area.Reason = "The licence is in the last days of its grace period: Arc refuses ingestion until it is renewed, and its other features stay on until cutoff."
+	case "read_only":
+		area.State, area.Reason = stateNotLicensed, "Arc reports the licence as read_only: it is no longer valid, so its features are off."
 	case "expired":
 		area.State, area.Reason = stateNotLicensed, "The licence has expired."
+	case "unlicensed":
+		area.State, area.Reason = stateNotLicensed, "A licence is configured, but Arc runs without it; Arc's log says why."
+	default:
+		if r := []rune(status); len(r) > 64 {
+			status = string(r[:64]) + "…"
+		}
+		area.State, area.Reason = stateUnknown, "Arc reports licence status "+strconv.Quote(status)+", which arc-mcp does not know; data is Arc's answer."
 	}
 	return area
+}
+
+// unreportedLicence is the licence of an Arc whose /health does not report
+// one: none configured, or an Arc before 26.09.1. In cluster mode the
+// status carries the licence's validity (Arc has sent it since 26.02.1), so
+// a licence that lapsed after startup is not read as active; otherwise an
+// area that is licensed shows one in force.
+func unreportedLicence(res EnterpriseResult) *EnterpriseArea {
+	const lead = "This Arc's /health does not report its licence (Arc does since 26.09.1); "
+	if cl, ok := res.Clustering.Data.(map[string]any); ok && res.Clustering.State == stateActive {
+		if lic, ok := cl["license"].(map[string]any); ok {
+			if valid, ok := lic["valid"].(bool); ok {
+				data := map[string]any{"valid": valid, "tier": lic["tier"]}
+				if !valid {
+					return &EnterpriseArea{State: stateNotLicensed, Reason: lead + "the cluster status reports it as not valid.", Data: data}
+				}
+				return &EnterpriseArea{State: stateActive, Reason: lead + "this is the cluster status's.", Data: data}
+			}
+		}
+	}
+	for _, a := range []struct {
+		name string
+		area *EnterpriseArea
+	}{{"clustering", res.Clustering}, {"cq_scheduler", res.CQScheduler}, {"retention_scheduler", res.RetentionScheduler}} {
+		if licensed(a.area) {
+			return &EnterpriseArea{State: stateActive, Reason: lead + a.name + " shows one in force."}
+		}
+	}
+	return res.License
 }
 
 // licensed reports whether an area shows a valid licence: Arc runs it, has
@@ -424,17 +515,20 @@ func licensed(a *EnterpriseArea) bool {
 // the answering node, the cluster's size and the licence with its features.
 var clusterKeys = []string{"local_node_id", "local_role", "cluster_name", "node_count", "healthy_count", "primary_writer_id", "license"}
 
-// clusteringArea is capabilities' clustering part; nil when obj is not
-// Arc's cluster status.
-func clusteringArea(obj map[string]any, notServed bool) *EnterpriseArea {
-	if notServed {
+// clusteringArea is capabilities' clustering part: unavailable when the
+// read failed (failed) or obj is not Arc's cluster status.
+func clusteringArea(obj map[string]any, notServed bool, failed string) *EnterpriseArea {
+	switch {
+	case failed != "":
+		return &EnterpriseArea{State: stateUnavailable, Reason: failed}
+	case notServed:
 		return &EnterpriseArea{State: stateNotServed, Reason: notServedText(routeCluster)}
 	}
 	if state, reason, ok := disabledState(obj); ok {
 		return &EnterpriseArea{State: state, Reason: reason}
 	}
 	if enabled, _ := obj["enabled"].(bool); !enabled {
-		return nil
+		return &EnterpriseArea{State: stateUnavailable, Reason: errNotArc.Error()}
 	}
 	data := map[string]any{}
 	for _, k := range clusterKeys {
@@ -446,12 +540,12 @@ func clusteringArea(obj map[string]any, notServed bool) *EnterpriseArea {
 }
 
 // schedulerArea reads one scheduler of /api/v1/schedulers, and returns its
-// CQ jobs sorted by cq_id (Arc builds the list from a map); nil when v is not
-// Arc's answer.
+// CQ jobs sorted by cq_id (Arc builds the list from a map); unavailable when
+// v is not Arc's answer.
 func schedulerArea(v any) (*EnterpriseArea, []any) {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return nil, nil
+		return &EnterpriseArea{State: stateUnavailable, Reason: errNotArc.Error()}, nil
 	}
 	if state, reason, ok := disabledState(m); ok {
 		return &EnterpriseArea{State: state, Reason: reason}, nil

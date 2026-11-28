@@ -422,7 +422,7 @@ it reads accepts any valid Arc token, so the read-only token above is enough.
 | `view` | Arc route | What it holds |
 |---|---|---|
 | `capabilities` | `/health`, `/api/v1/cluster`, `/api/v1/schedulers` | The licence (tier, status, expiry), clustering (the answering node, the cluster's size and, in cluster mode, the licence's features), and the CQ and retention schedulers (up to 20 CQ jobs, by id). Start here |
-| `cluster` | `/api/v1/cluster` | The full cluster status: Raft, writer failover, the compactor lease, replication, every node |
+| `cluster` | `/api/v1/cluster` | The cluster status: Raft, writer failover, the compactor lease, replication, every node |
 | `nodes` | `/api/v1/cluster/nodes` | Every node, sorted by id; `role` and `state` filter it |
 | `node` | `/api/v1/cluster/nodes` | One node, by `node_id` |
 | `local_node` | `/api/v1/cluster/local` | The node that answered, with its capabilities |
@@ -437,14 +437,20 @@ Each answer (each area, for `capabilities`) has a `state`:
 | `not_enabled` | Licensed but off in Arc's configuration, or a scheduler that is not running |
 | `not_served` | This Arc does not serve the route (Arc serves these since 26.02.1) |
 | `not_found` | `node` only: no node with that id |
+| `unavailable` | `capabilities` only: arc-mcp could not read that area (Arc's error, a timeout); `reason` says which, and the other areas still answer |
+| `unknown` | The licence only: a status arc-mcp does not know; `data` is Arc's answer |
 
 These are results, not errors: on Arc OSS every area answers `not_licensed`.
-An Arc before 26.09.1 does not report its licence in `/health`; `capabilities`
-then reads the licence as `active` when clustering or a scheduler shows one.
 Arc lists the licence's features only in cluster mode; a standalone Arc reports
 its licence's tier, status and expiry. A licence that lapses after startup shows
-in the answers (`status`, `valid` or `license_valid` false) rather than as a
-refusal.
+in the answers rather than as a refusal: its status, the cluster status's
+`valid`, a scheduler's `license_valid`. The licence statuses Arc reports are
+read one by one: `active`; `grace_period` and `writes_stopped` (Arc refuses
+ingestion) stay `active` with a `reason`; `expired`, `read_only` (which Arc up to
+26.09.4 passes on from the licence server) and `unlicensed` (configured but not in force) are `not_licensed`;
+any other is `unknown`. An Arc before 26.09.1 does not report its licence in
+`/health`; `capabilities` then takes it from the cluster status in cluster mode,
+or reads it as `active` when a scheduler or clustering shows one, and says so.
 
 **Single node and cluster.** Each answer comes from the Arc node at the
 configured URL. `answered_by` names that node when Arc's own answer does (the
@@ -455,12 +461,13 @@ that node's address. Retention runs only on the primary writer:
 `retention_scheduler` says whether the answering node runs it (`can_run`).
 Node entries carry each node's addresses as Arc reports them.
 
-Answers fit `--max-response-size` by dropping whole nodes (or CQ jobs) from the
-end of the list, and say so (`returned`, `total`, `truncated`). A 4-node
-cluster's full status is about 5,400 characters, of which 3,900 are not the node
-list. So at the 4,000 minimum the `cluster` view of such a cluster keeps none of
-its nodes, and on a larger cluster it may not fit at all (the answer says to
-raise the limit); `capabilities` and `nodes` still answer.
+Answers fit `--max-response-size` and say when they were cut (`truncated`).
+`nodes` drops whole nodes from the end (`returned`, `total`), `capabilities`
+CQ jobs. `cluster` leaves out its largest parts one by one and names them in
+`omitted`, keeping the answering node, the cluster's size and health and the
+primary writer: a 4-node cluster's status is about 5,200 characters, so at the
+4,000 minimum its node list (which `nodes` gives) goes first, and a larger
+cluster loses its Raft and replication detail too.
 
 **Example prompts:**
 - "Which Enterprise features does this Arc have?" → `capabilities`

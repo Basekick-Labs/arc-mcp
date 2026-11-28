@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -161,7 +162,7 @@ func TestEnterprise_ClusterViews(t *testing.T) {
 				t.Errorf("features %s", f)
 			}
 			jobs, _ := json.Marshal(r.CQScheduler.Data.(map[string]any)["jobs"])
-			if !strings.Contains(string(jobs), `"cq_id":1,`) || strings.Index(string(jobs), `"cq_id":1,`) > strings.Index(string(jobs), `"cq_id":3,`) || r.CQScheduler.Truncated {
+			if !strings.Contains(string(jobs), `"cq_id":1,`) || strings.Index(string(jobs), `"cq_id":1,`) > strings.Index(string(jobs), `"cq_id":3,`) || r.Truncated {
 				t.Errorf("jobs %s: sorted by cq_id, all kept", jobs)
 			}
 			if r.RetentionScheduler.State != stateActive || r.RetentionScheduler.Data.(map[string]any)["can_run"] != false {
@@ -169,8 +170,8 @@ func TestEnterprise_ClusterViews(t *testing.T) {
 			}
 		}},
 		{map[string]any{"view": "cluster"}, "/api/v1/cluster", "w2", func(t *testing.T, r EnterpriseResult, text string) {
-			if got := nodeIDs(t, r.Data); strings.Join(got, ",") != "r1,w1,w2" || *r.Returned != 3 || *r.Total != 3 || r.Truncated {
-				t.Errorf("nodes %v returned %v total %v", got, *r.Returned, *r.Total)
+			if got := nodeIDs(t, r.Data); strings.Join(got, ",") != "r1,w1,w2" || r.Returned != nil || r.Omitted != nil || r.Truncated {
+				t.Errorf("nodes %v, returned %v, omitted %v: the whole status at the default size", got, r.Returned, r.Omitted)
 			}
 			if !strings.Contains(text, "9007199254740993") || !strings.Contains(text, `"leader_addr":"10.9.0.2:9200"`) {
 				t.Errorf("Arc's status, numbers exact and addresses as Arc sent them:\n%s", text)
@@ -213,6 +214,39 @@ func TestEnterprise_ClusterViews(t *testing.T) {
 		}
 		fake.assertOnlyGets(t)
 		assertNoLeak(t, text, addr)
+	}
+}
+
+// arc_enterprise reads exactly these routes, each one Arc lets any valid
+// token read: /health is public, and Arc registers the cluster and scheduler
+// GETs with no permission middleware (internal/api/cluster.go RegisterRoutes,
+// scheduler.go RegisterRoutes). The 403 text says so; a route added here must
+// be checked against Arc first, or that text becomes false.
+func TestEnterprise_ReadsOnlyAnyTokenRoutes(t *testing.T) {
+	fake := clusterArc()
+	cs, _ := entSession(t, fake, opsOpts{})
+	for _, view := range enterpriseViews {
+		args := map[string]any{"view": view}
+		if view == "node" {
+			args["node_id"] = "w1"
+		}
+		callEnt(t, cs, args)
+	}
+	seen := map[string]bool{}
+	for _, uri := range fake.requests() {
+		seen[strings.SplitN(uri, "?", 2)[0]] = true
+	}
+	var got []string
+	for path := range seen {
+		got = append(got, path)
+	}
+	sort.Strings(got)
+	if want := "/api/v1/cluster /api/v1/cluster/health /api/v1/cluster/local /api/v1/cluster/nodes /api/v1/schedulers /health"; strings.Join(got, " ") != want {
+		t.Errorf("routes read: %v, want %s", got, want)
+	}
+	fake.routes["/api/v1/cluster/local"] = opsRoute{status: 403, body: `{}`}
+	if _, text, _ := callEnt(t, cs, map[string]any{"view": "local_node"}); !strings.Contains(text, "Arc lets any valid token read it") {
+		t.Errorf("403 text: %s", text)
 	}
 }
 
@@ -287,6 +321,7 @@ func TestEnterprise_LicenceNotInHealth(t *testing.T) {
 		want               string
 	}{
 		{"cluster mode", entStatus("w2", "w2"), entSchedulersOSS, stateActive},
+		{"cluster mode, the licence lapsed after startup", strings.Replace(entStatus("w2", "w2"), `"valid":true`, `"valid":false`, 1), entSchedulers(1), stateNotLicensed},
 		{"standalone, clustering off in the configuration", entClusterOff, entSchedulersOSS, stateActive},
 		{"a licence without the features", strings.Replace(entClusterOff, "Clustering not enabled in configuration (cluster.enabled=false)", "License does not include clustering feature", 1),
 			strings.ReplaceAll(entSchedulersOSS, "Enterprise license required", "License tier does not include CQ scheduler feature"), stateActive},
@@ -295,29 +330,45 @@ func TestEnterprise_LicenceNotInHealth(t *testing.T) {
 	} {
 		cs, _ := entSession(t, standaloneArc(entHealthOSS, tt.cluster, tt.scheduler), opsOpts{})
 		r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"})
-		if r.License.State != tt.want || r.License.Data != nil || (tt.want == stateActive && !strings.Contains(r.License.Reason, "26.09.1")) {
+		inCluster := strings.HasPrefix(tt.name, "cluster mode")
+		if r.License.State != tt.want || (r.License.Data != nil) != inCluster || (tt.name != "no licence" && !strings.Contains(r.License.Reason, "26.09.1")) {
 			t.Errorf("%s: %s", tt.name, text)
 		}
+		if inCluster && fmt.Sprint(r.License.Data.(map[string]any)["tier"]) != "enterprise" {
+			t.Errorf("%s: the cluster status's licence: %s", tt.name, text)
+		}
+	}
+	// The reason names the area the licence was read from.
+	cs, _ := entSession(t, standaloneArc(entHealthOSS, entClusterOSS, entSchedulers(1)), opsOpts{})
+	if r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"}); !strings.Contains(r.License.Reason, "cq_scheduler shows one") {
+		t.Errorf("area not named: %s", text)
 	}
 }
 
 // No route here answers 403 for a licence (Arc checks none at request time
 // on them), so a licence that lapsed after boot shows only in the bodies.
 func TestEnterprise_LicenceStatesInTheBody(t *testing.T) {
-	for _, tt := range []struct{ health, want string }{
-		{`{"license":{"tier":"oss","status":"unlicensed","source":"none"},"status":"ok"}`, stateNotLicensed},
-		{`{"license":{"tier":"enterprise","status":"expired","source":"cache"},"status":"ok"}`, stateNotLicensed},
-		{`{"license":{"tier":"enterprise","status":"grace_period","grace_day":2},"status":"ok"}`, stateActive},
-		{`{"license":{"tier":"enterprise","status":"writes_stopped"},"status":"ok"}`, stateActive},
+	// Every status Arc sends, main's and v26.09.4's; any other is unknown.
+	for _, tt := range []struct{ status, want, reason string }{
+		{"active", stateActive, ""},
+		{"grace_period", stateActive, "grace period"},
+		{"writes_stopped", stateActive, "refuses ingestion"},
+		{"read_only", stateNotLicensed, "read_only"},
+		{"expired", stateNotLicensed, "has expired"},
+		{"unlicensed", stateNotLicensed, "runs without it"},
+		{"suspended", stateUnknown, `status "suspended"`},
+		{"", stateUnknown, `status ""`},
+		{strings.Repeat("z", 80), stateUnknown, strings.Repeat("z", 64) + "…\""},
 	} {
+		health := `{"license":{"tier":"enterprise","status":"` + tt.status + `","source":"server"},"status":"ok"}`
 		fake := clusterArc()
-		fake.routes["/health"] = opsRoute{status: 200, body: tt.health}
+		fake.routes["/health"] = opsRoute{status: 200, body: health}
 		fake.routes["/api/v1/cluster"] = opsRoute{status: 200, body: strings.Replace(entStatus("w2", "w2"), `"valid":true`, `"valid":false`, 1)}
 		fake.routes["/api/v1/schedulers"] = opsRoute{status: 200, body: `{"cq_scheduler":{"job_count":0,"jobs":[],"license_valid":false,"running":true},"retention_scheduler":{"license_valid":true,"running":false}}`}
 		cs, _ := entSession(t, fake, opsOpts{})
 		r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"})
-		if r.License.State != tt.want || r.License.Data == nil {
-			t.Errorf("%s: licence %+v", tt.health, r.License)
+		if r.License.State != tt.want || r.License.Data == nil || (tt.reason == "") != (r.License.Reason == "") || !strings.Contains(r.License.Reason, tt.reason) {
+			t.Errorf("%q: licence %+v", tt.status, r.License)
 		}
 		if r.Clustering.State != stateActive || !strings.Contains(text, `"valid":false`) {
 			t.Errorf("clustering keeps running and shows Arc's valid:false: %s", text)
@@ -385,12 +436,23 @@ func TestEnterprise_ArcErrors(t *testing.T) {
 		{"not JSON", opsRoute{status: 200, body: proxyPage}, "unexpected response format"},
 		{"not Arc's shape", opsRoute{status: 200, body: `{"cq_scheduler":"on"}`}, "unexpected response format"},
 	} {
+		// A single-route view fails as a whole.
 		fake := clusterArc()
-		fake.routes["/api/v1/schedulers"] = tt.route
+		fake.routes["/api/v1/cluster/health"] = tt.route
 		cs, _ := entSession(t, fake, opsOpts{})
-		_, text, res := callEnt(t, cs, map[string]any{"view": "capabilities"})
-		if !res.IsError || !strings.Contains(text, tt.want) {
-			t.Errorf("%s: %q, want an error containing %q", tt.name, text, tt.want)
+		_, text, res := callEnt(t, cs, map[string]any{"view": "cluster_health"})
+		// (Arc's health answer has no shape to check beyond an object.)
+		if want := strings.ReplaceAll(tt.want, "/api/v1/schedulers", "/api/v1/cluster/health"); tt.name != "not Arc's shape" && (!res.IsError || !strings.Contains(text, want)) {
+			t.Errorf("%s: %q, want an error containing %q", tt.name, text, want)
+		}
+		// capabilities answers the other areas, and the failed one says why.
+		fake = clusterArc()
+		fake.routes["/api/v1/schedulers"] = tt.route
+		cs, _ = entSession(t, fake, opsOpts{})
+		r, text, res := callEnt(t, cs, map[string]any{"view": "capabilities"})
+		if res.IsError || r.License.State != stateActive || r.Clustering.State != stateActive ||
+			r.CQScheduler.State != stateUnavailable || !strings.Contains(r.CQScheduler.Reason, tt.want) || r.RetentionScheduler.State != stateUnavailable {
+			t.Errorf("%s: capabilities %s, want the schedulers unavailable (%q) and the rest answered", tt.name, text, tt.want)
 		}
 		for _, leak := range []string{"10.0.0.7", "/var/lib", "database", "read permission", "boom"} {
 			// Arc's fail-closed text keeps its shared wording ("not a problem
@@ -399,6 +461,20 @@ func TestEnterprise_ArcErrors(t *testing.T) {
 				t.Errorf("%s: answer carries %q: %s", tt.name, leak, text)
 			}
 		}
+	}
+	// A failed /cluster read leaves clustering unavailable; a failed /health
+	// fails the call.
+	fake := clusterArc()
+	fake.routes["/api/v1/cluster"] = opsRoute{status: 502, body: proxyPage}
+	cs, _ := entSession(t, fake, opsOpts{})
+	if r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"}); r.Clustering.State != stateUnavailable || r.CQScheduler.State != stateActive || r.License.State != stateActive {
+		t.Errorf("/cluster 502: %s", text)
+	}
+	fake = clusterArc()
+	fake.routes["/health"] = opsRoute{status: 500, body: `{}`}
+	cs, _ = entSession(t, fake, opsOpts{})
+	if _, text, res := callEnt(t, cs, map[string]any{"view": "capabilities"}); !res.IsError || !strings.Contains(text, "Arc returned an error") {
+		t.Errorf("/health 500: %s", text)
 	}
 	for name, body := range map[string]string{"status without enabled": `{"nodes":[]}`, "nodes without a list": `{"total":0}`} {
 		fake := clusterArc()
@@ -419,7 +495,9 @@ func TestEnterprise_TimeoutAndArcDown(t *testing.T) {
 	fake.routes["/health"] = opsRoute{status: 200, body: entHealthLicensed, delay: 150 * time.Millisecond}
 	fake.routes["/api/v1/cluster"] = opsRoute{status: 200, body: entStatus("w2", "w2"), delay: 150 * time.Millisecond}
 	cs, _ := entSession(t, fake, opsOpts{timeout: 250 * time.Millisecond})
-	if _, text, res := callEnt(t, cs, map[string]any{"view": "capabilities"}); !res.IsError || !strings.Contains(text, "Arc did not answer /api/v1/cluster within 250ms") {
+	if r, text, res := callEnt(t, cs, map[string]any{"view": "capabilities"}); res.IsError || r.License.State != stateActive ||
+		r.Clustering.State != stateUnavailable || !strings.Contains(r.Clustering.Reason, "Arc did not answer /api/v1/cluster within 250ms") ||
+		r.CQScheduler.State != stateUnavailable {
 		t.Errorf("shared deadline: %s", text)
 	}
 	cs, _ = entSession(t, clusterArc(), opsOpts{down: true})
@@ -428,8 +506,9 @@ func TestEnterprise_TimeoutAndArcDown(t *testing.T) {
 	}
 }
 
-// Lists lose whole items from the end to fit --max-response-size, and say
-// so; a status that does not fit even without its nodes is refused.
+// Lists lose whole items from the end to fit --max-response-size, and the
+// cluster status its largest parts, and they say so; a status whose core
+// does not fit is refused.
 func TestEnterprise_SizeBudget(t *testing.T) {
 	ids := make([]string, 40)
 	for i := range ids {
@@ -444,28 +523,46 @@ func TestEnterprise_SizeBudget(t *testing.T) {
 	}
 	fake.routes["/api/v1/schedulers"] = opsRoute{status: 200, body: entSchedulers(jobs...)}
 
-	for _, view := range []string{"cluster", "nodes"} {
-		cs, _ := entSession(t, fake, opsOpts{maxChars: 4000})
-		r, text, res := callEnt(t, cs, map[string]any{"view": view})
-		got := nodeIDs(t, r.Data)
-		if res.IsError || len(text) > 4000 || !r.Truncated || *r.Total != 40 || *r.Returned != len(got) || len(got) == 0 || len(got) >= 40 || got[0] != "w01" {
-			t.Errorf("%s at 4000: %d chars, returned %v of %v, first %v", view, len(text), len(got), r.Total, got)
-		}
-		cs, _ = entSession(t, fake, opsOpts{unlimited: true})
-		if r, _, _ := callEnt(t, cs, map[string]any{"view": view}); *r.Returned != 40 || r.Truncated {
-			t.Errorf("%s unlimited: returned %v", view, *r.Returned)
-		}
+	cs, _ := entSession(t, fake, opsOpts{maxChars: 4000})
+	r, text, res := callEnt(t, cs, map[string]any{"view": "nodes"})
+	got := nodeIDs(t, r.Data)
+	if res.IsError || len(text) > 4000 || !r.Truncated || *r.Total != 40 || *r.Returned != len(got) || len(got) == 0 || len(got) >= 40 || got[0] != "w01" {
+		t.Errorf("nodes at 4000: %d chars, returned %v of %v, first %v", len(text), len(got), r.Total, got)
+	}
+	cs, _ = entSession(t, fake, opsOpts{unlimited: true})
+	if r, _, _ := callEnt(t, cs, map[string]any{"view": "nodes"}); *r.Returned != 40 || r.Truncated {
+		t.Errorf("nodes unlimited: returned %v", *r.Returned)
 	}
 
-	cs, _ := entSession(t, fake, opsOpts{})
-	r, _, _ := callEnt(t, cs, map[string]any{"view": "capabilities"})
+	// The 40-node status at the smallest limit: the node list goes first
+	// (the largest part), the core stays.
+	cs, _ = entSession(t, fake, opsOpts{maxChars: 4000})
+	r, text, res = callEnt(t, cs, map[string]any{"view": "cluster"})
+	if data, _ := r.Data.(map[string]any); res.IsError || len(text) > 4000 || !r.Truncated || len(r.Omitted) == 0 || r.Omitted[0] != "nodes" ||
+		data["nodes"] != nil || data["local_node_id"] != "w07" || r.AnsweredBy != "w07" || data["raft"] == nil {
+		t.Errorf("cluster at 4000: %d chars, omitted %v: %s", len(text), r.Omitted, text)
+	}
+	// A status of any size answers: with a Raft part too large as well,
+	// both go, largest first.
+	fake.routes["/api/v1/cluster"] = opsRoute{status: 200, body: strings.Replace(entStatus("w07", ids...), `"raft":{`, `"raft":{"big":"`+strings.Repeat("x", 9000)+`",`, 1)}
+	cs, _ = entSession(t, fake, opsOpts{maxChars: 4000})
+	if r, text, res := callEnt(t, cs, map[string]any{"view": "cluster"}); res.IsError || strings.Join(r.Omitted, ",") != "raft,nodes" || len(text) > 4000 {
+		t.Errorf("cluster with a large Raft part: omitted %v: %s", r.Omitted, text)
+	}
+	cs, _ = entSession(t, fake, opsOpts{unlimited: true})
+	if r, _, _ := callEnt(t, cs, map[string]any{"view": "cluster"}); r.Omitted != nil || len(nodeIDs(t, r.Data)) != 40 {
+		t.Errorf("cluster unlimited: omitted %v", r.Omitted)
+	}
+
+	cs, _ = entSession(t, fake, opsOpts{})
+	r, _, _ = callEnt(t, cs, map[string]any{"view": "capabilities"})
 	cq := r.CQScheduler.Data.(map[string]any)
-	if kept := cq["jobs"].([]any); len(kept) != 20 || !r.CQScheduler.Truncated || fmt.Sprint(cq["job_count"]) != "30" ||
+	if kept := cq["jobs"].([]any); len(kept) != 20 || !r.Truncated || fmt.Sprint(cq["job_count"]) != "30" ||
 		fmt.Sprint(kept[0].(map[string]any)["cq_id"]) != "1" || fmt.Sprint(kept[19].(map[string]any)["cq_id"]) != "20" {
-		t.Errorf("jobs: %d kept, truncated %v, job_count %v, %v", len(kept), r.CQScheduler.Truncated, cq["job_count"], kept)
+		t.Errorf("jobs: %d kept, truncated %v, job_count %v, %v", len(kept), r.Truncated, cq["job_count"], kept)
 	}
 
-	fake.routes["/api/v1/cluster"] = opsRoute{status: 200, body: strings.Replace(entStatus("w07", "w01"), `"raft":{`, `"raft":{"big":"`+strings.Repeat("x", 5000)+`",`, 1)}
+	fake.routes["/api/v1/cluster"] = opsRoute{status: 200, body: strings.Replace(entStatus("w07", "w01"), `"cluster_name":"qa"`, `"cluster_name":"`+strings.Repeat("x", 5000)+`"`, 1)}
 	cs, _ = entSession(t, fake, opsOpts{maxChars: 4000})
 	if _, text, res := callEnt(t, cs, map[string]any{"view": "cluster"}); !res.IsError || !strings.Contains(text, "does not fit in arc-mcp's --max-response-size (4000 characters)") {
 		t.Errorf("oversized status: %s", text)
@@ -532,9 +629,8 @@ func TestEnterprise_InputSchema(t *testing.T) {
 	if err := json.Unmarshal(b, &out); err != nil || out.Properties["answered_by"] == nil {
 		t.Fatalf("output schema %s (%v)", b, err)
 	}
-	// The areas' shape is stated once, under $defs, and still enforced.
 	resolved, err := out.Resolve(nil)
-	if err != nil || out.Properties["license"].Ref != "#/$defs/area" {
+	if err != nil {
 		t.Fatalf("output schema: %v %s", err, b)
 	}
 	if resolved.Validate(map[string]any{"view": "capabilities", "license": map[string]any{"reason": "no state"}}) == nil {
