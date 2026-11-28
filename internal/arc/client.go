@@ -31,6 +31,9 @@ type Error struct {
 	// whole answer for a listing request that timed out (KindTimeout). Empty
 	// otherwise; UserMessage then gives the generic text.
 	Message string
+	// notServed marks a 404 that is Arc's own answer for a route it does
+	// not serve (see GetJSON); Kind stays KindNotFound.
+	notServed bool
 }
 
 // The Kind values Error can carry. The three permission kinds are kept

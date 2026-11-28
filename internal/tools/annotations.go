@@ -23,7 +23,7 @@ func readOnly(title string) *mcp.ToolAnnotations {
 }
 
 // RegisterAll registers the tools of every group in groups, in a fixed order:
-// the data tools, then the operations tools. main and the tests both use it,
+// the data tools, the operations tools, then arc_enterprise. main and the tests both use it,
 // so a test over its tools covers every tool the server exposes.
 func RegisterAll(server *mcp.Server, client *arc.Client, groups Groups, maxRows, maxResponseChars int) {
 	if groups.Data {
@@ -36,5 +36,8 @@ func RegisterAll(server *mcp.Server, client *arc.Client, groups Groups, maxRows,
 	if groups.Ops {
 		RegisterHealth(server, client, maxResponseChars)
 		RegisterMetrics(server, client, maxResponseChars)
+	}
+	if groups.Enterprise {
+		RegisterEnterprise(server, client, maxResponseChars)
 	}
 }

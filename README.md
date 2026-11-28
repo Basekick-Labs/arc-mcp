@@ -33,7 +33,7 @@ ARC_URL=http://localhost:8000 ARC_TOKEN_FILE=/path/to/token \
 | `ARC_TOKEN` | Arc API token | (none) |
 | `ARC_TOKEN_FILE` | File containing the Arc API token (an empty file is refused) | (none) |
 | `ARC_MCP_MAX_ROWS` | Maximum rows per query | `500` |
-| `ARC_MCP_TOOLS` | Tool groups to serve: `data`, `ops` or `data,ops` (see [Operations tools](#operations-tools-opt-in)) | `data` |
+| `ARC_MCP_TOOLS` | Tool groups to serve, comma-separated: `data`, `ops`, `enterprise` (see [Operations tools](#operations-tools-opt-in) and [Enterprise tool](#enterprise-tool-opt-in)) | `data` |
 | `ARC_MCP_TIMEOUT` | Query timeout (`30s`, `2m`) | `30s` |
 | `ARC_MCP_MAX_RESPONSE_SIZE` | Size limit of an answer, in characters | `50000` |
 | `ARC_MCP_INSECURE` | `true` to allow a token over plaintext HTTP to a non-loopback Arc (loopback is exactly `localhost` or a `127.x.x.x`/`::1` address; a name under `.localhost` is not, since a configured `HTTP_PROXY` applies to it) | `false` |
@@ -59,7 +59,7 @@ Boolean variables take `true`/`false` (or `1`/`0`); any other value is refused a
 | `--max-rows` | Maximum rows per query | `500` |
 | `--timeout` | Query timeout | `30s` |
 | `--max-response-size` | Size limit of an answer, in characters (minimum 4000). Applies to the text and to the structured rows alike, each stopping at a row boundary | `50000` |
-| `--tools` | Tool groups to serve, comma-separated: `data`, `ops` | `$ARC_MCP_TOOLS` or `data` |
+| `--tools` | Tool groups to serve, comma-separated: `data`, `ops`, `enterprise` | `$ARC_MCP_TOOLS` or `data` |
 | `--transport` | `stdio` or `http` | `stdio` |
 | `--listen` | HTTP: address to listen on | `127.0.0.1:8080` |
 | `--insecure-listen` | HTTP: serve a non-loopback address with no inbound token | `false` |
@@ -411,6 +411,68 @@ node answers for itself, so point arc-mcp at the node you want to inspect;
 behind a load balancer or a Kubernetes Service, successive calls may reach
 different nodes. Arc's application logs are not included: reading them needs an
 admin token, and arc-mcp asks for a read-only one.
+
+## Enterprise tool (opt-in)
+
+`arc_enterprise` reports the state of Arc's Enterprise features: the licence,
+clustering and the two schedulers. It is off by default: turn it on with
+`--tools=data,enterprise` (or add `enterprise` to any other list). Every route
+it reads accepts any valid Arc token, so the read-only token above is enough.
+
+| `view` | Arc route | What it holds |
+|---|---|---|
+| `capabilities` | `/health`, `/api/v1/cluster`, `/api/v1/schedulers` | The licence (tier, status, expiry), clustering (the answering node, the cluster's size and, in cluster mode, the licence's features), and the CQ and retention schedulers (up to 20 CQ jobs, by id). Start here |
+| `cluster` | `/api/v1/cluster` | The cluster status: Raft, writer failover, the compactor lease, replication, every node |
+| `nodes` | `/api/v1/cluster/nodes` | Every node, sorted by id; `role` and `state` filter it |
+| `node` | `/api/v1/cluster/nodes` | One node, by `node_id` |
+| `local_node` | `/api/v1/cluster/local` | The node that answered, with its capabilities |
+| `cluster_health` | `/api/v1/cluster/health` | How many nodes are healthy |
+
+Each answer (each area, for `capabilities`) has a `state`:
+
+| `state` | Meaning |
+|---|---|
+| `active` | The feature is on; `data` is Arc's answer |
+| `not_licensed` | No licence, an expired one, or one without the feature; `reason` says which |
+| `not_enabled` | Licensed but off in Arc's configuration, or a scheduler that is not running |
+| `not_served` | This Arc does not serve the route (Arc serves these since 26.02.1) |
+| `not_found` | `node` only: no node with that id |
+| `unavailable` | `capabilities` only: arc-mcp could not read that area (Arc's error, a timeout); `reason` says which, and the other areas still answer |
+| `unknown` | The licence only: a status arc-mcp does not know; `data` is Arc's answer |
+
+These are results, not errors: on Arc OSS every area answers `not_licensed`.
+Arc lists the licence's features only in cluster mode; a standalone Arc reports
+its licence's tier, status and expiry. A licence that lapses after startup shows
+in the answers rather than as a refusal: its status, the cluster status's
+`valid`, a scheduler's `license_valid`. The licence statuses Arc reports are
+read one by one: `active`; `grace_period` and `writes_stopped` (Arc refuses
+ingestion) stay `active` with a `reason`; `expired`, `read_only` (which Arc up to
+26.09.4 passes on from the licence server) and `unlicensed` (configured but not in force) are `not_licensed`;
+any other is `unknown`. An Arc before 26.09.1 does not report its licence in
+`/health`; `capabilities` then takes it from the cluster status in cluster mode,
+or reads it as `active` when a scheduler or clustering shows one, and says so.
+
+**Single node and cluster.** Each answer comes from the Arc node at the
+configured URL. `answered_by` names that node when Arc's own answer does (the
+`cluster` and `local_node` views); the other answers do not name it, and
+arc-mcp does not ask a second time, since behind a load balancer the second
+request can reach another node. To inspect a particular node, point arc-mcp at
+that node's address. Retention runs only on the primary writer:
+`retention_scheduler` says whether the answering node runs it (`can_run`).
+Node entries carry each node's addresses as Arc reports them.
+
+Answers fit `--max-response-size` and say when they were cut (`truncated`).
+`nodes` drops whole nodes from the end (`returned`, `total`), `capabilities`
+CQ jobs. `cluster` leaves out its largest parts one by one and names them in
+`omitted`, keeping the answering node, the cluster's size and health and the
+primary writer: a 4-node cluster's status is about 5,200 characters, so at the
+4,000 minimum its node list (which `nodes` gives) goes first, and a larger
+cluster loses its Raft and replication detail too.
+
+**Example prompts:**
+- "Which Enterprise features does this Arc have?" → `capabilities`
+- "Is the cluster healthy, and which node is the primary writer?" → `cluster`
+- "Which nodes are unhealthy?" → `nodes` with `state` unhealthy
 
 ## Safety
 

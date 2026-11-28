@@ -94,7 +94,13 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values) (an
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-		return nil, arcErrorFrom("GET "+path, resp.StatusCode, snippet)
+		e := arcErrorFrom("GET "+path, resp.StatusCode, snippet)
+		// Arc's router answers a route it does not serve with this exact
+		// text, naming the path it received. Matched whole, so a proxy that
+		// forwards a path prefix (Arc then names /prefix/api/...) still reads
+		// as a wrong URL.
+		e.notServed = resp.StatusCode == http.StatusNotFound && errorField(snippet) == "Cannot GET "+path
+		return nil, e
 	}
 	raw, err := io.ReadAll(body)
 	if err != nil {
@@ -108,6 +114,14 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values) (an
 		return nil, loggedError(KindParse, fmt.Sprintf("GET %s: decoding the answer: %v", path, err))
 	}
 	return v, nil
+}
+
+// NotServed reports whether err is Arc's own 404 for a route it does not
+// serve: an Arc older than the route, or one that registers it only when a
+// feature is on. Any other 404 (a proxy's, a wrong base URL) is not.
+func NotServed(err error) bool {
+	var ae *Error
+	return errors.As(err, &ae) && ae.notServed
 }
 
 // maxProbeBodyBytes caps how much of a /health or /ready answer is read.

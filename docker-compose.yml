@@ -49,7 +49,8 @@ services:
       ARC_URL: ${ARC_URL:-http://arc:8000}
       ARC_TOKEN: ${ARC_TOKEN:?ARC_TOKEN is required — set it in .env}
       ARC_MCP_MAX_ROWS: ${ARC_MCP_MAX_ROWS:-500}
-      # data (the default), or data,ops for Arc's health and metrics tools.
+      # data (the default), or data,ops for Arc's health and metrics tools;
+      # add enterprise for Arc's licence, clustering and schedulers.
       ARC_MCP_TOOLS: ${ARC_MCP_TOOLS:-data}
       # arc-mcp refuses by default to send a Bearer token over plaintext HTTP
       # to a non-loopback host. Inside this Compose file the `arc` service

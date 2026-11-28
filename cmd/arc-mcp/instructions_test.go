@@ -57,3 +57,29 @@ func TestServerInstructions_Ops(t *testing.T) {
 		}
 	}
 }
+
+// The Enterprise paragraph follows the others unchanged; without the data
+// tools the lead says the server reports on Arc itself, never that only
+// operations tools are on.
+func TestServerInstructions_Enterprise(t *testing.T) {
+	data := serverInstructions(500, tools.Groups{Data: true})
+	ops := serverInstructions(500, tools.Groups{Data: true, Ops: true})
+	for groups, want := range map[tools.Groups]string{
+		{Data: true, Enterprise: true}:            data + "\n\n" + enterpriseInstructions,
+		{Data: true, Ops: true, Enterprise: true}: ops + "\n\n" + enterpriseInstructions,
+		{Enterprise: true}:                        serverOnlyLead + "\n\n" + enterpriseInstructions,
+		{Ops: true, Enterprise: true}:             serverOnlyLead + "\n\n" + opsInstructions + "\n\n" + enterpriseInstructions,
+	} {
+		if got := serverInstructions(500, groups); got != want {
+			t.Errorf("%s instructions:\n%s", groups, got)
+		}
+	}
+	for _, want := range []string{"arc_enterprise", "capabilities", "not licensed", "answered_by", "configured URL"} {
+		if !strings.Contains(enterpriseInstructions, want) {
+			t.Errorf("enterprise paragraph lacks %q", want)
+		}
+	}
+	if strings.Contains(serverOnlyLead, "operations tools") {
+		t.Error("the lead without data names only the operations tools")
+	}
+}

@@ -47,17 +47,20 @@ type opsRoute struct {
 }
 
 // opsArc answers each path from routes, 404 for any other, and records the
-// request URI (path and query) and the Authorization header of every request.
+// request URI (path and query), the method and the Authorization header of
+// every request.
 type opsArc struct {
-	mu     sync.Mutex
-	routes map[string]opsRoute
-	seen   []string
-	auth   []string
+	mu      sync.Mutex
+	routes  map[string]opsRoute
+	seen    []string
+	methods []string
+	auth    []string
 }
 
 func (f *opsArc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.seen = append(f.seen, r.URL.RequestURI())
+	f.methods = append(f.methods, r.Method)
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	route, ok := f.routes[r.URL.Path]
 	f.mu.Unlock()
@@ -141,9 +144,10 @@ type opsOpts struct {
 	unlimited bool          // --max-response-size 0
 	down      bool          // nothing listens: every connection is refused
 	wire      *syncBuffer   // when set, gets the server's JSON-RPC traffic
+	groups    Groups        // default the ops group alone
 }
 
-// opsSession registers the ops tools against arcHandler, reached as
+// opsSession registers the tools of o.groups (the ops tools by default) against arcHandler, reached as
 // fakeHost, and returns a client session over a real in-memory MCP transport
 // and the address that must never appear in an answer.
 func opsSession(t *testing.T, arcHandler http.Handler, o opsOpts) (*mcp.ClientSession, string) {
@@ -181,7 +185,11 @@ func opsSession(t *testing.T, arcHandler http.Handler, o opsOpts) (*mcp.ClientSe
 	}
 	client := arc.NewClientWithTransport(base, "tok", timeout, transport)
 	server := mcp.NewServer(&mcp.Implementation{Name: "arc-mcp-test", Version: "test"}, nil)
-	RegisterAll(server, client, Groups{Ops: true}, 500, maxChars)
+	groups := o.groups
+	if groups == (Groups{}) {
+		groups = Groups{Ops: true}
+	}
+	RegisterAll(server, client, groups, 500, maxChars)
 
 	serverT, clientT := mcp.NewInMemoryTransports()
 	var st mcp.Transport = serverT
@@ -292,6 +300,8 @@ func TestRegisterAll_Groups(t *testing.T) {
 		{Groups{Data: true}, data},
 		{Groups{Ops: true}, "arc_health,arc_metrics"},
 		{Groups{Data: true, Ops: true}, "arc_health,arc_metrics," + data},
+		{Groups{Enterprise: true}, "arc_enterprise"},
+		{Groups{Data: true, Ops: true, Enterprise: true}, "arc_enterprise,arc_health,arc_metrics," + data},
 	} {
 		if got := strings.Join(toolNames(t, tt.groups), ","); got != tt.want {
 			t.Errorf("%s: tools %s, want %s", tt.groups, got, tt.want)
@@ -299,10 +309,9 @@ func TestRegisterAll_Groups(t *testing.T) {
 	}
 }
 
-// The default group lists exactly the tools arc-mcp listed before groups
-// existed, byte for byte: testdata/tools-list-data.json is c5f3fd5's
-// tools/list, rendered the same way. Turning ops on adds two tools and
-// changes none of the five.
+// The default group lists exactly the five data tools. Turning ops or
+// enterprise on adds their tools and changes none of the others, byte for
+// byte.
 func TestRegisterAll_DefaultToolsListIsUnchanged(t *testing.T) {
 	list := func(groups Groups) []*mcp.Tool {
 		cs := newSession(t, http.NotFoundHandler(), func(server *mcp.Server, client *arc.Client) {
@@ -332,14 +341,27 @@ func TestRegisterAll_DefaultToolsListIsUnchanged(t *testing.T) {
 	if strings.Join(names, ",") != "describe_measurement,get_sample_data,list_databases,list_measurements,query" {
 		t.Errorf("the default serves %v, want the five data tools only", names)
 	}
-	var data []*mcp.Tool
-	for _, tool := range list(Groups{Data: true, Ops: true}) {
-		if !strings.HasPrefix(tool.Name, "arc_") {
-			data = append(data, tool)
+	// pick is the tools of list named in group's own listing.
+	pick := func(all, group []*mcp.Tool) []*mcp.Tool {
+		var out []*mcp.Tool
+		for _, tool := range all {
+			for _, g := range group {
+				if tool.Name == g.Name {
+					out = append(out, tool)
+				}
+			}
 		}
+		return out
 	}
-	if got, want := render(data), render(list(Groups{Data: true})); got != want {
-		t.Errorf("with ops on, the data tools changed:\n%s", got)
+	data, ops := list(Groups{Data: true}), list(Groups{Ops: true})
+	for _, on := range []Groups{{Data: true, Ops: true}, {Data: true, Ops: true, Enterprise: true}} {
+		all := list(on)
+		if got, want := render(pick(all, data)), render(data); got != want {
+			t.Errorf("with %s on, the data tools changed:\n%s", on, got)
+		}
+		if got, want := render(pick(all, ops)), render(ops); got != want {
+			t.Errorf("with %s on, the ops tools changed:\n%s", on, got)
+		}
 	}
 }
 

@@ -57,7 +57,7 @@ func main() {
 	tlsUpstream := flag.Bool("tls-upstream", envBool("ARC_MCP_TLS_UPSTREAM"), "HTTP transport: TLS terminates in front of arc-mcp (a proxy or ingress), so passthrough may listen without --tls-cert")
 	authMode := flag.String("auth-mode", envOrDefault("ARC_MCP_AUTH_MODE", "static"), "HTTP transport: static (arc-mcp's own Arc token, the default) or passthrough (each caller's bearer token is its Arc token)")
 	allowAnyHost := flag.Bool("allow-any-host", envBool("ARC_MCP_ALLOW_ANY_HOST"), "HTTP transport: accept any Host header on a loopback listener (for a TLS proxy on the same host); turns off DNS-rebinding protection")
-	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics)")
+	toolGroups := flag.String("tools", envOrDefault("ARC_MCP_TOOLS", tools.DefaultGroups), "Tool groups to serve, comma-separated: data (the default), ops (Arc health and metrics), enterprise (licence, clustering and schedulers)")
 	version := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -498,17 +498,24 @@ func resolveToken(flagValue string) (string, error) {
 
 // serverInstructions is what every client receives on connect, for the tool
 // groups served: the data text alone by default, byte for byte what it was
-// before groups existed, and a paragraph on the operations tools when they
-// are on. Per-tool detail lives in the tool descriptions.
+// before groups existed, and a paragraph on the operations tools and on the
+// Enterprise tool when they are on. Per-tool detail lives in the tool
+// descriptions.
 func serverInstructions(maxRows int, groups tools.Groups) string {
 	var parts []string
-	if groups.Data {
+	switch {
+	case groups.Data:
 		parts = append(parts, dataInstructions(maxRows))
-	} else {
+	case groups.Enterprise:
+		parts = append(parts, serverOnlyLead)
+	default:
 		parts = append(parts, opsOnlyLead)
 	}
 	if groups.Ops {
 		parts = append(parts, opsInstructions)
+	}
+	if groups.Enterprise {
+		parts = append(parts, enterpriseInstructions)
 	}
 	return strings.Join(parts, "\n\n")
 }
@@ -516,6 +523,15 @@ func serverInstructions(maxRows int, groups tools.Groups) string {
 // opsOnlyLead replaces the data text when only the operations tools are on:
 // there is no query to give habits for.
 const opsOnlyLead = "Arc is a time-series lakehouse. This server has only its operations tools: they report on the Arc server itself, and cannot read the data stored in it."
+
+// serverOnlyLead replaces the data text when the Enterprise tool is on
+// without the data tools, with or without the operations tools.
+const serverOnlyLead = "Arc is a time-series lakehouse. This server has only tools that report on the Arc server itself: they cannot read the data stored in it."
+
+// enterpriseInstructions is the paragraph on arc_enterprise.
+const enterpriseInstructions = "Enterprise tool: arc_enterprise reports Arc's licence, clustering, schedulers and cluster nodes; start with view capabilities. " +
+	"A feature that is not enabled or not licensed is a state to report, not a failure. " +
+	"Each answer comes from the Arc node at the configured URL, and answered_by names that node when Arc's answer does."
 
 // opsInstructions is the paragraph on the operations tools.
 const opsInstructions = "Operations tools: arc_health says whether Arc is alive and ready for traffic; " +
