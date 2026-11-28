@@ -467,8 +467,8 @@ func TestEnterprise_ArcErrors(t *testing.T) {
 	fake := clusterArc()
 	fake.routes["/api/v1/cluster"] = opsRoute{status: 502, body: proxyPage}
 	cs, _ := entSession(t, fake, opsOpts{})
-	if r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"}); r.Clustering.State != stateUnavailable || r.CQScheduler.State != stateActive || r.License.State != stateActive {
-		t.Errorf("/cluster 502: %s", text)
+	if r, text, _ := callEnt(t, cs, map[string]any{"view": "capabilities"}); r.Clustering.State != stateUnavailable || r.CQScheduler.State != stateActive || r.License.State != stateActive || r.Note != "" {
+		t.Errorf("/cluster 502: %s (no note on the mode: an unread area says nothing about it)", text)
 	}
 	fake = clusterArc()
 	fake.routes["/health"] = opsRoute{status: 500, body: `{}`}

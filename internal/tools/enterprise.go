@@ -426,7 +426,9 @@ func capabilities(ctx context.Context, client *arc.Client, maxChars int) (Enterp
 	if _, reported := health["license"]; !reported {
 		res.License = unreportedLicence(res)
 	}
-	if res.License.State == stateActive && res.Clustering.State != stateActive {
+	// Only when Arc said it runs standalone: an unread or unserved
+	// clustering area says nothing about the mode.
+	if standalone := res.Clustering.State == stateNotEnabled || res.Clustering.State == stateNotLicensed; res.License.State == stateActive && standalone {
 		res.Note = "Arc lists the licence's features only in cluster mode."
 	}
 	cq := *res.CQScheduler
